@@ -90,39 +90,7 @@ services:
     networks:
       - homelab
 
-  ordago-android-e2e-4:
-    <<: *runner-base
-    container_name: github-runner-ordago-android-e2e-4
-    environment:
-      <<: *runner-env
-      RUNNER_NAME: "powerserver-ordago-android-e2e-4"
-      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
-      SKIP_ANDROID_SDK: "1"
-    env_file:
-      - path: /opt/personal/secrets/github-actions-runner.env
-        required: false
-    volumes:
-      - /opt/personal/github-actions/ordago-android-e2e-4/work:/runner-work:rw
-      - /opt/personal/github-actions/ordago-android-e2e-4/pnpm-store:/cache/pnpm:rw
-    networks:
-      - homelab
 
-  ordago-android-e2e-5:
-    <<: *runner-base
-    container_name: github-runner-ordago-android-e2e-5
-    environment:
-      <<: *runner-env
-      RUNNER_NAME: "powerserver-ordago-android-e2e-5"
-      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
-      SKIP_ANDROID_SDK: "1"
-    env_file:
-      - path: /opt/personal/secrets/github-actions-runner.env
-        required: false
-    volumes:
-      - /opt/personal/github-actions/ordago-android-e2e-5/work:/runner-work:rw
-      - /opt/personal/github-actions/ordago-android-e2e-5/pnpm-store:/cache/pnpm:rw
-    networks:
-      - homelab
 
 
 networks:

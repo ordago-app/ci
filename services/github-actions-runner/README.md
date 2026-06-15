@@ -3,7 +3,7 @@
 Compose-managed GitHub Actions runner pools for selected private repositories.
 
 The pool serves `alvaro-francisco-gil/ordago-apps` and is split by capacity into
-**1 heavy + 4 light** runners (the box is an i7-4770, 4 cores / 15 GiB — one
+**1 heavy + 2 light** runners (the box is an i7-4770, 4 cores / 15 GiB — one
 Android emulator alone wants 4 cores + 4 GB, so only one emulator may run at a
 time):
 
@@ -12,12 +12,20 @@ time):
 | `ordago-android-e2e`   | `powerserver-ordago-android-e2e`   | `android-e2e, ordago-ci` | yes | Heavy — Android E2E; also joins the light pool when no emulator runs |
 | `ordago-android-e2e-2` | `powerserver-ordago-android-e2e-2` | `ordago-ci` | no | Light |
 | `ordago-android-e2e-3` | `powerserver-ordago-android-e2e-3` | `ordago-ci` | no | Light |
-| `ordago-android-e2e-4` | `powerserver-ordago-android-e2e-4` | `ordago-ci` | no | Light (lean — `SKIP_ANDROID_SDK=1`) |
-| `ordago-android-e2e-5` | `powerserver-ordago-android-e2e-5` | `ordago-ci` | no | Light (lean — `SKIP_ANDROID_SDK=1`) |
 
-Light runners set `SKIP_ANDROID_SDK=1` so `entrypoint.sh` skips seeding the
-~12 GB Android SDK they never use. Service names ending `-android-e2e-N` on the
-light runners are legacy; the labels (not the names) determine routing.
+Service names ending `-android-e2e-N` on the light runners are legacy; the
+labels (not the names) determine routing.
+
+### Why only 3 (concurrency cap)
+
+The root filesystem is on a **7,200 rpm HDD** (`/var/lib/docker` and all runner
+caches live there). Under concurrent CI the disk hits **100% I/O utilization**
+while the CPU sits ~65% idle — i.e. the bottleneck is disk throughput, not CPU
+or RAM. Running 4–5 concurrent jobs thrashes the single spinning disk (random
+seeks) and makes the queue *slower*, not faster, so the pool is capped at 3.
+The real fix is an SSD/NVMe for the working set (then the pool can grow again);
+a lean `SKIP_ANDROID_SDK=1` light template is preserved in git history for when
+that lands.
 
 ## Deployment (current)
 
