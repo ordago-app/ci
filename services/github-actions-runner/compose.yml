@@ -63,7 +63,7 @@ services:
       - path: /opt/personal/secrets/github-actions-runner.env
         required: false
     volumes:
-      - /opt/personal/github-actions/ordago-android-e2e-2/work:/runner-work:rw
+      - /mnt/ci-ssd/ordago-light-2-work:/runner-work:rw
       - /opt/personal/github-actions/ordago-android-e2e-2/gradle:/cache/gradle:rw
       - /opt/personal/github-actions/ordago-android-e2e-2/android-sdk:/cache/android-sdk:rw
       - /opt/personal/github-actions/ordago-android-e2e-2/android-avd:/cache/android-avd:rw
@@ -82,7 +82,7 @@ services:
       - path: /opt/personal/secrets/github-actions-runner.env
         required: false
     volumes:
-      - /opt/personal/github-actions/ordago-android-e2e-3/work:/runner-work:rw
+      - /mnt/ci-ssd/ordago-light-3-work:/runner-work:rw
       - /opt/personal/github-actions/ordago-android-e2e-3/gradle:/cache/gradle:rw
       - /opt/personal/github-actions/ordago-android-e2e-3/android-sdk:/cache/android-sdk:rw
       - /opt/personal/github-actions/ordago-android-e2e-3/android-avd:/cache/android-avd:rw
