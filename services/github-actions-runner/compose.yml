@@ -1,16 +1,19 @@
 # GitHub Actions self-hosted runners for ordago-apps.
-# Pool = 1 HEAVY + 2 LIGHT, sized so that even with all 3 busy the box
-# (4 cores / 15 GiB) cannot OOM. Only the heavy runner has /dev/kvm, so at
-# most one Android emulator runs at a time.
+# Pool = 1 HEAVY + 4 LIGHT, sized so the box (4 cores / 15 GiB) cannot OOM.
+# Only the heavy runner has /dev/kvm, so at most one Android emulator runs at a
+# time. 5 lanes is the practical ceiling on 15 GiB RAM; 6+ would need more RAM.
 #
-#   ordago-android-e2e    -> HEAVY: labels android-e2e + ordago-ci, has KVM.
-#                            Runs the Android E2E job; also picks up light
-#                            (ordago-ci) jobs when no emulator is running.
-#   ordago-android-e2e-2  -> LIGHT: label ordago-ci only, no KVM.
-#   ordago-android-e2e-3  -> LIGHT: label ordago-ci only, no KVM.
+#   ordago-android-e2e    -> HEAVY: labels android-e2e + ordago-ci, has KVM,
+#                            work dir on the HDD (Android builds can exceed the
+#                            30 GB SSD). Runs the Android E2E job; also picks up
+#                            light (ordago-ci) jobs when no emulator is running.
+#   ordago-android-e2e-2  -> LIGHT: label ordago-ci only, no KVM, work on SSD.
+#   ordago-android-e2e-3  -> LIGHT: label ordago-ci only, no KVM, work on SSD.
+#   ordago-android-e2e-4  -> LIGHT (lean, SKIP_ANDROID_SDK): work on SSD.
+#   ordago-android-e2e-5  -> LIGHT (lean, SKIP_ANDROID_SDK): work on SSD.
 #
 # Jobs route by label: the Android E2E job requests `android-e2e` (heavy only);
-# every other CI job requests `ordago-ci` (any of the three).
+# every other CI job requests `ordago-ci` (any of the five).
 
 x-runner-base: &runner-base
   image: homelab/github-actions-runner:latest
@@ -90,8 +93,39 @@ services:
     networks:
       - homelab
 
+  ordago-android-e2e-4:
+    <<: *runner-base
+    container_name: github-runner-ordago-android-e2e-4
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: "powerserver-ordago-android-e2e-4"
+      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
+      SKIP_ANDROID_SDK: "1"
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /mnt/ci-ssd/ordago-light-4-work:/runner-work:rw
+      - /opt/personal/github-actions/ordago-android-e2e-4/pnpm:/cache/pnpm:rw
+    networks:
+      - homelab
 
-
+  ordago-android-e2e-5:
+    <<: *runner-base
+    container_name: github-runner-ordago-android-e2e-5
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: "powerserver-ordago-android-e2e-5"
+      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
+      SKIP_ANDROID_SDK: "1"
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /mnt/ci-ssd/ordago-light-5-work:/runner-work:rw
+      - /opt/personal/github-actions/ordago-android-e2e-5/pnpm:/cache/pnpm:rw
+    networks:
+      - homelab
 
 networks:
   homelab:
