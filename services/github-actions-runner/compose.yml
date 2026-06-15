@@ -1,0 +1,131 @@
+# GitHub Actions self-hosted runners for ordago-apps.
+# Pool = 1 HEAVY + 2 LIGHT, sized so that even with all 3 busy the box
+# (4 cores / 15 GiB) cannot OOM. Only the heavy runner has /dev/kvm, so at
+# most one Android emulator runs at a time.
+#
+#   ordago-android-e2e    -> HEAVY: labels android-e2e + ordago-ci, has KVM.
+#                            Runs the Android E2E job; also picks up light
+#                            (ordago-ci) jobs when no emulator is running.
+#   ordago-android-e2e-2  -> LIGHT: label ordago-ci only, no KVM.
+#   ordago-android-e2e-3  -> LIGHT: label ordago-ci only, no KVM.
+#
+# Jobs route by label: the Android E2E job requests `android-e2e` (heavy only);
+# every other CI job requests `ordago-ci` (any of the three).
+
+x-runner-base: &runner-base
+  image: homelab/github-actions-runner:latest
+  build:
+    context: .
+  restart: unless-stopped
+
+x-runner-env: &runner-env
+  RUNNER_REPOSITORY: "alvaro-francisco-gil/ordago-apps"
+  RUNNER_WORKDIR: "/runner-work"
+  GRADLE_USER_HOME: "/cache/gradle"
+  ANDROID_HOME: "/cache/android-sdk"
+  ANDROID_SDK_ROOT: "/cache/android-sdk"
+  ANDROID_AVD_HOME: "/cache/android-avd"
+  PNPM_HOME: "/cache/pnpm"
+  MAESTRO_CLI_NO_ANALYTICS: "1"
+
+services:
+  ordago-android-e2e:
+    <<: *runner-base
+    container_name: github-runner-ordago-android-e2e
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: "powerserver-ordago-android-e2e"
+      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,android-e2e,ordago-ci"
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /opt/personal/github-actions/ordago-android-e2e/work:/runner-work:rw
+      - /opt/personal/github-actions/ordago-android-e2e/gradle:/cache/gradle:rw
+      - /opt/personal/github-actions/ordago-android-e2e/android-sdk:/cache/android-sdk:rw
+      - /opt/personal/github-actions/ordago-android-e2e/android-avd:/cache/android-avd:rw
+      - /opt/personal/github-actions/ordago-android-e2e/pnpm-store:/cache/pnpm:rw
+    devices:
+      - "/dev/kvm:/dev/kvm"
+    group_add:
+      - "994"
+    networks:
+      - homelab
+
+  ordago-android-e2e-2:
+    <<: *runner-base
+    container_name: github-runner-ordago-android-e2e-2
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: "powerserver-ordago-android-e2e-2"
+      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /opt/personal/github-actions/ordago-android-e2e-2/work:/runner-work:rw
+      - /opt/personal/github-actions/ordago-android-e2e-2/gradle:/cache/gradle:rw
+      - /opt/personal/github-actions/ordago-android-e2e-2/android-sdk:/cache/android-sdk:rw
+      - /opt/personal/github-actions/ordago-android-e2e-2/android-avd:/cache/android-avd:rw
+      - /opt/personal/github-actions/ordago-android-e2e-2/pnpm-store:/cache/pnpm:rw
+    networks:
+      - homelab
+
+  ordago-android-e2e-3:
+    <<: *runner-base
+    container_name: github-runner-ordago-android-e2e-3
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: "powerserver-ordago-android-e2e-3"
+      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /opt/personal/github-actions/ordago-android-e2e-3/work:/runner-work:rw
+      - /opt/personal/github-actions/ordago-android-e2e-3/gradle:/cache/gradle:rw
+      - /opt/personal/github-actions/ordago-android-e2e-3/android-sdk:/cache/android-sdk:rw
+      - /opt/personal/github-actions/ordago-android-e2e-3/android-avd:/cache/android-avd:rw
+      - /opt/personal/github-actions/ordago-android-e2e-3/pnpm-store:/cache/pnpm:rw
+    networks:
+      - homelab
+
+  ordago-android-e2e-4:
+    <<: *runner-base
+    container_name: github-runner-ordago-android-e2e-4
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: "powerserver-ordago-android-e2e-4"
+      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
+      SKIP_ANDROID_SDK: "1"
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /opt/personal/github-actions/ordago-android-e2e-4/work:/runner-work:rw
+      - /opt/personal/github-actions/ordago-android-e2e-4/pnpm-store:/cache/pnpm:rw
+    networks:
+      - homelab
+
+  ordago-android-e2e-5:
+    <<: *runner-base
+    container_name: github-runner-ordago-android-e2e-5
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: "powerserver-ordago-android-e2e-5"
+      RUNNER_LABELS: "self-hosted,linux,x64,powerserver,ordago-ci"
+      SKIP_ANDROID_SDK: "1"
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /opt/personal/github-actions/ordago-android-e2e-5/work:/runner-work:rw
+      - /opt/personal/github-actions/ordago-android-e2e-5/pnpm-store:/cache/pnpm:rw
+    networks:
+      - homelab
+
+
+networks:
+  homelab:
+    external: true
+    name: homelab

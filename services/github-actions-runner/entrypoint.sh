@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+require_env() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "Missing required environment variable: ${name}" >&2
+    exit 1
+  fi
+}
+
+require_env RUNNER_REPOSITORY
+require_env RUNNER_NAME
+require_env RUNNER_LABELS
+require_env RUNNER_WORKDIR
+require_env GITHUB_RUNNER_APP_ID
+require_env GITHUB_RUNNER_APP_INSTALLATION_ID
+require_env GITHUB_RUNNER_APP_PRIVATE_KEY_B64
+
+app_id="${GITHUB_RUNNER_APP_ID}"
+app_installation_id="${GITHUB_RUNNER_APP_INSTALLATION_ID}"
+app_private_key_b64="${GITHUB_RUNNER_APP_PRIVATE_KEY_B64}"
+unset GITHUB_RUNNER_APP_ID GITHUB_RUNNER_APP_INSTALLATION_ID GITHUB_RUNNER_APP_PRIVATE_KEY_B64
+
+github_api="https://api.github.com/repos/${RUNNER_REPOSITORY}/actions/runners"
+github_app_installation_api="https://api.github.com/app/installations/${app_installation_id}/access_tokens"
+github_url="https://github.com/${RUNNER_REPOSITORY}"
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+mint_app_jwt() {
+  local now header payload signing_input private_key_file signature
+
+  now="$(date +%s)"
+  header="$(printf '{"alg":"RS256","typ":"JWT"}' | base64url)"
+  payload="$(
+    jq -nc \
+      --argjson iat "$((now - 60))" \
+      --argjson exp "$((now + 540))" \
+      --arg iss "${app_id}" \
+      '{iat: $iat, exp: $exp, iss: $iss}' \
+      | base64url
+  )"
+  signing_input="${header}.${payload}"
+  private_key_file="$(mktemp)"
+  trap 'rm -f "${private_key_file}"' RETURN
+  printf '%s' "${app_private_key_b64}" | base64 -d > "${private_key_file}"
+  signature="$(
+    printf '%s' "${signing_input}" \
+      | openssl dgst -sha256 -sign "${private_key_file}" -binary \
+      | base64url
+  )"
+  rm -f "${private_key_file}"
+  trap - RETURN
+
+  printf '%s.%s\n' "${signing_input}" "${signature}"
+}
+
+mint_installation_token() {
+  local app_jwt
+
+  app_jwt="$(mint_app_jwt)"
+  curl -fsSL \
+    -X POST \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${app_jwt}" \
+    -H "X-GitHub-Api-Version: 2026-03-10" \
+    "${github_app_installation_api}" \
+    | jq -r '.token'
+}
+
+mint_token() {
+  local endpoint="$1"
+  local installation_token
+
+  installation_token="$(mint_installation_token)"
+  curl -fsSL \
+    -X POST \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${installation_token}" \
+    -H "X-GitHub-Api-Version: 2026-03-10" \
+    "${github_api}/${endpoint}" \
+    | jq -r '.token'
+}
+
+cleanup() {
+  set +e
+  if [ -f .runner ]; then
+    echo "Removing GitHub Actions runner ${RUNNER_NAME}..."
+    remove_token="$(mint_token remove-token)"
+    ./config.sh remove --unattended --token "${remove_token}"
+  fi
+}
+
+trap cleanup EXIT INT TERM
+
+mkdir -p "${RUNNER_WORKDIR}"
+
+if [ "${SKIP_ANDROID_SDK:-0}" != "1" ] && [ ! -x "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" ]; then
+  echo "Seeding persistent Android SDK cache at ${ANDROID_SDK_ROOT}..."
+  mkdir -p "${ANDROID_SDK_ROOT}"
+  cp -a /opt/android-sdk-seed/. "${ANDROID_SDK_ROOT}/"
+fi
+
+export PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${ANDROID_SDK_ROOT}/emulator:${PATH}"
+
+if [ ! -f .runner ]; then
+  echo "Configuring GitHub Actions runner ${RUNNER_NAME} for ${RUNNER_REPOSITORY}..."
+  registration_token="$(mint_token registration-token)"
+  ./config.sh \
+    --unattended \
+    --replace \
+    --url "${github_url}" \
+    --token "${registration_token}" \
+    --name "${RUNNER_NAME}" \
+    --labels "${RUNNER_LABELS}" \
+    --work "${RUNNER_WORKDIR}"
+fi
+
+exec ./run.sh
