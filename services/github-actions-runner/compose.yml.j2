@@ -11,6 +11,10 @@ services:
       context: .
     container_name: github-runner-{{ runner.name }}
     restart: unless-stopped
+    # run.sh is PID 1 and does not reap; CI jobs spawn many git/node children
+    # whose orphaned grandchildren would otherwise pile up as zombies. tini
+    # reaps them and transparently forwards signals to run.sh.
+    init: true
     environment:
       RUNNER_REPOSITORY: "{{ github_actions_runners.repository }}"
       RUNNER_NAME: "{{ inventory_hostname }}-{{ runner.name }}"

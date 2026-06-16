@@ -44,6 +44,14 @@ workflows on this pool should **not** also use `actions/setup-node`'s
 `cache: pnpm` — that tars the store up and re-extracts it every job, the
 redundant I/O the persistent store exists to avoid.
 
+Concurrent `pnpm install` reads/hardlinks from a shared store are safe, but
+simultaneous *writes* into one store under heavy parallelism can occasionally
+hit `Cannot link`/index races. If that surfaces, the escape hatch is
+**per-runner stores on the SSD** (each co-located with that runner's
+`/runner-work`): point each light runner's `/cache/pnpm` at its own
+`/mnt/ci-ssd/ordago-light-N-pnpm` instead of the shared path. ~3 GB × 4 ≈ 12 GB
+still fits the 30 GB SSD; it trades cache-hit rate for zero write contention.
+
 ## Deployment
 
 This is **deployed by ansible** (`make deploy host=powerserver`), gated by
