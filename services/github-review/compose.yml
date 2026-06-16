@@ -9,6 +9,7 @@ services:
       - STATE_DIR=/var/lib/github-review
       - PROJECTS_ROOT=/opt/personal/projects
       - ROUTER_INTERNAL_URL=http://claude-router:8000
+      - AGENT_ROLE=reviewer
       - CODEX_STATE_ROOT=/opt/personal/codex-code-state
       - CODEX_MODEL=gpt-5.5
       - REVIEWER_BOT_LOGIN=homelab-claude-reviewer[bot]
