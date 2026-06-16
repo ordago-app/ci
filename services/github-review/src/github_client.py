@@ -58,9 +58,16 @@ class GitHubClient:
         return f"{changed} files changed, {additions} insertions(+), {deletions} deletions(-)"
 
     def ci_summary(self, repo: str, head_sha: str) -> str:
-        body = self._github_get(
-            f"https://api.github.com/repos/{repo}/commits/{head_sha}/check-runs", params={}
-        )
+        # CI status is auxiliary prompt context, not the review itself. The
+        # reviewer App is intentionally minimal (Pull requests / Contents /
+        # Metadata) and lacks Checks: Read, so this endpoint 403s. Surface the
+        # limitation in the prompt rather than aborting the whole review.
+        try:
+            body = self._github_get(
+                f"https://api.github.com/repos/{repo}/commits/{head_sha}/check-runs", params={}
+            )
+        except httpx.HTTPStatusError as exc:
+            return f"CI status unavailable (HTTP {exc.response.status_code})"
         runs = body.get("check_runs", []) if isinstance(body, dict) else []
         if not runs:
             return "no check runs reported"
