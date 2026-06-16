@@ -42,3 +42,7 @@ def test_prompt_contains_review_policy_and_pr_context() -> None:
     assert "prioritize correctness" in prompt
     assert "scripts/backup.sh" in prompt
     assert "do not push commits" in prompt
+    # The service posts exactly one review; the model must not post itself,
+    # or every PR gets duplicate reviews.
+    assert "do not post" in prompt.lower()
+    assert "final message" in prompt.lower()

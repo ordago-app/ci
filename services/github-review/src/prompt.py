@@ -21,7 +21,10 @@ Review stance:
 - cite file and line references
 - do not modify the PR
 - do not push commits
-- post one GitHub review with findings, or a concise no-findings comment
+- do NOT post to GitHub yourself: never run `gh`, `git`, or any write tool;
+  the service posts your review for you (posting it yourself causes duplicates)
+- output your complete review as your final message — findings with file/line
+  references, or a concise "No findings." when the change is clean
 
 Context:
 - title: {pr.title}
