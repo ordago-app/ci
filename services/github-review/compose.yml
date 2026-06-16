@@ -4,6 +4,10 @@ services:
     build: .
     container_name: github-review
     restart: unless-stopped
+    # Run tini as PID 1 so exited children are reaped. The worker shells out to
+    # git, whose transient helper processes get reparented to PID 1; without an
+    # init they linger as zombies.
+    init: true
     environment:
       - AGENT_REVIEW_CONFIG=/etc/github-review/agent-review.yml
       - STATE_DIR=/var/lib/github-review
