@@ -133,6 +133,15 @@ def test_image_points_pnpm_store_at_the_mounted_volume():
     )
 
 
+def test_every_runner_runs_an_init_to_reap_zombies():
+    # run.sh is PID 1 and CI jobs spawn many git/node children; without an init
+    # their orphaned grandchildren accumulate as zombies (same class of leak as
+    # mcp-gateway / github-review). tini reaps and forwards signals to run.sh.
+    services = render()["services"]
+    for name, svc in services.items():
+        assert svc.get("init") is True, f"{name} must set init: true to reap CI-job zombies"
+
+
 def test_secret_env_file_and_external_network():
     compose = render()
     for svc in compose["services"].values():
