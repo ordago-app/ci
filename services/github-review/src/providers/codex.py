@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import concurrent.futures
+import json
+from pathlib import Path
+
+from docker import DockerClient
+
+from ..config import ToolProfile
+from ..job_store import ReviewJob
+from ..provider import ReviewResult, SessionRef
+
+
+def render_codex_config(*, caller: str, mcps: dict[str, list[str]], model: str) -> str:
+    lines = [f'model = "{model}"', ""]
+    for mcp_name, caps in mcps.items():
+        for cap in caps:
+            key = mcp_name if len(caps) == 1 else f"{mcp_name}-{cap}"
+            lines.extend(
+                [
+                    f"[mcp_servers.{key}]",
+                    f'url = "http://mcp-gateway:8000/mcp/{mcp_name}/{cap}/mcp"',
+                    f'http_headers = {{ "X-MCP-Caller" = "codex-code-server-{caller}" }}',
+                    "",
+                ]
+            )
+    return "\n".join(lines)
+
+
+class CodexReviewProvider:
+    def __init__(
+        self,
+        *,
+        docker_client: DockerClient,
+        projects_root: Path,
+        codex_state_root: Path,
+        router_url: str,
+        model: str,
+    ) -> None:
+        self._docker = docker_client
+        self._projects_root = projects_root
+        self._codex_state_root = codex_state_root
+        self._router_url = router_url
+        self._model = model
+
+    def start_review_session(self, job: ReviewJob, worktree: Path, profile: ToolProfile) -> SessionRef:
+        auth = self._codex_state_root / "auth.json"
+        if not auth.exists():
+            raise RuntimeError("Codex auth is not onboarded; run `make codex-onboard host=<host>`")
+
+        image = self._docker.images.get(f"homelab/codex-code-{job.project}:latest")
+        codex_home = self._projects_root / job.project / "review-sessions" / str(job.id)
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "config.toml").write_text(
+            render_codex_config(caller=job.project, mcps=profile.mcps, model=self._model)
+        )
+        auth_link = codex_home / "auth.json"
+        if auth_link.exists() or auth_link.is_symlink():
+            auth_link.unlink()
+        auth_link.symlink_to(auth)
+
+        container = self._docker.containers.run(
+            image=image.id,
+            name=f"codex-review-{job.id}",
+            command=["sleep", "infinity"],
+            detach=True,
+            network="homelab",
+            environment={
+                "SESSION_ID": f"review-{job.id}",
+                "ROUTER_INTERNAL_URL": self._router_url,
+                "AGENT_ROLE": profile.github_role,
+                "CODEX_HOME": "/home/agent/.codex",
+            },
+            volumes={
+                str(worktree): {"bind": "/workspace", "mode": "rw"},
+                str(codex_home): {"bind": "/home/agent/.codex", "mode": "rw"},
+                str(self._codex_state_root): {"bind": str(self._codex_state_root), "mode": "rw"},
+            },
+        )
+        return SessionRef(id=str(job.id), container=container.name, worktree=worktree)
+
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        container = self._docker.containers.get(session.container)
+        cmd = [
+            "codex",
+            "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            prompt,
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(container.exec_run, cmd, stdout=True, stderr=True)
+            try:
+                result = future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError as exc:
+                self.cleanup(session)
+                raise RuntimeError("codex review timed out") from exc
+        output = result.output.decode("utf-8", errors="replace")
+        if result.exit_code != 0:
+            raise RuntimeError(f"codex review failed: {output.strip()}")
+        body = self._extract_review_body(output)
+        return ReviewResult(body=body, event="COMMENT")
+
+    def cleanup(self, session: SessionRef) -> None:
+        try:
+            self._docker.containers.get(session.container).remove(force=True)
+        except Exception:
+            pass
+
+    def _extract_review_body(self, output: str) -> str:
+        messages: list[str] = []
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "message" and event.get("content"):
+                messages.append(str(event["content"]))
+        body = "\n".join(messages).strip()
+        if not body:
+            raise RuntimeError("codex produced no review body")
+        return body

@@ -1,0 +1,28 @@
+services:
+  github-review:
+    image: homelab/github-review:latest
+    build: .
+    container_name: github-review
+    restart: unless-stopped
+    environment:
+      - AGENT_REVIEW_CONFIG=/etc/github-review/agent-review.yml
+      - STATE_DIR=/var/lib/github-review
+      - PROJECTS_ROOT=/opt/personal/projects
+      - ROUTER_INTERNAL_URL=http://claude-router:8000
+      - CODEX_STATE_ROOT=/opt/personal/codex-code-state
+      - CODEX_MODEL=gpt-5.5
+      - REVIEWER_BOT_LOGIN=homelab-claude-reviewer[bot]
+      - POLL_INTERVAL_SECONDS=300
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - /opt/personal/projects:/opt/personal/projects:rw
+      - /opt/personal/codex-code-state:/opt/personal/codex-code-state:rw
+      - /opt/personal/state/github-review:/var/lib/github-review:rw
+      - /opt/personal/agent-review.yml:/etc/github-review/agent-review.yml:ro
+    networks:
+      - homelab
+
+networks:
+  homelab:
+    external: true
+    name: homelab
