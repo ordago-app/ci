@@ -28,8 +28,14 @@ class GitWorktreeManager:
         worktree = self._projects_root / project / "reviews" / f"pr-{pr_number}-{short_sha}"
         if worktree.exists():
             shutil.rmtree(worktree)
+        # Drop any stale registration a prior run left behind (cleanup() rmtree's
+        # the directory without deregistering), then force the add so a leftover
+        # entry never blocks a fresh review.
+        self._run(self._git(repo_dir, "worktree", "prune"))
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        self._run(self._git(repo_dir, "worktree", "add", "--detach", str(worktree), head_sha))
+        self._run(
+            self._git(repo_dir, "worktree", "add", "--detach", "--force", str(worktree), head_sha)
+        )
         return worktree
 
     def _git(self, repo_dir: Path, *args: str) -> list[str]:
