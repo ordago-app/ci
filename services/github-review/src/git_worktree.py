@@ -29,7 +29,9 @@ class GitWorktreeManager:
         if worktree.exists():
             shutil.rmtree(worktree)
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        self._run(["git", "-C", str(repo_dir), "worktree", "add", "--detach", str(worktree), head_sha])
+        self._run(
+            ["git", "-C", str(repo_dir), "worktree", "add", "--detach", str(worktree), head_sha]
+        )
         return worktree
 
     def cleanup(self, worktree: Path) -> None:

@@ -33,7 +33,9 @@ class GitHubClient:
         self._http = http or httpx.Client(timeout=20)
 
     def list_open_prs(self, repo: str) -> list[PullRequest]:
-        body = self._github_get(f"https://api.github.com/repos/{repo}/pulls", params={"state": "open"})
+        body = self._github_get(
+            f"https://api.github.com/repos/{repo}/pulls", params={"state": "open"}
+        )
         return [self._to_pull_request(item) for item in body]
 
     def get_pull_request(self, repo: str, number: int) -> PullRequest:
@@ -41,11 +43,15 @@ class GitHubClient:
         return self._to_pull_request(item)
 
     def changed_files(self, repo: str, number: int) -> list[str]:
-        body = self._github_get(f"https://api.github.com/repos/{repo}/pulls/{number}/files", params={})
+        body = self._github_get(
+            f"https://api.github.com/repos/{repo}/pulls/{number}/files", params={}
+        )
         return [str(item["filename"]) for item in body]
 
     def diffstat(self, repo: str, number: int) -> str:
-        files = self._github_get(f"https://api.github.com/repos/{repo}/pulls/{number}/files", params={})
+        files = self._github_get(
+            f"https://api.github.com/repos/{repo}/pulls/{number}/files", params={}
+        )
         changed = len(files)
         additions = sum(int(item.get("additions") or 0) for item in files)
         deletions = sum(int(item.get("deletions") or 0) for item in files)
@@ -59,8 +65,7 @@ class GitHubClient:
         if not runs:
             return "no check runs reported"
         parts = [
-            f"{run.get('name')}: {run.get('status')} / {run.get('conclusion')}"
-            for run in runs
+            f"{run.get('name')}: {run.get('status')} / {run.get('conclusion')}" for run in runs
         ]
         return "; ".join(parts)
 

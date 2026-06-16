@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.job_store import JobStatus, ReviewJob, ReviewJobStore
+from src.job_store import JobStatus, ReviewJobStore
 
 
 def make_store(tmp_path: Path) -> ReviewJobStore:

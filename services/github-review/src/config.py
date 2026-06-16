@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -57,7 +58,7 @@ class ReviewConfig:
     tool_profiles: dict[str, ToolProfile]
 
     @classmethod
-    def load(cls, path: Path) -> "ReviewConfig":
+    def load(cls, path: Path) -> ReviewConfig:
         try:
             raw_doc = yaml.safe_load(path.read_text()) or {}
             raw = _RawConfig.model_validate(raw_doc)

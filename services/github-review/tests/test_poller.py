@@ -69,14 +69,21 @@ def test_enqueues_new_open_pr_head_sha(tmp_path: Path) -> None:
 def test_skips_draft_when_policy_disables_drafts(tmp_path: Path) -> None:
     store = ReviewJobStore(tmp_path / "jobs.db")
     store.init()
-    poller = ReviewPoller(config(tmp_path), store, FakeGitHub([pr(draft=True)]), reviewer_bot="reviewer[bot]")
+    poller = ReviewPoller(
+        config(tmp_path), store, FakeGitHub([pr(draft=True)]), reviewer_bot="reviewer[bot]"
+    )
     assert poller.poll_once() == []
 
 
 def test_skips_reviewer_bot_author(tmp_path: Path) -> None:
     store = ReviewJobStore(tmp_path / "jobs.db")
     store.init()
-    poller = ReviewPoller(config(tmp_path), store, FakeGitHub([pr(author="reviewer[bot]")]), reviewer_bot="reviewer[bot]")
+    poller = ReviewPoller(
+        config(tmp_path),
+        store,
+        FakeGitHub([pr(author="reviewer[bot]")]),
+        reviewer_bot="reviewer[bot]",
+    )
     assert poller.poll_once() == []
 
 

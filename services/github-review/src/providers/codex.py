@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 from pathlib import Path
 
@@ -43,7 +44,9 @@ class CodexReviewProvider:
         self._router_url = router_url
         self._model = model
 
-    def start_review_session(self, job: ReviewJob, worktree: Path, profile: ToolProfile) -> SessionRef:
+    def start_review_session(
+        self, job: ReviewJob, worktree: Path, profile: ToolProfile
+    ) -> SessionRef:
         auth = self._codex_state_root / "auth.json"
         if not auth.exists():
             raise RuntimeError("Codex auth is not onboarded; run `make codex-onboard host=<host>`")
@@ -102,10 +105,8 @@ class CodexReviewProvider:
         return ReviewResult(body=body, event="COMMENT")
 
     def cleanup(self, session: SessionRef) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self._docker.containers.get(session.container).remove(force=True)
-        except Exception:
-            pass
 
     def _extract_review_body(self, output: str) -> str:
         messages: list[str] = []

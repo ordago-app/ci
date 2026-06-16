@@ -2,7 +2,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from src.git_worktree import GitWorktreeError, GitWorktreeManager
 
 
