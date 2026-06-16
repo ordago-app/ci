@@ -30,13 +30,18 @@ fit (no concurrent emulator); 6+ lanes would need a memory upgrade. SSD capacity
 (4 light work dirs × ~3 GB ≈ 12–16 GB of 30 GB) has headroom. The next unlock is
 a larger SSD + more RAM.
 
-## Deployment (current)
+## Deployment
 
-This is **deployed manually** to `/opt/services/github-actions-runner/` on
-`powerserver` (`docker compose up -d`); secrets live outside the repo at
-`/opt/personal/secrets/github-actions-runner.env`. The Ansible "First Deploy
-Checklist" below is the intended future flow and is not wired up yet — edit the
-files here and copy them to the host, or `docker compose` on the host directly.
+This is **deployed by ansible** (`make deploy host=powerserver`), gated by
+`github-actions-runner` in [`personal/services-enabled.yml`](../../personal/services-enabled.yml).
+The pool topology lives in [`personal/github-runners.yml`](../../personal/github-runners.yml);
+`services.yml` renders `compose.yml` from [`compose.yml.j2`](compose.yml.j2),
+creates the per-runner work/cache dirs, and brings the stack up. Secrets live
+outside the repo at `/opt/personal/secrets/github-actions-runner.env`, rendered
+from `github_actions_runner_app` in `secrets/secrets.prod.yml`.
+
+To add or resize the pool, edit `personal/github-runners.yml` (each runner is a
+list entry) and re-deploy — no hand-edited compose on the host.
 
 ## Safety
 
