@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import json
+import os
 from pathlib import Path
 
 from docker import DockerClient
@@ -10,6 +11,11 @@ from docker import DockerClient
 from ..config import ToolProfile
 from ..job_store import ReviewJob
 from ..provider import ReviewResult, SessionRef
+
+# The codex-code agent image runs as this non-root user; the worktree and
+# CODEX_HOME it mounts must be owned by it or codex can't write (os error 13).
+AGENT_UID = 1000
+AGENT_GID = 1000
 
 
 def render_codex_config(*, caller: str, mcps: dict[str, list[str]], model: str) -> str:
@@ -62,6 +68,10 @@ class CodexReviewProvider:
             auth_link.unlink()
         auth_link.symlink_to(auth)
 
+        # github-review runs as root; the codex container runs as `agent`
+        # (uid 1000). Hand both mounts to that uid so codex can write.
+        self._make_agent_writable(worktree, codex_home)
+
         container = self._docker.containers.run(
             image=image.id,
             name=f"codex-review-{job.id}",
@@ -107,6 +117,27 @@ class CodexReviewProvider:
     def cleanup(self, session: SessionRef) -> None:
         with contextlib.suppress(Exception):
             self._docker.containers.get(session.container).remove(force=True)
+
+    def _make_agent_writable(self, *paths: Path) -> None:
+        for path in paths:
+            if not path.exists() and not path.is_symlink():
+                continue
+            if path.is_dir() and not path.is_symlink():
+                for child in path.rglob("*"):
+                    self._chown_for_agent(child)
+            self._chown_for_agent(path)
+
+    def _chown_for_agent(self, path: Path) -> None:
+        try:
+            if path.is_symlink():
+                os.lchown(path, AGENT_UID, AGENT_GID)
+            else:
+                os.chown(path, AGENT_UID, AGENT_GID)
+        except PermissionError:
+            # When running unprivileged (tests/local) the chown is a no-op; in
+            # the container github-review is root, so a failure there is real.
+            if os.geteuid() == 0:
+                raise
 
     def _extract_review_body(self, output: str) -> str:
         messages: list[str] = []
