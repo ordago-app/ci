@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 from src.config import ToolProfile
 from src.job_store import JobStatus, ReviewJob
+from src.providers import codex as codex_mod
 from src.providers.codex import CodexReviewProvider
 
 
@@ -64,7 +65,37 @@ def test_starts_codex_review_container(tmp_path: Path) -> None:
     assert session.container == "codex-review-3"
     assert (tmp_path / "projects" / "homelab" / "review-sessions" / "3" / "config.toml").exists()
     env = raw.containers.run.call_args.kwargs["environment"]
-    assert env["AGENT_ROLE"] == "reviewer"
+    assert env["AGENT_ROLE"] == codex_mod.CODEX_GH_ROLE
+
+
+def test_review_container_cannot_post_to_github() -> None:
+    # Regression: the model ignores prompt instructions and posts its own review
+    # via `gh` (it had the write-capable reviewer token), so every PR got a
+    # duplicate review. The worker is the sole poster; the review container must
+    # NOT receive a write-capable role.
+    raw = MagicMock()
+    image = MagicMock()
+    image.id = "sha256:image"
+    raw.images.get.return_value = image
+    raw.containers.run.return_value = MagicMock(name="codex-review-3")
+    provider = CodexReviewProvider(
+        docker_client=raw,
+        projects_root=Path("/tmp/x-projects"),
+        codex_state_root=Path("/tmp/x-state"),
+        router_url="http://claude-router:8000",
+        model="gpt-5.5",
+    )
+    Path("/tmp/x-state").mkdir(parents=True, exist_ok=True)
+    (Path("/tmp/x-state") / "auth.json").write_text("{}")
+    worktree = Path("/tmp/x-worktree")
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    provider.start_review_session(job(), worktree, profile())
+
+    env = raw.containers.run.call_args.kwargs["environment"]
+    assert env["AGENT_ROLE"] not in ("reviewer", "developer"), (
+        "review container must not get a write-capable github role"
+    )
 
 
 def test_extract_review_body_parses_codex_agent_message() -> None:
@@ -117,8 +148,6 @@ def test_makes_worktree_and_codex_home_agent_writable(
     # user (uid 1000), which then can't write its own home -> "Permission
     # denied (os error 13)". The provider must chown both to the agent uid.
     import os
-
-    from src.providers import codex as codex_mod
 
     raw = MagicMock()
     image = MagicMock()

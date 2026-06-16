@@ -18,6 +18,13 @@ from ..provider import ReviewResult, SessionRef
 AGENT_UID = 1000
 AGENT_GID = 1000
 
+# The worker is the sole poster. The review container must NOT get a
+# write-capable github role, or the model posts its own review via `gh` and
+# every PR ends up with duplicate reviews. claude-router does not configure
+# this role, so the gh shim / credential helper run unauthenticated (codex
+# reads code from the local worktree and the github MCP, never `gh` writes).
+CODEX_GH_ROLE = "reviewer-readonly"
+
 
 def render_codex_config(*, caller: str, mcps: dict[str, list[str]], model: str) -> str:
     lines = [f'model = "{model}"', ""]
@@ -82,7 +89,7 @@ class CodexReviewProvider:
             environment={
                 "SESSION_ID": f"review-{job.id}",
                 "ROUTER_INTERNAL_URL": self._router_url,
-                "AGENT_ROLE": profile.github_role,
+                "AGENT_ROLE": CODEX_GH_ROLE,
                 "CODEX_HOME": "/home/agent/.codex",
             },
             volumes={
