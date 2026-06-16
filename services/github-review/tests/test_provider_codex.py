@@ -93,6 +93,22 @@ def test_extract_review_body_parses_codex_agent_message() -> None:
     assert "Looks good." in body
 
 
+def test_extract_review_body_surfaces_raw_output_when_empty() -> None:
+    # When codex returns no agent_message the error must include the raw output
+    # so we can see what it actually emitted, instead of an opaque message.
+    provider = CodexReviewProvider(
+        docker_client=MagicMock(),
+        projects_root=Path("/x"),
+        codex_state_root=Path("/y"),
+        router_url="http://claude-router:8000",
+        model="gpt-5.5",
+    )
+    output = '{"type":"turn.failed","error":{"message":"DISTINCTIVE_MARKER_42"}}'
+    with pytest.raises(RuntimeError) as exc:
+        provider._extract_review_body(output)
+    assert "DISTINCTIVE_MARKER_42" in str(exc.value)
+
+
 def test_makes_worktree_and_codex_home_agent_writable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

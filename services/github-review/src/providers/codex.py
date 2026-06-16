@@ -4,6 +4,7 @@ import concurrent.futures
 import contextlib
 import json
 import os
+import sys
 from pathlib import Path
 
 from docker import DockerClient
@@ -157,5 +158,13 @@ class CodexReviewProvider:
                     last_text = text
         body = last_text.strip()
         if not body:
-            raise RuntimeError("codex produced no review body")
+            # Dump the full transcript to the container log and surface a tail in
+            # the error so "no review body" is diagnosable instead of opaque.
+            print(
+                f"[github-review] codex emitted no agent_message; raw output:\n{output}",
+                file=sys.stderr,
+                flush=True,
+            )
+            tail = output.strip()[-1500:] or "<empty>"
+            raise RuntimeError(f"codex produced no review body; raw tail: {tail}")
         return body
