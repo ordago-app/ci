@@ -99,6 +99,40 @@ def test_light_runner_work_dirs_live_on_the_ssd():
         assert work.startswith("/mnt/ci-ssd/")
 
 
+def test_light_runners_share_one_ssd_pnpm_store():
+    services = render()["services"]
+    # The mounted pnpm cache volume only persists across jobs if pnpm's store-dir
+    # actually points at it (the image sets store-dir=/cache/pnpm). For the light
+    # pool, node_modules lives in /runner-work on the SSD, so the store must be on
+    # the SAME disk (/mnt/ci-ssd) for pnpm to hardlink instead of copy across
+    # disks. A single shared store maximizes cache hits and fits the SSD budget.
+    def pnpm_host(name: str) -> str:
+        return next(
+            v.rsplit(":/cache/pnpm:", 1)[0]
+            for v in services[name]["volumes"]
+            if ":/cache/pnpm:" in v
+        )
+
+    light = [f"ordago-android-e2e-{n}" for n in (2, 3, 4, 5)]
+    hosts = {pnpm_host(name) for name in light}
+    assert hosts == {"/mnt/ci-ssd/pnpm-store"}, (
+        "light runners must share one pnpm store on the SSD (same disk as /runner-work)"
+    )
+    # Heavy's work dir is on the HDD, so its store stays on the HDD to keep
+    # hardlinks on the same filesystem.
+    assert pnpm_host("ordago-android-e2e").startswith("/opt/personal/")
+
+
+def test_image_points_pnpm_store_at_the_mounted_volume():
+    # Regression: PNPM_HOME=/cache/pnpm only sets pnpm's global bin, not the
+    # store, so without store-dir pnpm kept its store on the container layer and
+    # the mounted volume sat empty/unused. A global .npmrc store-dir wires it up.
+    dockerfile = (REPO_ROOT / "services/github-actions-runner/Dockerfile").read_text()
+    assert "store-dir=/cache/pnpm" in dockerfile, (
+        "image must set pnpm store-dir to the mounted /cache/pnpm volume"
+    )
+
+
 def test_secret_env_file_and_external_network():
     compose = render()
     for svc in compose["services"].values():

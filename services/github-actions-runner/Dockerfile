@@ -94,6 +94,14 @@ RUN install -d -o 1000 -g 1000 /home/runner /runner-work /cache /cache/gradle /c
  && chown 1000:1000 /opt/actions-runner \
  && chmod +x /opt/actions-runner/config.sh /opt/actions-runner/run.sh
 
+# Point pnpm's content-addressed store at the mounted /cache/pnpm volume.
+# PNPM_HOME only sets the global bin dir, not the store, so without this pnpm
+# kept its store on the container layer and the mounted (persistent) volume sat
+# empty — every job re-fetched dependencies. A user-level .npmrc is honored by
+# pnpm regardless of the Node version quirks in the base image.
+RUN printf 'store-dir=/cache/pnpm\n' > /home/runner/.npmrc \
+ && chown 1000:1000 /home/runner/.npmrc
+
 COPY entrypoint.sh /usr/local/bin/github-runner-entrypoint
 RUN chmod +x /usr/local/bin/github-runner-entrypoint
 

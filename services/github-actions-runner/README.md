@@ -27,8 +27,22 @@ light runners' `/runner-work` onto a **30 GB SSD** (`/mnt/ci-ssd`): flash absorb
 the concurrent random I/O the HDD couldn't. With 4 light lanes on the SSD + 1
 heavy on the HDD, the binding constraint becomes **RAM (15 GiB)** — ~5 light jobs
 fit (no concurrent emulator); 6+ lanes would need a memory upgrade. SSD capacity
-(4 light work dirs × ~3 GB ≈ 12–16 GB of 30 GB) has headroom. The next unlock is
-a larger SSD + more RAM.
+(4 light work dirs × ~3 GB ≈ 12–16 GB of 30 GB, plus one shared pnpm store
+≈ 2–5 GB) has headroom. The next unlock is a larger SSD + more RAM.
+
+### pnpm store
+
+The image sets pnpm `store-dir=/cache/pnpm` (a user-level `.npmrc`). Without it,
+`PNPM_HOME=/cache/pnpm` only relocated the global bin — pnpm kept its store on
+the container layer and the mounted volume sat empty, so every job re-fetched
+dependencies. The **light pool shares one store at `/mnt/ci-ssd/pnpm-store`**:
+it lives on the same disk as their `/runner-work`, so `pnpm install` hardlinks
+from the store instead of copying across disks, and one shared store maximizes
+cache hits. The heavy runner keeps its store on the HDD next to its HDD work
+dir (same-disk hardlinks). Because the store is now genuinely persistent,
+workflows on this pool should **not** also use `actions/setup-node`'s
+`cache: pnpm` — that tars the store up and re-extracts it every job, the
+redundant I/O the persistent store exists to avoid.
 
 ## Deployment
 
