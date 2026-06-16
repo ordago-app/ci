@@ -21,3 +21,28 @@ def test_rejects_sha_mismatch(tmp_path: Path, repo_dir: Path) -> None:
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
     with pytest.raises(GitWorktreeError, match="not present"):
         manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=5, head_sha="0" * 40)
+
+
+def test_git_commands_carry_safe_directory_guard(
+    tmp_path: Path, repo_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: in production the clone is owned by uid 1000 but the container
+    # runs git as root, so plain `git -C <repo>` fails with "detected dubious
+    # ownership" and every review job dies before Codex runs. Every git
+    # invocation must opt the repo into safe.directory to be ownership-agnostic.
+    head = sha(repo_dir, "feature")
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def recording_run(cmd: list[str], *args: object, **kwargs: object) -> object:
+        calls.append(cmd)
+        return real_run(cmd, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    manager = GitWorktreeManager(projects_root=tmp_path / "projects")
+    manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=5, head_sha=head)
+
+    git_calls = [cmd for cmd in calls if cmd and cmd[0] == "git"]
+    assert git_calls, "expected git to be invoked"
+    for cmd in git_calls:
+        assert f"safe.directory={repo_dir}" in cmd, f"git call missing safe.directory guard: {cmd}"

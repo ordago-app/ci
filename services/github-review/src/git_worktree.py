@@ -14,9 +14,9 @@ class GitWorktreeManager:
         self._projects_root = projects_root
 
     def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
-        self._run(["git", "-C", str(repo_dir), "fetch", "--all", "--prune"])
+        self._run(self._git(repo_dir, "fetch", "--all", "--prune"))
         present = subprocess.run(
-            ["git", "-C", str(repo_dir), "cat-file", "-e", f"{head_sha}^{{commit}}"],
+            self._git(repo_dir, "cat-file", "-e", f"{head_sha}^{{commit}}"),
             capture_output=True,
             text=True,
             check=False,
@@ -29,10 +29,14 @@ class GitWorktreeManager:
         if worktree.exists():
             shutil.rmtree(worktree)
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        self._run(
-            ["git", "-C", str(repo_dir), "worktree", "add", "--detach", str(worktree), head_sha]
-        )
+        self._run(self._git(repo_dir, "worktree", "add", "--detach", str(worktree), head_sha))
         return worktree
+
+    def _git(self, repo_dir: Path, *args: str) -> list[str]:
+        # The container runs git as root over a clone owned by the operator
+        # (uid 1000). Without this, git aborts with "detected dubious
+        # ownership". Scope the exemption to the repo we operate on.
+        return ["git", "-c", f"safe.directory={repo_dir}", "-C", str(repo_dir), *args]
 
     def cleanup(self, worktree: Path) -> None:
         if worktree.exists():
