@@ -140,15 +140,22 @@ class CodexReviewProvider:
                 raise
 
     def _extract_review_body(self, output: str) -> str:
-        messages: list[str] = []
+        # codex `exec --json` emits JSONL events; the review is the final
+        # agent_message: {"type":"item.completed","item":{"type":
+        # "agent_message","text":...}}. (Same schema the telegram codex backend
+        # consumes.) Keep the last non-empty agent_message as the review.
+        last_text = ""
         for line in output.splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") == "message" and event.get("content"):
-                messages.append(str(event["content"]))
-        body = "\n".join(messages).strip()
+            item = event.get("item") or {}
+            if event.get("type") == "item.completed" and item.get("type") == "agent_message":
+                text = str(item.get("text") or "")
+                if text:
+                    last_text = text
+        body = last_text.strip()
         if not body:
             raise RuntimeError("codex produced no review body")
         return body

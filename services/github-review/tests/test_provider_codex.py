@@ -67,6 +67,32 @@ def test_starts_codex_review_container(tmp_path: Path) -> None:
     assert env["AGENT_ROLE"] == "reviewer"
 
 
+def test_extract_review_body_parses_codex_agent_message() -> None:
+    # Regression: codex `exec --json` emits
+    # {"type":"item.completed","item":{"type":"agent_message","text":...}},
+    # not {"type":"message","content":...}. The old parser matched nothing and
+    # raised "codex produced no review body" even on a successful run.
+    provider = CodexReviewProvider(
+        docker_client=MagicMock(),
+        projects_root=Path("/x"),
+        codex_state_root=Path("/y"),
+        router_url="http://claude-router:8000",
+        model="gpt-5.5",
+    )
+    output = "\n".join(
+        [
+            '{"type":"item.started","item":{"type":"reasoning"}}',
+            '{"type":"item.completed","item":{"type":"command_execution","name":"rg"}}',
+            '{"type":"item.completed","item":'
+            '{"type":"agent_message","text":"## Review\\nLooks good."}}',
+            '{"type":"turn.completed"}',
+        ]
+    )
+    body = provider._extract_review_body(output)
+    assert body.startswith("## Review")
+    assert "Looks good." in body
+
+
 def test_makes_worktree_and_codex_home_agent_writable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
