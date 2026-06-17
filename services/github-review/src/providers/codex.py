@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
 import json
 import os
 import sys
 from pathlib import Path
 
 from docker import DockerClient
+from docker.errors import NotFound
 
 from ..config import ToolProfile
 from ..job_store import ReviewJob
@@ -123,8 +123,29 @@ class CodexReviewProvider:
         return ReviewResult(body=body, event="COMMENT")
 
     def cleanup(self, session: SessionRef) -> None:
-        with contextlib.suppress(Exception):
-            self._docker.containers.get(session.container).remove(force=True)
+        # Runs in the worker's finally, so it must not raise. But it must not
+        # silently swallow failures either: a hidden remove() error leaks one
+        # codex container per review and eventually exhausts the host.
+        try:
+            container = self._docker.containers.get(session.container)
+        except NotFound:
+            return
+        except Exception as exc:
+            print(
+                f"[github-review] could not look up review container "
+                f"{session.container} for cleanup: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        try:
+            container.remove(force=True)
+        except Exception as exc:
+            print(
+                f"[github-review] failed to remove review container {session.container}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _make_agent_writable(self, *paths: Path) -> None:
         for path in paths:

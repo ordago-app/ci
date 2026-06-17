@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 from src.config import ToolProfile
 from src.job_store import JobStatus, ReviewJob
+from src.provider import SessionRef
 from src.providers import codex as codex_mod
 from src.providers.codex import CodexReviewProvider
 
@@ -178,3 +179,40 @@ def test_makes_worktree_and_codex_home_agent_writable(
     assert str(worktree) in chowned_paths, "worktree must be chowned to the agent uid"
     assert str(codex_home) in chowned_paths, "CODEX_HOME must be chowned to the agent uid"
     assert all((u, g) == (codex_mod.AGENT_UID, codex_mod.AGENT_GID) for _, u, g in chowned)
+
+
+def test_cleanup_removes_container() -> None:
+    raw = MagicMock()
+    container = MagicMock()
+    raw.containers.get.return_value = container
+    provider = CodexReviewProvider(
+        docker_client=raw,
+        projects_root=Path("/x"),
+        codex_state_root=Path("/y"),
+        router_url="http://claude-router:8000",
+        model="gpt-5.5",
+    )
+    provider.cleanup(SessionRef(id="1", container="codex-review-1", worktree=Path("/w")))
+    container.remove.assert_called_once_with(force=True)
+
+
+def test_cleanup_surfaces_removal_failure(capsys: pytest.CaptureFixture[str]) -> None:
+    # Regression: cleanup() swallowed every exception, so a failing remove()
+    # silently leaked one codex container per review (observed on powerserver).
+    # A removal failure must be surfaced, not hidden.
+    raw = MagicMock()
+    container = MagicMock()
+    container.remove.side_effect = RuntimeError("docker daemon boom")
+    raw.containers.get.return_value = container
+    provider = CodexReviewProvider(
+        docker_client=raw,
+        projects_root=Path("/x"),
+        codex_state_root=Path("/y"),
+        router_url="http://claude-router:8000",
+        model="gpt-5.5",
+    )
+    # Must not raise (runs in a finally), but must log the failure.
+    provider.cleanup(SessionRef(id="1", container="codex-review-1", worktree=Path("/w")))
+    err = capsys.readouterr().err
+    assert "codex-review-1" in err
+    assert "docker daemon boom" in err
