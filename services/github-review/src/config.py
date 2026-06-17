@@ -18,6 +18,7 @@ class RepoPolicy(BaseModel):
     provider: str
     enabled: bool = True
     review_drafts: bool = False
+    review_bots: bool = False
     run_ci_first: bool = True
     tool_profile: str
 

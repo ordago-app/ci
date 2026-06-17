@@ -35,6 +35,10 @@ class ReviewPoller:
                     continue
                 if pr.author == self._reviewer_bot:
                     continue
+                # Dependabot and other bot PRs are mechanical version bumps; CI
+                # is the right gate, so skip *[bot] authors unless opted in.
+                if not repo_policy.review_bots and pr.author.endswith("[bot]"):
+                    continue
                 job = self._store.enqueue(
                     repo=repo_policy.repo,
                     project=repo_policy.project,

@@ -14,7 +14,9 @@ class FakeGitHub:
         return self.prs
 
 
-def config(tmp_path: Path, *, review_drafts: bool = False) -> ReviewConfig:
+def config(
+    tmp_path: Path, *, review_drafts: bool = False, review_bots: bool = False
+) -> ReviewConfig:
     path = tmp_path / "agent-review.yml"
     path.write_text(
         f"""
@@ -25,6 +27,7 @@ def config(tmp_path: Path, *, review_drafts: bool = False) -> ReviewConfig:
             provider: codex
             enabled: true
             review_drafts: {str(review_drafts).lower()}
+            review_bots: {str(review_bots).lower()}
             run_ci_first: true
             tool_profile: reviewer
         tool_profiles:
@@ -96,3 +99,29 @@ def test_new_sha_gets_second_job(tmp_path: Path) -> None:
     gh.prs = [pr(sha="two")]
     poller.poll_once()
     assert [job.head_sha for job in store.list_by_status(JobStatus.QUEUED)] == ["one", "two"]
+
+
+def test_skips_bot_authored_pr_by_default(tmp_path: Path) -> None:
+    # Dependabot and other bot PRs are mechanical; CI is the right gate, not an
+    # agentic review. Skip *[bot] authors unless review_bots is enabled.
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    poller = ReviewPoller(
+        config(tmp_path),
+        store,
+        FakeGitHub([pr(author="dependabot[bot]")]),
+        reviewer_bot="reviewer[bot]",
+    )
+    assert poller.poll_once() == []
+
+
+def test_reviews_bot_pr_when_review_bots_enabled(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    poller = ReviewPoller(
+        config(tmp_path, review_bots=True),
+        store,
+        FakeGitHub([pr(author="dependabot[bot]")]),
+        reviewer_bot="reviewer[bot]",
+    )
+    assert len(poller.poll_once()) == 1
