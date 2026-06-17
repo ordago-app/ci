@@ -111,3 +111,46 @@ def test_worker_polls_runs_review_and_marks_posted(tmp_path: Path) -> None:
     worker.tick()
     assert store.list_by_status(JobStatus.POSTED)[0].head_sha == "head"
     assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT")]
+
+
+class FlakyProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def start_review_session(self, job, worktree, profile) -> SessionRef:
+        return SessionRef(id=str(job.id), container="c", worktree=worktree)
+
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("transient codex failure")
+        return ReviewResult(body="No findings.", event="COMMENT")
+
+    def cleanup(self, session: SessionRef) -> None:
+        pass
+
+
+def test_worker_retries_failed_job_on_next_tick(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    gh = FakeGitHub()
+    provider = FlakyProvider()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=gh,
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": provider},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+        max_attempts=3,
+    )
+    worker.tick()  # first attempt fails
+    assert store.list_by_status(JobStatus.FAILED), "first attempt should have failed"
+    assert not store.list_by_status(JobStatus.POSTED)
+
+    worker.tick()  # retry succeeds
+    posted = store.list_by_status(JobStatus.POSTED)
+    assert posted and posted[0].head_sha == "head"
+    assert provider.calls == 2
+    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT")]

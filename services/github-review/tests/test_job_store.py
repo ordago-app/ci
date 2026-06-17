@@ -49,3 +49,24 @@ def test_transitions_record_failure_message(tmp_path: Path) -> None:
     assert updated.status == JobStatus.FAILED
     assert updated.attempts == 1
     assert updated.last_error == "provider timed out"
+
+
+def test_list_retryable_includes_queued_and_failed_under_limit(tmp_path: Path) -> None:
+    # Transient failures should self-heal: failed jobs under the attempt limit
+    # are retried alongside fresh queued ones; exhausted ones are terminal.
+    store = make_store(tmp_path)
+    queued = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "q", "base")
+
+    under = store.enqueue("alvaro/homelab", "homelab", "codex", 2, "u", "base")
+    store.mark_running(under.id)  # attempts -> 1
+    store.mark_failed(under.id, "boom")
+
+    exhausted = store.enqueue("alvaro/homelab", "homelab", "codex", 3, "x", "base")
+    for _ in range(3):  # attempts -> 3
+        store.mark_running(exhausted.id)
+        store.mark_failed(exhausted.id, "boom")
+
+    retryable_ids = {job.id for job in store.list_retryable(max_attempts=3)}
+    assert queued.id in retryable_ids
+    assert under.id in retryable_ids
+    assert exhausted.id not in retryable_ids

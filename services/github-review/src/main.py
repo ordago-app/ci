@@ -9,7 +9,7 @@ import docker
 from .config import ReviewConfig
 from .git_worktree import GitWorktreeManager
 from .github_client import GitHubClient
-from .job_store import JobStatus, ReviewJob, ReviewJobStore
+from .job_store import ReviewJob, ReviewJobStore
 from .poller import ReviewPoller
 from .prompt import build_review_prompt
 from .provider import ReviewProvider
@@ -27,6 +27,7 @@ class ReviewWorker:
         providers: dict[str, ReviewProvider],
         projects_root: Path,
         reviewer_bot: str,
+        max_attempts: int = 3,
     ) -> None:
         self._config = config
         self._store = store
@@ -35,12 +36,13 @@ class ReviewWorker:
         self._providers = providers
         self._projects_root = projects_root
         self._reviewer_bot = reviewer_bot
+        self._max_attempts = max_attempts
 
     def tick(self) -> None:
         ReviewPoller(
             self._config, self._store, self._github, reviewer_bot=self._reviewer_bot
         ).poll_once()
-        for job in self._store.list_by_status(JobStatus.QUEUED):
+        for job in self._store.list_retryable(self._max_attempts):
             self._run_job(job)
 
     def _run_job(self, job: ReviewJob) -> None:
@@ -99,6 +101,7 @@ def main() -> None:
     codex_model = os.environ.get("CODEX_MODEL", "gpt-5.5")
     reviewer_bot = os.environ.get("REVIEWER_BOT_LOGIN", "homelab-claude-reviewer[bot]")
     poll_interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
+    max_attempts = int(os.environ.get("MAX_REVIEW_ATTEMPTS", "3"))
 
     cfg = ReviewConfig.load(config_path)
     store = ReviewJobStore(state_dir / "jobs.db")
@@ -120,6 +123,7 @@ def main() -> None:
         },
         projects_root=projects_root,
         reviewer_bot=reviewer_bot,
+        max_attempts=max_attempts,
     )
 
     while True:

@@ -102,6 +102,20 @@ class ReviewJobStore:
             ).fetchall()
         return [self._from_row(row) for row in rows]
 
+    def list_retryable(self, max_attempts: int) -> list[ReviewJob]:
+        # Queued jobs plus failed jobs that haven't exhausted their attempts, so
+        # a transient failure self-heals on a later tick (ticks are the backoff).
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM review_jobs
+                WHERE status = ? OR (status = ? AND attempts < ?)
+                ORDER BY id
+                """,
+                (JobStatus.QUEUED, JobStatus.FAILED, max_attempts),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
     def mark_running(self, job_id: int) -> None:
         with self._connect() as conn:
             conn.execute(

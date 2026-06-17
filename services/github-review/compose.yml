@@ -18,6 +18,7 @@ services:
       - CODEX_MODEL=gpt-5.5
       - REVIEWER_BOT_LOGIN=homelab-claude-reviewer[bot]
       - POLL_INTERVAL_SECONDS=300
+      - MAX_REVIEW_ATTEMPTS=3
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:rw
       - /opt/personal/projects:/opt/personal/projects:rw
