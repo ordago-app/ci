@@ -46,3 +46,7 @@ def test_prompt_contains_review_policy_and_pr_context() -> None:
     # or every PR gets duplicate reviews.
     assert "do not post" in prompt.lower()
     assert "final message" in prompt.lower()
+    # The worktree is mounted at /workspace in the codex container, so the model
+    # must cite repo-relative paths or the links won't resolve on GitHub.
+    assert "repo-relative" in prompt.lower()
+    assert "/workspace" in prompt

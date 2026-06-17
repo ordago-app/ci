@@ -18,7 +18,9 @@ def build_review_prompt(
 Review stance:
 - prioritize correctness, regressions, security, missing tests, and operational risks
 - ignore cosmetic style unless it hides a bug
-- cite file and line references
+- cite repo-relative file paths with line numbers (e.g. `services/foo/bar.py:42`);
+  the repo is checked out at /workspace, so never write /workspace-prefixed or
+  absolute paths — they won't resolve as links on GitHub
 - do not modify the PR
 - do not push commits
 - do NOT post to GitHub yourself: never run `gh`, `git`, or any write tool;
