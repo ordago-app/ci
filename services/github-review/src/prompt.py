@@ -27,6 +27,10 @@ Review stance:
   the service posts your review for you (posting it yourself causes duplicates)
 - output your complete review as your final message — findings with file/line
   references, or a concise "No findings." when the change is clean
+- end your final message with a verdict line on its own line, exactly one of:
+  `VERDICT: APPROVE` (no required changes; safe for a human to merge) or
+  `VERDICT: REQUEST_CHANGES` (there are findings that should be fixed first)
+- choose APPROVE only when you found nothing that should block the merge
 
 Context:
 - title: {pr.title}

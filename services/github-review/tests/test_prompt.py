@@ -50,3 +50,6 @@ def test_prompt_contains_review_policy_and_pr_context() -> None:
     # must cite repo-relative paths or the links won't resolve on GitHub.
     assert "repo-relative" in prompt.lower()
     assert "/workspace" in prompt
+    # The loop terminates on an explicit verdict line the worker can parse.
+    assert "VERDICT: APPROVE" in prompt
+    assert "VERDICT: REQUEST_CHANGES" in prompt
