@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import ReviewConfig
-from .job_store import ReviewJob, ReviewJobStore
+from .job_store import JobStatus, ReviewJob, ReviewJobStore
 from .poller import ReviewPoller
 from .prompt import build_review_prompt
 from .provider import ReviewProvider
@@ -33,6 +33,10 @@ class ReviewWorker:
         self._reviewer_bot = reviewer_bot
         self._max_attempts = max_attempts
         self._max_rounds = max_rounds
+
+    @property
+    def reviewer_bot(self) -> str:
+        return self._reviewer_bot
 
     def tick(self) -> None:
         ReviewPoller(
@@ -112,8 +116,16 @@ class ReviewWorker:
         job = self._store.enqueue(repo, project, "codex", pr_number, head_sha, pr.base_sha)
         self._run_job(job)
         done = self._store.get(job.id)
-        verdict = done.verdict if done and done.verdict else "REQUEST_CHANGES"
-        return ReviewResultSummary(head_sha, verdict, False)
+        if done is None or done.status != JobStatus.POSTED or done.verdict is None:
+            detail = (
+                done.last_error
+                if done is not None and done.last_error
+                else f"status={done.status if done is not None else 'missing'}"
+            )
+            raise RuntimeError(
+                f"review did not complete for {repo}#{pr_number}@{head_sha}: {detail}"
+            )
+        return ReviewResultSummary(head_sha, done.verdict, False)
 
 
 @dataclass(frozen=True)

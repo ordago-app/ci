@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from src.config import ReviewConfig
 from src.github_client import PullRequest
 from src.job_store import JobStatus, ReviewJobStore
@@ -154,6 +155,35 @@ def test_worker_retries_failed_job_on_next_tick(tmp_path: Path) -> None:
     assert posted and posted[0].head_sha == "head"
     assert provider.calls == 2
     assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT", "head")]
+
+
+class FailingProvider:
+    def start_review_session(self, job, worktree, profile) -> SessionRef:
+        return SessionRef(id=str(job.id), container="c", worktree=worktree)
+
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        raise RuntimeError("codex boom")
+
+    def cleanup(self, session: SessionRef) -> None:
+        pass
+
+
+def test_run_pr_review_raises_when_review_fails(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    gh = FakeGitHub()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=gh,
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": FailingProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+        max_attempts=3,
+    )
+    with pytest.raises(RuntimeError):
+        worker.run_pr_review("alvaro/homelab", 1)
 
 
 class ApprovingProvider:

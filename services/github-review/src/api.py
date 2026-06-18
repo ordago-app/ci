@@ -5,7 +5,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .worker import ReviewWorker
@@ -45,11 +45,15 @@ def create_app(worker: ReviewWorker, poll_interval: int = 0) -> FastAPI:
     @app.post("/reviews")
     async def reviews(req: ReviewRequest) -> dict[str, object]:
         async with lock:
-            summary = await asyncio.to_thread(worker.run_pr_review, req.repo, req.pr_number)
+            try:
+                summary = await asyncio.to_thread(worker.run_pr_review, req.repo, req.pr_number)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {
             "head_sha": summary.head_sha,
             "verdict": summary.verdict,
             "escalated": summary.escalated,
+            "reviewer": worker.reviewer_bot,
         }
 
     return app
