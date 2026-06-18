@@ -20,3 +20,9 @@ def test_post_reviews_runs_and_returns_verdict() -> None:
 def test_healthz() -> None:
     client = TestClient(create_app(MagicMock()))
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+def test_app_starts_without_background_poll() -> None:
+    # poll_interval=0 -> no background task; app still serves.
+    with TestClient(create_app(MagicMock(), poll_interval=0)) as client:
+        assert client.get("/healthz").status_code == 200

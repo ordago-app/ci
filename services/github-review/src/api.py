@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -13,11 +16,27 @@ class ReviewRequest(BaseModel):
     pr_number: int
 
 
-def create_app(worker: ReviewWorker) -> FastAPI:
-    app = FastAPI(title="github-review")
-    # Serialize job execution (codex containers + SQLite writes) across the
-    # poll task and HTTP triggers.
+def create_app(worker: ReviewWorker, poll_interval: int = 0) -> FastAPI:
     lock = asyncio.Lock()
+
+    async def _poll_loop() -> None:
+        while True:
+            async with lock:
+                await asyncio.to_thread(worker.tick)
+            await asyncio.sleep(poll_interval)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        task = asyncio.create_task(_poll_loop()) if poll_interval > 0 else None
+        try:
+            yield
+        finally:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    app = FastAPI(title="github-review", lifespan=lifespan)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
