@@ -9,6 +9,16 @@ from src.providers import codex as codex_mod
 from src.providers.codex import CodexReviewProvider
 
 
+def _provider() -> CodexReviewProvider:
+    return CodexReviewProvider(
+        docker_client=MagicMock(),
+        projects_root=Path("/x"),
+        codex_state_root=Path("/y"),
+        router_url="http://claude-router:8000",
+        model="gpt-5.5",
+    )
+
+
 def job() -> ReviewJob:
     return ReviewJob(
         id=3,
@@ -216,3 +226,36 @@ def test_cleanup_surfaces_removal_failure(capsys: pytest.CaptureFixture[str]) ->
     err = capsys.readouterr().err
     assert "codex-review-1" in err
     assert "docker daemon boom" in err
+
+
+def test_parse_review_approve_sets_event_and_strips_verdict() -> None:
+    out = "\n".join(
+        [
+            '{"type":"item.completed","item":'
+            '{"type":"agent_message","text":"No findings.\\nVERDICT: APPROVE"}}',
+        ]
+    )
+    body, event = _provider()._parse_review(out)
+    assert event == "APPROVE"
+    assert "VERDICT:" not in body
+    assert body == "No findings."
+
+
+def test_parse_review_request_changes_when_findings() -> None:
+    out = "\n".join(
+        [
+            '{"type":"item.completed","item":'
+            '{"type":"agent_message","text":"- [P1] bug at foo.py:1\\nVERDICT: REQUEST_CHANGES"}}',
+        ]
+    )
+    body, event = _provider()._parse_review(out)
+    assert event == "REQUEST_CHANGES"
+    assert body.startswith("- [P1]")
+
+
+def test_parse_review_missing_verdict_defaults_to_request_changes() -> None:
+    out = '{"type":"item.completed","item":{"type":"agent_message","text":"Looks fine to me."}}'
+    body, event = _provider()._parse_review(out)
+    # Never auto-approve without an explicit APPROVE token.
+    assert event == "REQUEST_CHANGES"
+    assert body == "Looks fine to me."

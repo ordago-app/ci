@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,8 @@ AGENT_GID = 1000
 # this role, so the gh shim / credential helper run unauthenticated (codex
 # reads code from the local worktree and the github MCP, never `gh` writes).
 CODEX_GH_ROLE = "reviewer-readonly"
+
+_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\s*$", re.MULTILINE)
 
 
 def render_codex_config(*, caller: str, mcps: dict[str, list[str]], model: str) -> str:
@@ -119,8 +122,8 @@ class CodexReviewProvider:
         output = result.output.decode("utf-8", errors="replace")
         if result.exit_code != 0:
             raise RuntimeError(f"codex review failed: {output.strip()}")
-        body = self._extract_review_body(output)
-        return ReviewResult(body=body, event="COMMENT")
+        body, event = self._parse_review(output)
+        return ReviewResult(body=body, event=event)
 
     def cleanup(self, session: SessionRef) -> None:
         # Runs in the worker's finally, so it must not raise. But it must not
@@ -167,6 +170,14 @@ class CodexReviewProvider:
             # the container github-review is root, so a failure there is real.
             if os.geteuid() == 0:
                 raise
+
+    def _parse_review(self, output: str) -> tuple[str, str]:
+        raw = self._extract_review_body(output)
+        match = _VERDICT_RE.search(raw)
+        # Default REQUEST_CHANGES: never approve without an explicit APPROVE token.
+        event = "APPROVE" if (match and match.group(1) == "APPROVE") else "REQUEST_CHANGES"
+        body = _VERDICT_RE.sub("", raw).strip()
+        return body, event
 
     def _extract_review_body(self, output: str) -> str:
         # codex `exec --json` emits JSONL events; the review is the final
