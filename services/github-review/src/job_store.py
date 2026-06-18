@@ -30,6 +30,7 @@ class ReviewJob:
     started_at: float | None
     finished_at: float | None
     last_error: str | None
+    verdict: str | None = None
 
 
 class ReviewJobStore:
@@ -56,6 +57,7 @@ class ReviewJobStore:
                   started_at REAL,
                   finished_at REAL,
                   last_error TEXT,
+                  verdict TEXT,
                   UNIQUE(repo, pr_number, head_sha)
                 )
                 """
@@ -127,14 +129,28 @@ class ReviewJobStore:
                 (JobStatus.RUNNING, time.time(), job_id),
             )
 
-    def mark_posted(self, job_id: int) -> None:
-        self._finish(job_id, JobStatus.POSTED, None)
+    def mark_posted(self, job_id: int, verdict: str | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE review_jobs SET status = ?, finished_at = ?, last_error = NULL, "
+                "verdict = ? WHERE id = ?",
+                (JobStatus.POSTED, time.time(), verdict, job_id),
+            )
 
     def mark_skipped(self, job_id: int, reason: str) -> None:
         self._finish(job_id, JobStatus.SKIPPED, reason)
 
     def mark_failed(self, job_id: int, error: str) -> None:
         self._finish(job_id, JobStatus.FAILED, error)
+
+    def rounds_for(self, repo: str, pr_number: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT head_sha) FROM review_jobs "
+                "WHERE repo = ? AND pr_number = ? AND status = ?",
+                (repo, pr_number, JobStatus.POSTED),
+            ).fetchone()
+        return int(row[0])
 
     def _finish(self, job_id: int, status: JobStatus, message: str | None) -> None:
         with self._connect() as conn:
@@ -167,4 +183,5 @@ class ReviewJobStore:
             started_at=float(row["started_at"]) if row["started_at"] is not None else None,
             finished_at=float(row["finished_at"]) if row["finished_at"] is not None else None,
             last_error=str(row["last_error"]) if row["last_error"] is not None else None,
+            verdict=str(row["verdict"]) if row["verdict"] is not None else None,
         )

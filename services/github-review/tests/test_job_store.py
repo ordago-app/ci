@@ -70,3 +70,25 @@ def test_list_retryable_includes_queued_and_failed_under_limit(tmp_path: Path) -
     assert queued.id in retryable_ids
     assert under.id in retryable_ids
     assert exhausted.id not in retryable_ids
+
+
+def test_mark_posted_records_verdict(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 7, "abc", "base")
+    store.mark_running(job.id)
+    store.mark_posted(job.id, verdict="APPROVE")
+    updated = store.get(job.id)
+    assert updated is not None
+    assert updated.status == JobStatus.POSTED
+    assert updated.verdict == "APPROVE"
+
+
+def test_rounds_for_counts_posted_head_shas(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    for sha in ("a", "b"):
+        job = store.enqueue("alvaro/homelab", "homelab", "codex", 7, sha, "base")
+        store.mark_running(job.id)
+        store.mark_posted(job.id, verdict="REQUEST_CHANGES")
+    # A queued-but-not-posted head does not count.
+    store.enqueue("alvaro/homelab", "homelab", "codex", 7, "c", "base")
+    assert store.rounds_for("alvaro/homelab", 7) == 2
