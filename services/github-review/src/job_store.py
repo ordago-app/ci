@@ -146,6 +146,15 @@ class ReviewJobStore:
     def mark_failed(self, job_id: int, error: str) -> None:
         self._finish(job_id, JobStatus.FAILED, error)
 
+    def get_posted(self, repo: str, pr_number: int, head_sha: str) -> ReviewJob | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_jobs WHERE repo = ? AND pr_number = ? AND head_sha = ? "
+                "AND status = ?",
+                (repo, pr_number, head_sha, JobStatus.POSTED),
+            ).fetchone()
+        return self._from_row(row) if row else None
+
     def rounds_for(self, repo: str, pr_number: int) -> int:
         with self._connect() as conn:
             row = conn.execute(

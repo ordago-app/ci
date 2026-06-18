@@ -95,6 +95,15 @@ def test_rounds_for_counts_posted_head_shas(tmp_path: Path) -> None:
     assert store.rounds_for("alvaro/homelab", 7) == 2
 
 
+def test_get_posted_returns_job_for_matching_triple(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 7, "abc", "base")
+    store.mark_running(job.id)
+    store.mark_posted(job.id, verdict="APPROVE")
+    assert store.get_posted("alvaro/homelab", 7, "abc") is not None
+    assert store.get_posted("alvaro/homelab", 7, "other") is None
+
+
 def test_init_migrates_legacy_db_without_verdict_column(tmp_path: Path) -> None:
     db = tmp_path / "jobs.db"
     # Legacy schema: same as current minus the verdict column.
