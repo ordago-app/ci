@@ -43,6 +43,9 @@ class ReviewWorker:
             self._config, self._store, self._github, reviewer_bot=self._reviewer_bot
         ).poll_once()
         for job in self._store.list_retryable(self._max_attempts):
+            if self._store.rounds_for(job.repo, job.pr_number) >= self._max_rounds:
+                self._store.mark_skipped(job.id, f"max review rounds ({self._max_rounds}) reached")
+                continue
             self._run_job(job)
 
     def _run_job(self, job: ReviewJob) -> None:
@@ -103,10 +106,12 @@ class ReviewWorker:
         pr = self._github.get_pull_request(repo, pr_number)
         head_sha = pr.head_sha
 
-        # Idempotent: if this exact head was already reviewed, return its verdict.
+        # Idempotent: a posted row means a review already exists for this head.
+        # Legacy rows migrated from the old DB have verdict NULL; treat them as
+        # already-reviewed (REQUEST_CHANGES) rather than posting a duplicate.
         existing = self._store.get_posted(repo, pr_number, head_sha)
-        if existing is not None and existing.verdict is not None:
-            return ReviewResultSummary(head_sha, existing.verdict, False)
+        if existing is not None:
+            return ReviewResultSummary(head_sha, existing.verdict or "REQUEST_CHANGES", False)
 
         # Cost backstop: refuse beyond the hard round cap.
         if self._store.rounds_for(repo, pr_number) >= self._max_rounds:

@@ -219,3 +219,99 @@ def test_run_pr_review_returns_verdict_summary(tmp_path: Path) -> None:
     # Verdict persisted so a repeat request is idempotent.
     posted = store.list_by_status(JobStatus.POSTED)
     assert posted and posted[0].verdict == "APPROVE"
+
+
+class BombProvider:
+    """Raises unconditionally — proves the provider was never invoked."""
+
+    def start_review_session(self, job, worktree, profile) -> SessionRef:
+        raise AssertionError("provider must not be called")
+
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        raise AssertionError("provider must not be called")
+
+    def cleanup(self, session: SessionRef) -> None:
+        pass
+
+
+class EmptyGitHub(FakeGitHub):
+    """FakeGitHub that returns no open PRs so poll_once enqueues nothing."""
+
+    def list_open_prs(self, repo: str) -> list[PullRequest]:
+        return []
+
+
+def test_tick_skips_jobs_over_round_cap(tmp_path: Path) -> None:
+    """tick() must skip a queued job when rounds_for >= max_rounds (Fix #1).
+
+    Regression: before the fix, tick() ran every retryable job without checking
+    the round cap, so an always-on poller would keep reviewing new head SHAs past
+    MAX_REVIEW_ROUNDS.
+    """
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+
+    # Seed one POSTED round at head_sha="head-v1" — rounds_for == 1.
+    j1 = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "head-v1", "base")
+    store.mark_running(j1.id)
+    store.mark_posted(j1.id, verdict="REQUEST_CHANGES")
+    assert store.rounds_for("alvaro/homelab", 1) == 1
+
+    # Enqueue a new QUEUED job for the same PR at a different head.
+    j2 = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "head-v2", "base")
+    assert store.get(j2.id).status == JobStatus.QUEUED
+
+    # EmptyGitHub so poll_once doesn't enqueue extra jobs.
+    gh = EmptyGitHub()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=gh,
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": BombProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+        max_rounds=1,  # cap already reached after the seed job
+    )
+
+    worker.tick()
+
+    assert store.get(j2.id).status == JobStatus.SKIPPED, "over-cap job should be SKIPPED, not run"
+    assert all(commit_id != "head-v2" for (_, _, _, _, commit_id) in gh.posted), (
+        "post_review must not be called for the over-cap job"
+    )
+
+
+def test_run_pr_review_idempotent_for_legacy_posted_row_without_verdict(tmp_path: Path) -> None:
+    """run_pr_review must treat ANY POSTED row as already-reviewed (Fix #2).
+
+    Regression: the old guard was `existing.verdict is not None`, so a legacy
+    migrated row (status=POSTED, verdict=NULL) bypassed the guard and triggered
+    a duplicate review + duplicate post_review call.
+    """
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+
+    # FakeGitHub returns head_sha="head"; seed a POSTED row for that head with
+    # verdict=None (simulating a legacy migrated row).
+    j1 = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "head", "base")
+    store.mark_running(j1.id)
+    store.mark_posted(j1.id)  # no verdict arg → verdict stays NULL
+    assert store.get_posted("alvaro/homelab", 1, "head").verdict is None
+
+    gh = FakeGitHub()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=gh,
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": BombProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+    )
+
+    summary = worker.run_pr_review("alvaro/homelab", 1)
+
+    assert summary.verdict == "REQUEST_CHANGES", "conservative fallback for legacy NULL verdict"
+    assert summary.escalated is False
+    assert gh.posted == [], "must not post a duplicate review"
