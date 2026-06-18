@@ -77,7 +77,9 @@ class ReviewWorker:
                 prompt,
                 timeout_seconds=profile.max_runtime_minutes * 60,
             )
-            self._github.post_review(job.repo, job.pr_number, result.body, result.event)
+            self._github.post_review(
+                job.repo, job.pr_number, result.body, result.event, commit_id=job.head_sha
+            )
             self._store.mark_posted(job.id, verdict=result.event)
         except Exception as exc:
             self._store.mark_failed(job.id, str(exc))

@@ -76,7 +76,7 @@ class GitHubClient:
         ]
         return "; ".join(parts)
 
-    def post_review(self, repo: str, number: int, body: str, event: str) -> None:
+    def post_review(self, repo: str, number: int, body: str, event: str, commit_id: str) -> None:
         token = self._token()
         resp = self._http.post(
             f"https://api.github.com/repos/{repo}/pulls/{number}/reviews",
@@ -85,7 +85,7 @@ class GitHubClient:
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
-            json={"body": body, "event": event},
+            json={"body": body, "event": event, "commit_id": commit_id},
         )
         resp.raise_for_status()
 

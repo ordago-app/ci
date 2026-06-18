@@ -9,7 +9,7 @@ from src.worker import ReviewWorker
 
 class FakeGitHub:
     def __init__(self) -> None:
-        self.posted: list[tuple[str, int, str, str]] = []
+        self.posted: list[tuple[str, int, str, str, str]] = []
 
     def list_open_prs(self, repo: str) -> list[PullRequest]:
         return [
@@ -39,8 +39,8 @@ class FakeGitHub:
     def ci_summary(self, repo: str, head_sha: str) -> str:
         return "checks skipped in test"
 
-    def post_review(self, repo: str, number: int, body: str, event: str) -> None:
-        self.posted.append((repo, number, body, event))
+    def post_review(self, repo: str, number: int, body: str, event: str, commit_id: str) -> None:
+        self.posted.append((repo, number, body, event, commit_id))
 
 
 class FakeWorktrees:
@@ -110,7 +110,7 @@ def test_worker_polls_runs_review_and_marks_posted(tmp_path: Path) -> None:
     )
     worker.tick()
     assert store.list_by_status(JobStatus.POSTED)[0].head_sha == "head"
-    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT")]
+    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT", "head")]
 
 
 class FlakyProvider:
@@ -153,7 +153,7 @@ def test_worker_retries_failed_job_on_next_tick(tmp_path: Path) -> None:
     posted = store.list_by_status(JobStatus.POSTED)
     assert posted and posted[0].head_sha == "head"
     assert provider.calls == 2
-    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT")]
+    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT", "head")]
 
 
 class ApprovingProvider:
@@ -185,7 +185,7 @@ def test_run_pr_review_returns_verdict_summary(tmp_path: Path) -> None:
     assert summary.verdict == "APPROVE"
     assert summary.head_sha == "head"
     assert summary.escalated is False
-    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "APPROVE")]
+    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "APPROVE", "head")]
     # Verdict persisted so a repeat request is idempotent.
     posted = store.list_by_status(JobStatus.POSTED)
     assert posted and posted[0].verdict == "APPROVE"

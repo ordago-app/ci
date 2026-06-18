@@ -47,3 +47,21 @@ def test_ci_summary_degrades_when_checks_not_readable() -> None:
     summary = client.ci_summary("alvaro/homelab", "deadbeef")
     assert "unavailable" in summary.lower()
     assert "403" in summary
+
+
+@respx.mock
+def test_post_review_sends_commit_id() -> None:
+    respx.get("http://claude-router:8000/internal/github-token").mock(
+        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
+    )
+    route = respx.post("https://api.github.com/repos/alvaro/homelab/pulls/1/reviews").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+    client.post_review("alvaro/homelab", 1, "Looks good.", "COMMENT", commit_id="deadbeef")
+    import json
+
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["commit_id"] == "deadbeef"
+    assert sent["body"] == "Looks good."
+    assert sent["event"] == "COMMENT"
