@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 from src.job_store import JobStatus, ReviewJobStore
@@ -92,3 +93,36 @@ def test_rounds_for_counts_posted_head_shas(tmp_path: Path) -> None:
     # A queued-but-not-posted head does not count.
     store.enqueue("alvaro/homelab", "homelab", "codex", 7, "c", "base")
     assert store.rounds_for("alvaro/homelab", 7) == 2
+
+
+def test_init_migrates_legacy_db_without_verdict_column(tmp_path: Path) -> None:
+    db = tmp_path / "jobs.db"
+    # Legacy schema: same as current minus the verdict column.
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE review_jobs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo TEXT NOT NULL, project TEXT NOT NULL, provider TEXT NOT NULL,
+          pr_number INTEGER NOT NULL, head_sha TEXT NOT NULL, base_sha TEXT NOT NULL,
+          status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          queued_at REAL NOT NULL, started_at REAL, finished_at REAL, last_error TEXT,
+          UNIQUE(repo, pr_number, head_sha)
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO review_jobs "
+        "(repo, project, provider, pr_number, head_sha, base_sha, status, queued_at) "
+        "VALUES ('alvaro/homelab','homelab','codex',7,'abc','base','posted',1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = ReviewJobStore(db)
+    store.init()  # must add the missing column, not raise
+    job = store.get(1)
+    assert job is not None
+    assert job.verdict is None  # legacy row reads back cleanly
+    store.mark_posted(1, verdict="APPROVE")
+    assert store.get(1).verdict == "APPROVE"

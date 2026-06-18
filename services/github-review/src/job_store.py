@@ -62,6 +62,9 @@ class ReviewJobStore:
                 )
                 """
             )
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(review_jobs)")}
+            if "verdict" not in cols:
+                conn.execute("ALTER TABLE review_jobs ADD COLUMN verdict TEXT")
 
     def enqueue(
         self,
