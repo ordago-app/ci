@@ -53,3 +53,8 @@ def test_prompt_contains_review_policy_and_pr_context() -> None:
     # The loop terminates on an explicit verdict line the worker can parse.
     assert "VERDICT: APPROVE" in prompt
     assert "VERDICT: REQUEST_CHANGES" in prompt
+    # Test coverage is a required gate: untested behavioral changes must block.
+    assert "Test coverage is a required gate" in prompt
+    assert "would fail if the change were reverted" in prompt
+    # CI status is a gate too (the reviewer App has Checks:Read).
+    assert "CI is also a gate" in prompt
