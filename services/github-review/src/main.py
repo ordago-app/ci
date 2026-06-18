@@ -37,7 +37,13 @@ def main() -> None:
         config=cfg,
         store=store,
         github=github,
-        worktrees=GitWorktreeManager(projects_root=projects_root),
+        worktrees=GitWorktreeManager(
+            projects_root=projects_root,
+            # Container runs as root; drop git to the operator uid (powerbot=1000)
+            # so objects in the shared clone stay operator-owned for the deploy.
+            run_as_uid=int(os.environ.get("WORKTREE_RUN_AS_UID", "1000")),
+            run_as_gid=int(os.environ.get("WORKTREE_RUN_AS_GID", "1000")),
+        ),
         providers={
             "codex": CodexReviewProvider(
                 docker_client=docker.from_env(),

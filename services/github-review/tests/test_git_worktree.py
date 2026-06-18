@@ -39,6 +39,28 @@ def test_prepare_recovers_from_stale_registered_worktree(tmp_path: Path, repo_di
     assert sha(second, "HEAD") == head
 
 
+def test_run_as_uid_drops_privileges_for_git(tmp_path: Path) -> None:
+    # Regression: the container runs as root; git objects it writes into the
+    # shared clone must be owned by the operator (uid 1000), not root, or the
+    # next deploy's `git fetch` fails with "insufficient permission for adding
+    # an object". When run_as_uid is set, every git subprocess must setuid/gid
+    # and get a writable HOME.
+    mgr = GitWorktreeManager(projects_root=tmp_path, run_as_uid=1000, run_as_gid=1000)
+    kwargs = mgr._subprocess_kwargs()
+    assert kwargs["user"] == 1000
+    assert kwargs["group"] == 1000
+    assert kwargs["env"]["HOME"] == "/tmp"
+
+
+def test_no_uid_means_no_setuid(tmp_path: Path) -> None:
+    # Default (tests, which run unprivileged and cannot setuid): no user/group.
+    mgr = GitWorktreeManager(projects_root=tmp_path)
+    kwargs = mgr._subprocess_kwargs()
+    assert "user" not in kwargs
+    assert "group" not in kwargs
+    assert "env" not in kwargs
+
+
 def test_git_commands_carry_safe_directory_guard(
     tmp_path: Path, repo_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
