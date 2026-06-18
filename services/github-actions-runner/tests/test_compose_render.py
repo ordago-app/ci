@@ -48,7 +48,12 @@ def test_runner_names_and_labels():
     assert env["RUNNER_REPOSITORY"] == "alvaro-francisco-gil/ordago-apps"
     # self-hosted,linux,x64 are prepended; android-e2e routes the emulator job.
     assert env["RUNNER_LABELS"].split(",") == [
-        "self-hosted", "linux", "x64", "powerserver", "android-e2e", "ordago-ci",
+        "self-hosted",
+        "linux",
+        "x64",
+        "powerserver",
+        "android-e2e",
+        "ordago-ci",
     ]
     # Light runners carry ordago-ci but never android-e2e.
     for name in ("ordago-android-e2e-2", "ordago-android-e2e-5"):
@@ -62,8 +67,10 @@ def test_only_heavy_runner_has_kvm_and_kvm_group():
     assert services["ordago-android-e2e"]["devices"] == ["/dev/kvm:/dev/kvm"]
     assert services["ordago-android-e2e"]["group_add"] == ["994"]
     for name in (
-        "ordago-android-e2e-2", "ordago-android-e2e-3",
-        "ordago-android-e2e-4", "ordago-android-e2e-5",
+        "ordago-android-e2e-2",
+        "ordago-android-e2e-3",
+        "ordago-android-e2e-4",
+        "ordago-android-e2e-5",
     ):
         assert "devices" not in services[name]
         assert "group_add" not in services[name]
@@ -74,7 +81,9 @@ def test_only_lean_light_runners_skip_android_sdk():
     for name in ("ordago-android-e2e-4", "ordago-android-e2e-5"):
         assert services[name]["environment"]["SKIP_ANDROID_SDK"] == "1"
     for name in (
-        "ordago-android-e2e", "ordago-android-e2e-2", "ordago-android-e2e-3",
+        "ordago-android-e2e",
+        "ordago-android-e2e-2",
+        "ordago-android-e2e-3",
     ):
         assert "SKIP_ANDROID_SDK" not in services[name]["environment"]
 
@@ -84,23 +93,22 @@ def test_light_runner_work_dirs_live_on_the_ssd():
     # Heavy work dir stays on the HDD; light work dirs move to /mnt/ci-ssd so
     # concurrent random I/O does not saturate the spinning disk.
     heavy_work = next(
-        v for v in services["ordago-android-e2e"]["volumes"]
-        if v.endswith(":/runner-work:rw")
+        v for v in services["ordago-android-e2e"]["volumes"] if v.endswith(":/runner-work:rw")
     )
     assert heavy_work.startswith("/opt/personal/")
     for name in (
-        "ordago-android-e2e-2", "ordago-android-e2e-3",
-        "ordago-android-e2e-4", "ordago-android-e2e-5",
+        "ordago-android-e2e-2",
+        "ordago-android-e2e-3",
+        "ordago-android-e2e-4",
+        "ordago-android-e2e-5",
     ):
-        work = next(
-            v for v in services[name]["volumes"]
-            if v.endswith(":/runner-work:rw")
-        )
+        work = next(v for v in services[name]["volumes"] if v.endswith(":/runner-work:rw"))
         assert work.startswith("/mnt/ci-ssd/")
 
 
 def test_light_runners_share_one_ssd_pnpm_store():
     services = render()["services"]
+
     # The mounted pnpm cache volume only persists across jobs if pnpm's store-dir
     # actually points at it (the image sets store-dir=/cache/pnpm). For the light
     # pool, node_modules lives in /runner-work on the SSD, so the store must be on
