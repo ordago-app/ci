@@ -1,8 +1,18 @@
+import asyncio
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
-from src.api import create_app
+from src.api import _safe_tick, create_app
 from src.worker import ReviewResultSummary
+
+
+def test_safe_tick_swallows_tick_errors() -> None:
+    # A single failing tick must not propagate — otherwise the poll loop dies
+    # permanently and polling silently stops until the container restarts.
+    worker = MagicMock()
+    worker.tick.side_effect = RuntimeError("boom")
+    asyncio.run(_safe_tick(worker, asyncio.Lock()))
+    worker.tick.assert_called_once()
 
 
 def test_post_reviews_runs_and_returns_verdict() -> None:

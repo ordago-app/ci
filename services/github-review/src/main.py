@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from .worker import ReviewWorker
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     config_path = Path(os.environ.get("AGENT_REVIEW_CONFIG", "/etc/github-review/agent-review.yml"))
     state_dir = Path(os.environ.get("STATE_DIR", "/var/lib/github-review"))
     projects_root = Path(os.environ.get("PROJECTS_ROOT", "/opt/personal/projects"))

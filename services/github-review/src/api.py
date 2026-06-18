@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -10,19 +11,31 @@ from pydantic import BaseModel
 
 from .worker import ReviewWorker
 
+_log = logging.getLogger("github_review.poll")
+
 
 class ReviewRequest(BaseModel):
     repo: str
     pr_number: int
 
 
+async def _safe_tick(worker: ReviewWorker, lock: asyncio.Lock) -> None:
+    # One failing tick (transient GitHub error, one bad job) must never kill the
+    # poll loop — otherwise polling silently stops until the container restarts.
+    try:
+        async with lock:
+            await asyncio.to_thread(worker.tick)
+    except Exception:
+        _log.exception("poll tick failed; continuing")
+
+
 def create_app(worker: ReviewWorker, poll_interval: int = 0) -> FastAPI:
     lock = asyncio.Lock()
 
     async def _poll_loop() -> None:
+        _log.info("poll loop started (interval=%ss)", poll_interval)
         while True:
-            async with lock:
-                await asyncio.to_thread(worker.tick)
+            await _safe_tick(worker, lock)
             await asyncio.sleep(poll_interval)
 
     @asynccontextmanager
