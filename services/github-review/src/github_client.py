@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -18,6 +18,7 @@ class PullRequest:
     base_sha: str
     head_ref: str
     head_sha: str
+    labels: list[str] = field(default_factory=list)
 
 
 class GitHubClient:
@@ -101,6 +102,7 @@ class GitHubClient:
             base_sha=str(item["base"]["sha"]),
             head_ref=str(item["head"]["ref"]),
             head_sha=str(item["head"]["sha"]),
+            labels=[str(label["name"]) for label in item.get("labels", [])],
         )
 
     def _github_get(self, url: str, *, params: dict[str, str]) -> Any:
