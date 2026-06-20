@@ -20,7 +20,15 @@ class RepoPolicy(BaseModel):
     review_drafts: bool = False
     review_bots: bool = False
     run_ci_first: bool = True
+    review_mode: str = "all"
     tool_profile: str
+
+    @field_validator("review_mode")
+    @classmethod
+    def review_mode_is_known(cls, value: str) -> str:
+        if value not in {"all", "labeled"}:
+            raise ValueError("review_mode must be 'all' or 'labeled'")
+        return value
 
     @field_validator("repo")
     @classmethod

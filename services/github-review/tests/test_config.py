@@ -96,6 +96,64 @@ def test_rejects_missing_profile(tmp_path: Path) -> None:
         ReviewConfig.load(cfg_path)
 
 
+REVIEW_MODE_UNSET_YAML = """
+    repos:
+      homelab:
+        repo: alvaro-francisco-gil/homelab
+        project: homelab
+        provider: codex
+        enabled: true
+        review_drafts: false
+        run_ci_first: true
+        tool_profile: default-reviewer
+    tool_profiles:
+      default-reviewer:
+        github_role: reviewer
+        mcps: {}
+        allow_shell: true
+        allow_network: true
+        allow_repo_write: true
+        allow_git_push: false
+        allow_docker: false
+        max_runtime_minutes: 30
+    """
+
+REVIEW_MODE_BAD_YAML = """
+    repos:
+      homelab:
+        repo: alvaro-francisco-gil/homelab
+        project: homelab
+        provider: codex
+        enabled: true
+        review_drafts: false
+        run_ci_first: true
+        review_mode: nonsense
+        tool_profile: default-reviewer
+    tool_profiles:
+      default-reviewer:
+        github_role: reviewer
+        mcps: {}
+        allow_shell: true
+        allow_network: true
+        allow_repo_write: true
+        allow_git_push: false
+        allow_docker: false
+        max_runtime_minutes: 30
+    """
+
+
+def test_review_mode_defaults_to_all(tmp_path: Path) -> None:
+    cfg_path = write(tmp_path / "agent-review.yml", REVIEW_MODE_UNSET_YAML)
+    cfg = ReviewConfig.load(cfg_path)
+    assert cfg.repos["homelab"].review_mode == "all"
+
+
+def test_invalid_review_mode_rejected(tmp_path: Path) -> None:
+    cfg_path = write(tmp_path / "agent-review.yml", REVIEW_MODE_BAD_YAML)
+    with pytest.raises(ConfigError):
+        ReviewConfig.load(cfg_path)
+
+
 def test_rejects_git_push_for_reviewer(tmp_path: Path) -> None:
     cfg_path = write(
         tmp_path / "agent-review.yml",
