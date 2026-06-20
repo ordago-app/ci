@@ -25,7 +25,7 @@ def main() -> None:
     codex_state_root = Path(os.environ.get("CODEX_STATE_ROOT", "/opt/personal/codex-code-state"))
     codex_model = os.environ.get("CODEX_MODEL", "gpt-5.5")
     reviewer_bot = os.environ.get("REVIEWER_BOT_LOGIN", "homelab-claude-reviewer[bot]")
-    poll_interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
+    poll_interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "900"))
     max_attempts = int(os.environ.get("MAX_REVIEW_ATTEMPTS", "3"))
     max_rounds = int(os.environ.get("MAX_REVIEW_ROUNDS", "5"))
 
