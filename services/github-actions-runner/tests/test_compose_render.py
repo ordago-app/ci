@@ -33,10 +33,11 @@ def render() -> dict:
     return yaml.safe_load(text)
 
 
-def test_renders_valid_yaml_with_five_runners():
+def test_renders_valid_yaml_with_seven_runners():
     compose = render()
     assert set(compose) == {"services", "networks"}
-    assert len(compose["services"]) == 5
+    # 5 ordago runners + 2 homelab-ci runners
+    assert len(compose["services"]) == 7
 
 
 def test_runner_names_and_labels():
@@ -158,3 +159,57 @@ def test_secret_env_file_and_external_network():
         ]
         assert svc["networks"] == ["homelab"]
     assert compose["networks"]["homelab"]["external"] is True
+
+
+# ── Tests for per-runner repository override + ephemeral flag (Stage B) ──
+
+
+def test_ordago_runner_uses_top_level_repository():
+    """Ordago runners have no per-runner repository; they should use the top-level default."""
+    services = render()["services"]
+    for name in (
+        "ordago-android-e2e",
+        "ordago-android-e2e-2",
+        "ordago-android-e2e-3",
+        "ordago-android-e2e-4",
+        "ordago-android-e2e-5",
+    ):
+        repo = services[name]["environment"]["RUNNER_REPOSITORY"]
+        assert repo == "alvaro-francisco-gil/ordago-apps"
+
+
+def test_homelab_runner_overrides_repository():
+    """Homelab runners declare repository: alvaro-francisco-gil/homelab; that must win."""
+    services = render()["services"]
+    for name in ("homelab-ci-1", "homelab-ci-2"):
+        repo = services[name]["environment"]["RUNNER_REPOSITORY"]
+        assert repo == "alvaro-francisco-gil/homelab"
+
+
+def test_homelab_runner_is_ephemeral():
+    """Homelab runners have ephemeral: true; compose must set RUNNER_EPHEMERAL=1."""
+    services = render()["services"]
+    assert services["homelab-ci-1"]["environment"]["RUNNER_EPHEMERAL"] == "1"
+    assert services["homelab-ci-2"]["environment"]["RUNNER_EPHEMERAL"] == "1"
+
+
+def test_ordago_runner_has_no_runner_ephemeral():
+    """Ordago runners do not set ephemeral; RUNNER_EPHEMERAL must be absent."""
+    services = render()["services"]
+    for name in (
+        "ordago-android-e2e",
+        "ordago-android-e2e-2",
+        "ordago-android-e2e-3",
+        "ordago-android-e2e-4",
+        "ordago-android-e2e-5",
+    ):
+        assert "RUNNER_EPHEMERAL" not in services[name]["environment"]
+
+
+def test_homelab_runner_labels_include_self_hosted_and_homelab():
+    """Homelab runner labels must include the standard self-hosted prefix and the homelab label."""
+    services = render()["services"]
+    for name in ("homelab-ci-1", "homelab-ci-2"):
+        labels = services[name]["environment"]["RUNNER_LABELS"].split(",")
+        assert "self-hosted" in labels
+        assert "homelab" in labels

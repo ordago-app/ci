@@ -109,14 +109,19 @@ export PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/pl
 if [ ! -f .runner ]; then
   echo "Configuring GitHub Actions runner ${RUNNER_NAME} for ${RUNNER_REPOSITORY}..."
   registration_token="$(mint_token registration-token)"
-  ./config.sh \
-    --unattended \
-    --replace \
-    --url "${github_url}" \
-    --token "${registration_token}" \
-    --name "${RUNNER_NAME}" \
-    --labels "${RUNNER_LABELS}" \
+  config_args=(
+    --unattended
+    --replace
+    --url "${github_url}"
+    --token "${registration_token}"
+    --name "${RUNNER_NAME}"
+    --labels "${RUNNER_LABELS}"
     --work "${RUNNER_WORKDIR}"
+  )
+  if [ "${RUNNER_EPHEMERAL:-0}" = "1" ]; then
+    config_args+=(--ephemeral)
+  fi
+  ./config.sh "${config_args[@]}"
 fi
 
 exec ./run.sh

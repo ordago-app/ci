@@ -16,7 +16,7 @@ services:
     # reaps them and transparently forwards signals to run.sh.
     init: true
     environment:
-      RUNNER_REPOSITORY: "{{ github_actions_runners.repository }}"
+      RUNNER_REPOSITORY: "{{ runner.repository | default(github_actions_runners.repository) }}"
       RUNNER_NAME: "{{ inventory_hostname }}-{{ runner.name }}"
       RUNNER_LABELS: "{{ (['self-hosted', 'linux', 'x64'] + runner.labels) | join(',') }}"
       RUNNER_WORKDIR: "/runner-work"
@@ -28,6 +28,9 @@ services:
       MAESTRO_CLI_NO_ANALYTICS: "1"
 {% if runner.skip_android_sdk | default(false) %}
       SKIP_ANDROID_SDK: "1"
+{% endif %}
+{% if runner.ephemeral | default(false) %}
+      RUNNER_EPHEMERAL: "1"
 {% endif %}
     env_file:
       - path: {{ github_actions_runners.secret_env }}
