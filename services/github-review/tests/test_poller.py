@@ -15,7 +15,11 @@ class FakeGitHub:
 
 
 def config(
-    tmp_path: Path, *, review_drafts: bool = False, review_bots: bool = False
+    tmp_path: Path,
+    *,
+    review_drafts: bool = False,
+    review_bots: bool = False,
+    review_mode: str = "all",
 ) -> ReviewConfig:
     path = tmp_path / "agent-review.yml"
     path.write_text(
@@ -29,6 +33,7 @@ def config(
             review_drafts: {str(review_drafts).lower()}
             review_bots: {str(review_bots).lower()}
             run_ci_first: true
+            review_mode: {review_mode}
             tool_profile: reviewer
         tool_profiles:
           reviewer:
@@ -45,9 +50,16 @@ def config(
     return ReviewConfig.load(path)
 
 
-def pr(*, draft: bool = False, author: str = "alice", sha: str = "head") -> PullRequest:
+def pr(
+    *,
+    draft: bool = False,
+    author: str = "alice",
+    sha: str = "head",
+    labels: list[str] | None = None,
+    number: int = 9,
+) -> PullRequest:
     return PullRequest(
-        number=9,
+        number=number,
         title="Title",
         body="Body",
         draft=draft,
@@ -57,6 +69,7 @@ def pr(*, draft: bool = False, author: str = "alice", sha: str = "head") -> Pull
         base_sha="base",
         head_ref="feature",
         head_sha=sha,
+        labels=labels or [],
     )
 
 
@@ -125,3 +138,18 @@ def test_reviews_bot_pr_when_review_bots_enabled(tmp_path: Path) -> None:
         reviewer_bot="reviewer[bot]",
     )
     assert len(poller.poll_once()) == 1
+
+
+def test_labeled_mode_only_reviews_labelled_prs(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    gh = FakeGitHub(
+        prs=[
+            pr(number=1, labels=["ai-review"]),
+            pr(number=2, labels=["wip"]),
+        ]
+    )
+    created = ReviewPoller(
+        config(tmp_path, review_mode="labeled"), store, gh, reviewer_bot="reviewer[bot]"
+    ).poll_once()
+    assert [job.pr_number for job in created] == [1]

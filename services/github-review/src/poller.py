@@ -6,6 +6,8 @@ from .config import ReviewConfig
 from .github_client import PullRequest
 from .job_store import ReviewJob, ReviewJobStore
 
+REVIEW_LABEL = "ai-review"
+
 
 class PullRequestSource(Protocol):
     def list_open_prs(self, repo: str) -> list[PullRequest]: ...
@@ -38,6 +40,8 @@ class ReviewPoller:
                 # Dependabot and other bot PRs are mechanical version bumps; CI
                 # is the right gate, so skip *[bot] authors unless opted in.
                 if not repo_policy.review_bots and pr.author.endswith("[bot]"):
+                    continue
+                if repo_policy.review_mode == "labeled" and REVIEW_LABEL not in pr.labels:
                     continue
                 job = self._store.enqueue(
                     repo=repo_policy.repo,
