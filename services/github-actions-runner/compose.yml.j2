@@ -1,7 +1,9 @@
 # Rendered by ansible from personal/github-runners.yml — do not edit on the host.
-# GitHub Actions self-hosted runners for {{ github_actions_runners.repository }}.
-# Pool = 1 HEAVY + 4 LIGHT; only the heavy runner has /dev/kvm, so at most one
-# Android emulator runs at a time. See README.md for the capacity reasoning.
+# GitHub Actions self-hosted runners. Each runner serves
+# `runner.repository | default(github_actions_runners.repository)`; only the
+# heavy ordago runner has /dev/kvm, so at most one Android emulator runs at a
+# time. Runners with `ephemeral: true` register one-job runners. See README.md
+# for the capacity reasoning.
 services:
 {% for runner in github_actions_runners.runners %}
 {% if runner.enabled | default(false) %}
