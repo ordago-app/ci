@@ -19,7 +19,7 @@ def test_controller_has_no_raw_socket() -> None:
 def test_socket_proxy_mounts_socket_read_only() -> None:
     compose = _load()
     volumes = compose["services"]["docker-socket-proxy"]["volumes"]
-    assert any(v.endswith("/var/run/docker.sock:ro") for v in volumes)
+    assert "/var/run/docker.sock:/var/run/docker.sock:ro" in volumes
 
 
 def test_socket_proxy_is_scoped() -> None:
@@ -28,6 +28,7 @@ def test_socket_proxy_is_scoped() -> None:
     # Allowed: containers + POST (to create/start). Denied: exec, images write, etc.
     assert env["CONTAINERS"] == 1
     assert env["POST"] == 1
+    assert env["EVENTS"] == 1  # read-only event stream: intentional, not a mutation surface
     for denied in ("EXEC", "IMAGES", "VOLUMES", "NETWORKS", "SECRETS", "SWARM", "SERVICES"):
         assert env.get(denied, 0) == 0, f"{denied} must be denied on the socket proxy"
 
