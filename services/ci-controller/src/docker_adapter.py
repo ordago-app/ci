@@ -30,9 +30,14 @@ class DockerAdapter:
         lane_id = f"{self._host}-cici-{job.job_id}"
         job_class = self._config.classes[decision.class_name]
 
+        # Bind the work_dir BASE (pre-created by ansible, owned by the runner uid) rather
+        # than a per-lane subdir: if we bind a non-existent per-lane path, docker creates
+        # it root-owned and the uid-1000 runner can't write its workspace ("Set up job"
+        # fails). Binding the 1000-owned base lets the entrypoint's `mkdir -p` create the
+        # per-lane subdir as the runner user.
         work_base = self._config.work_dirs[job_class.work_disk]
-        work_host = f"{work_base}/{lane_id}-work"
-        volumes: dict[str, dict[str, str]] = {work_host: {"bind": "/runner-work", "mode": "rw"}}
+        work_dir = f"/runner-base/{lane_id}-work"
+        volumes: dict[str, dict[str, str]] = {work_base: {"bind": "/runner-base", "mode": "rw"}}
         for mount in self._config.shared_mounts:
             volumes[mount.host] = {"bind": mount.container, "mode": "rw"}
 
@@ -45,7 +50,7 @@ class DockerAdapter:
                 "RUNNER_REPOSITORY": job.repo,
                 "RUNNER_NAME": lane_id,
                 "RUNNER_LABELS": ",".join(job.labels),
-                "RUNNER_WORKDIR": "/runner-work",
+                "RUNNER_WORKDIR": work_dir,
                 "RUNNER_EPHEMERAL": "1",
                 "RUNNER_REGISTRATION_TOKEN": registration_token,
                 "SKIP_ANDROID_SDK": "0" if job_class.needs_android_sdk else "1",

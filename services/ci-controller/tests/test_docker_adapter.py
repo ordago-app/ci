@@ -37,10 +37,10 @@ def test_spawn_light_lane(write_config) -> None:
     assert kwargs["environment"]["PNPM_HOME"] == "/cache/pnpm"
     assert kwargs["environment"]["GRADLE_USER_HOME"] == "/cache/gradle"
     assert "devices" not in kwargs or not kwargs["devices"]
-    # work dir on ssd
-    assert any(
-        "/mnt/ci-ssd/ci-controller/powerserver-cici-42-work" in host for host in kwargs["volumes"]
-    )
+    # work dir: bind the SSD base (owned by uid 1000) and let the runner create its own
+    # per-lane subdir inside it — avoids docker auto-creating a root-owned per-lane dir.
+    assert kwargs["volumes"]["/mnt/ci-ssd/ci-controller"] == {"bind": "/runner-base", "mode": "rw"}
+    assert kwargs["environment"]["RUNNER_WORKDIR"] == "/runner-base/powerserver-cici-42-work"
 
 
 def test_spawn_emulator_lane_gets_kvm(write_config) -> None:
@@ -56,10 +56,12 @@ def test_spawn_emulator_lane_gets_kvm(write_config) -> None:
     assert kwargs["devices"] == ["/dev/kvm:/dev/kvm:rwm"]
     assert kwargs["group_add"] == ["994"]
     assert kwargs["environment"]["SKIP_ANDROID_SDK"] == "0"
-    assert any(
-        "/opt/personal/github-actions/ci-controller/powerserver-cici-7-work" in h
-        for h in kwargs["volumes"]
-    )
+    # emulator lane: HDD base bound; runner creates its per-lane subdir inside it
+    assert kwargs["volumes"]["/opt/personal/github-actions/ci-controller"] == {
+        "bind": "/runner-base",
+        "mode": "rw",
+    }
+    assert kwargs["environment"]["RUNNER_WORKDIR"] == "/runner-base/powerserver-cici-7-work"
 
 
 def test_list_lanes(write_config) -> None:
