@@ -1,0 +1,59 @@
+services:
+  docker-socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.3.0
+    container_name: ci-controller-socket-proxy
+    restart: unless-stopped
+    environment:
+      # Allow only what the controller needs to create/start/list/remove lanes.
+      CONTAINERS: 1
+      POST: 1
+      # Everything else denied (default 0, pinned explicitly for the wiring test).
+      EXEC: 0
+      IMAGES: 0
+      VOLUMES: 0
+      NETWORKS: 0
+      SECRETS: 0
+      CONFIGS: 0
+      SWARM: 0
+      SERVICES: 0
+      NODES: 0
+      TASKS: 0
+      INFO: 0
+      AUTH: 0
+      BUILD: 0
+      DISTRIBUTION: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      EVENTS: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - homelab
+
+  ci-controller:
+    image: homelab/ci-controller:latest
+    build: .
+    container_name: ci-controller
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - docker-socket-proxy
+    environment:
+      - CI_CONTROLLER_CONFIG=/etc/ci-controller/ci-controller.yml
+      - POLL_INTERVAL_SECONDS=15
+      - RUNNER_HOST=powerserver
+      - DOCKER_PROXY_URL=tcp://docker-socket-proxy:2375
+    env_file:
+      - path: /opt/personal/secrets/github-actions-runner.env
+        required: false
+    volumes:
+      - /opt/personal/ci-controller.yml:/etc/ci-controller/ci-controller.yml:ro
+    expose:
+      - "8000"
+    networks:
+      - homelab
+
+networks:
+  homelab:
+    external: true
+    name: homelab

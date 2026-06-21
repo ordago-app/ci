@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import docker
 import docker.errors
 
 from src.config import ControllerConfig
@@ -19,7 +20,7 @@ class LaneInfo:
 
 
 class DockerAdapter:
-    def __init__(self, client: object, config: ControllerConfig, host: str) -> None:
+    def __init__(self, client: docker.DockerClient, config: ControllerConfig, host: str) -> None:
         self._client = client
         self._config = config
         self._host = host
