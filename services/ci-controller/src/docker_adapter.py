@@ -55,7 +55,7 @@ class DockerAdapter:
             "volumes": volumes,
             "labels": {LANE_LABEL: lane_id, JOB_LABEL: str(job.job_id)},
         }
-        if job_class.needs_kvm:
+        if decision.needs_kvm:
             run_kwargs["devices"] = ["/dev/kvm:/dev/kvm:rwm"]
         if job_class.group_add:
             run_kwargs["group_add"] = list(job_class.group_add)
