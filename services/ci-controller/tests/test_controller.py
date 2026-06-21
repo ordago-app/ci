@@ -5,6 +5,7 @@ from src.controller import Controller
 from src.docker_adapter import LaneInfo
 from src.ledger import Ledger
 from src.models import AdmitDecision, DeferDecision, QueuedJob, Reservation
+
 from tests.conftest import VALID_CONFIG
 
 
@@ -15,12 +16,16 @@ def _controller(write_config, queued):
     github.mint_registration_token.return_value = "ARRT"
     docker = MagicMock()
     docker.list_lanes.return_value = []
-    docker.spawn.side_effect = lambda decision, registration_token: f"powerserver-cici-{decision.job.job_id}"
+    docker.spawn.side_effect = lambda decision, registration_token: (
+        f"powerserver-cici-{decision.job.job_id}"
+    )
     return Controller(config=cfg, github=github, docker=docker, ledger=Ledger()), github, docker
 
 
 def test_tick_admits_and_spawns(write_config) -> None:
-    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["self-hosted", "homelab"])
+    job = QueuedJob(
+        job_id=1, repo="alvaro-francisco-gil/homelab", labels=["self-hosted", "homelab"]
+    )
     ctrl, github, docker = _controller(write_config, [job])
 
     decisions = ctrl.tick()

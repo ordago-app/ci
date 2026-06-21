@@ -1,8 +1,8 @@
 from pathlib import Path
 
 import pytest
-
 from src.config import ConfigError, ControllerConfig
+
 from tests.conftest import VALID_CONFIG
 
 
@@ -20,8 +20,13 @@ def test_loads_valid_config(write_config) -> None:
 
 def test_class_for_maps_label(write_config) -> None:
     cfg = ControllerConfig.load(write_config(VALID_CONFIG))
-    assert cfg.class_for("alvaro-francisco-gil/ordago-apps", ["self-hosted", "android-e2e"]) == "emulator"
-    assert cfg.class_for("alvaro-francisco-gil/ordago-apps", ["self-hosted", "ordago-ci"]) == "light"
+    assert (
+        cfg.class_for("alvaro-francisco-gil/ordago-apps", ["self-hosted", "android-e2e"])
+        == "emulator"
+    )
+    assert (
+        cfg.class_for("alvaro-francisco-gil/ordago-apps", ["self-hosted", "ordago-ci"]) == "light"
+    )
 
 
 def test_class_for_falls_back_to_default(write_config) -> None:

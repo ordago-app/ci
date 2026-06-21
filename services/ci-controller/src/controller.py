@@ -60,7 +60,7 @@ class Controller:
         for repo in self.config.repo_names():
             try:
                 jobs.extend(self.github.list_queued_jobs(repo))
-            except Exception as exc:  # noqa: BLE001 — one bad repo must not kill the loop
+            except Exception as exc:  # one bad repo must not kill the loop
                 log.warning("poll failed for %s: %s", repo, exc)
 
         decisions = evaluate(jobs, self.ledger, self.config)
@@ -74,7 +74,7 @@ class Controller:
         try:
             token = self.github.mint_registration_token(decision.job.repo)
             lane_id = self.docker.spawn(decision, registration_token=token)
-        except Exception as exc:  # noqa: BLE001 — spawn failure: leave job queued
+        except Exception as exc:  # spawn failure: leave job queued
             log.error("failed to spawn lane for job %s: %s", decision.job.job_id, exc)
             return
         self.ledger.add(
@@ -87,7 +87,9 @@ class Controller:
                 needs_kvm=decision.needs_kvm,
             )
         )
-        log.info("admitted job %s (%s) on lane %s", decision.job.job_id, decision.class_name, lane_id)
+        log.info(
+            "admitted job %s (%s) on lane %s", decision.job.job_id, decision.class_name, lane_id
+        )
 
     def status(self) -> dict:
         deferred = [d for d in self._last_decisions if isinstance(d, DeferDecision)]
@@ -107,5 +109,7 @@ class Controller:
                 }
                 for r in self.ledger.reservations()
             ],
-            "deferred": [{"job_id": d.job.job_id, "repo": d.job.repo, "reason": d.reason} for d in deferred],
+            "deferred": [
+                {"job_id": d.job.job_id, "repo": d.job.repo, "reason": d.reason} for d in deferred
+            ],
         }
