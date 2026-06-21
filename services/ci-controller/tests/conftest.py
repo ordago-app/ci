@@ -26,8 +26,15 @@ work_dirs:
 shared_mounts:
   - { host: /mnt/ci-ssd/pnpm-store, container: /cache/pnpm }
 classes:
-  emulator: { ram_mb: 2500, needs_kvm: true, needs_android_sdk: true, work_disk: hdd, group_add: ["994"] }
-  light:    { ram_mb: 700,  work_disk: ssd }
+  emulator:
+    ram_mb: 2500
+    needs_kvm: true
+    needs_android_sdk: true
+    work_disk: hdd
+    group_add: ["994"]
+  light:
+    ram_mb: 700
+    work_disk: ssd
 repos:
   - repo: alvaro-francisco-gil/ordago-apps
     label_class:
