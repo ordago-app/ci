@@ -6,6 +6,8 @@ import time
 import httpx
 import jwt
 
+from src.models import QueuedJob
+
 _API_VERSION = "2026-03-10"
 
 
@@ -61,3 +63,29 @@ class GitHubAdapter:
         )
         resp.raise_for_status()
         return str(resp.json()["token"])
+
+    def list_queued_jobs(self, repo: str) -> list[QueuedJob]:
+        headers = self._headers(self.installation_token())
+        runs_resp = self._client.get(
+            f"{self._base_url}/repos/{repo}/actions/runs",
+            params={"status": "queued", "per_page": 50},
+            headers=headers,
+        )
+        runs_resp.raise_for_status()
+        jobs: list[QueuedJob] = []
+        for run in runs_resp.json().get("workflow_runs", []):
+            jobs_resp = self._client.get(
+                f"{self._base_url}/repos/{repo}/actions/runs/{run['id']}/jobs",
+                headers=headers,
+            )
+            jobs_resp.raise_for_status()
+            for job in jobs_resp.json().get("jobs", []):
+                if job.get("status") == "queued":
+                    jobs.append(
+                        QueuedJob(
+                            job_id=int(job["id"]),
+                            repo=repo,
+                            labels=[str(label) for label in job.get("labels", [])],
+                        )
+                    )
+        return jobs

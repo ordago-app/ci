@@ -64,3 +64,33 @@ def test_installation_token_is_cached() -> None:
     assert gh.installation_token() == "ghs_inst"
     assert gh.installation_token() == "ghs_inst"
     assert inst.call_count == 1  # second call served from cache
+
+
+@respx.mock
+def test_list_queued_jobs() -> None:
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    respx.get(
+        "https://api.github.com/repos/o/r/actions/runs",
+        params={"status": "queued", "per_page": "50"},
+    ).mock(return_value=httpx.Response(200, json={"workflow_runs": [{"id": 555}]}))
+    respx.get("https://api.github.com/repos/o/r/actions/runs/555/jobs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 1, "status": "queued", "labels": ["self-hosted", "homelab"]},
+                    {"id": 2, "status": "in_progress", "labels": ["self-hosted", "homelab"]},
+                ]
+            },
+        )
+    )
+
+    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    jobs = gh.list_queued_jobs("o/r")
+
+    assert len(jobs) == 1
+    assert jobs[0].job_id == 1
+    assert jobs[0].repo == "o/r"
+    assert jobs[0].labels == ["self-hosted", "homelab"]
