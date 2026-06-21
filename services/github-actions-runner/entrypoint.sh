@@ -106,6 +106,17 @@ fi
 
 export PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${ANDROID_SDK_ROOT}/emulator:${PATH}"
 
+# Ephemeral runners register for a single job; after that job (or a crash) the
+# registration is already consumed/deleted server-side, but the local config
+# files persist on the container layer. With them present, run.sh starts with a
+# dead registration and fails ("registration has been deleted, please
+# re-configure"), so a restart:unless-stopped container crash-loops instead of
+# recycling. Clear the stale config so an ephemeral runner always re-registers
+# fresh on (re)start. Long-lived (non-ephemeral) runners keep their config.
+if [ "${RUNNER_EPHEMERAL:-0}" = "1" ]; then
+  rm -f .runner .credentials .credentials_rsaparams
+fi
+
 if [ ! -f .runner ]; then
   echo "Configuring GitHub Actions runner ${RUNNER_NAME} for ${RUNNER_REPOSITORY}..."
   registration_token="$(mint_token registration-token)"
