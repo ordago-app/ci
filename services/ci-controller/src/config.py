@@ -78,5 +78,10 @@ class ControllerConfig(BaseModel):
         for label in labels:
             if label in match.label_class:
                 return match.label_class[label]
-        # Allowlisted repo with no matching label → fall back to default_class (intentional).
-        return self.default_class
+        # No mapped label: only serve genuine self-hosted jobs. A job without the
+        # "self-hosted" label (e.g. ubuntu-latest) runs on GitHub-hosted runners and
+        # must never be admitted — the controller can't run it and would spawn an
+        # idle lane. A self-hosted job with an unmapped custom label gets default_class.
+        if "self-hosted" in labels:
+            return self.default_class
+        return None

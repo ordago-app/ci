@@ -39,6 +39,19 @@ def test_class_for_returns_none_for_unlisted_repo(write_config) -> None:
     assert cfg.class_for("someone/other-repo", ["self-hosted"]) is None
 
 
+def test_class_for_rejects_hosted_runner_job(write_config) -> None:
+    # A GitHub-hosted job (e.g. dependabot on ubuntu-latest) has no "self-hosted"
+    # label and no mapped label — the controller must NOT admit it (it can't run it).
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    assert cfg.class_for("alvaro-francisco-gil/homelab", ["ubuntu-latest"]) is None
+
+
+def test_class_for_self_hosted_unmapped_label_uses_default(write_config) -> None:
+    # A self-hosted job whose custom label isn't mapped still gets the default class.
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    assert cfg.class_for("alvaro-francisco-gil/homelab", ["self-hosted", "x64"]) == "light"
+
+
 def test_default_class_must_exist(write_config) -> None:
     bad = VALID_CONFIG.replace("default_class: light", "default_class: nonexistent")
     with pytest.raises(ConfigError, match="default_class"):
