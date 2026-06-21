@@ -13,13 +13,23 @@ require_env RUNNER_REPOSITORY
 require_env RUNNER_NAME
 require_env RUNNER_LABELS
 require_env RUNNER_WORKDIR
-require_env GITHUB_RUNNER_APP_ID
-require_env GITHUB_RUNNER_APP_INSTALLATION_ID
-require_env GITHUB_RUNNER_APP_PRIVATE_KEY_B64
 
-app_id="${GITHUB_RUNNER_APP_ID}"
-app_installation_id="${GITHUB_RUNNER_APP_INSTALLATION_ID}"
-app_private_key_b64="${GITHUB_RUNNER_APP_PRIVATE_KEY_B64}"
+require_app_creds() {
+  require_env GITHUB_RUNNER_APP_ID
+  require_env GITHUB_RUNNER_APP_INSTALLATION_ID
+  require_env GITHUB_RUNNER_APP_PRIVATE_KEY_B64
+}
+
+# App creds are only needed to MINT tokens. When the controller supplies a
+# pre-minted registration token (the dynamic ci-controller path), the App
+# private key never enters this lane.
+if [ -z "${RUNNER_REGISTRATION_TOKEN:-}" ]; then
+  require_app_creds
+fi
+
+app_id="${GITHUB_RUNNER_APP_ID:-}"
+app_installation_id="${GITHUB_RUNNER_APP_INSTALLATION_ID:-}"
+app_private_key_b64="${GITHUB_RUNNER_APP_PRIVATE_KEY_B64:-}"
 unset GITHUB_RUNNER_APP_ID GITHUB_RUNNER_APP_INSTALLATION_ID GITHUB_RUNNER_APP_PRIVATE_KEY_B64
 
 github_api="https://api.github.com/repos/${RUNNER_REPOSITORY}/actions/runners"
@@ -87,7 +97,9 @@ mint_token() {
 
 cleanup() {
   set +e
-  if [ -f .runner ]; then
+  # Ephemeral runners auto-deregister after one job, and have no App creds to
+  # mint a remove-token. Only the static pool path removes explicitly.
+  if [ "${RUNNER_EPHEMERAL:-0}" != "1" ] && [ -f .runner ]; then
     echo "Removing GitHub Actions runner ${RUNNER_NAME}..."
     remove_token="$(mint_token remove-token)"
     ./config.sh remove --unattended --token "${remove_token}"
@@ -119,7 +131,11 @@ fi
 
 if [ ! -f .runner ]; then
   echo "Configuring GitHub Actions runner ${RUNNER_NAME} for ${RUNNER_REPOSITORY}..."
-  registration_token="$(mint_token registration-token)"
+  if [ -n "${RUNNER_REGISTRATION_TOKEN:-}" ]; then
+    registration_token="${RUNNER_REGISTRATION_TOKEN}"
+  else
+    registration_token="$(mint_token registration-token)"
+  fi
   config_args=(
     --unattended
     --replace
