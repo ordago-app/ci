@@ -17,8 +17,21 @@ POOL_CONFIG = REPO_ROOT / "personal/github-runners.yml"
 HOST = "powerserver"
 
 
-def render() -> dict:
+def render(respect_enabled: bool = False) -> dict:
+    """Render the compose template from the committed pool config.
+
+    The template only emits runners with ``enabled: true``. These tests assert
+    the *template's* handling of each runner archetype (heavy/light, KVM, SSD
+    work dirs, ephemeral, per-runner repository) — which is independent of which
+    runners happen to be enabled for deployment. So by default we force every
+    configured runner enabled. Pass ``respect_enabled=True`` to render the
+    actual deployed pool (honouring the real ``enabled`` flags).
+    """
     config = yaml.safe_load(POOL_CONFIG.read_text())
+    runners_cfg = config["github_actions_runners"]
+    if not respect_enabled:
+        runners_cfg = dict(runners_cfg)
+        runners_cfg["runners"] = [{**r, "enabled": True} for r in runners_cfg["runners"]]
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(str(TEMPLATE.parent)),
         trim_blocks=True,
@@ -27,17 +40,25 @@ def render() -> dict:
         undefined=jinja2.StrictUndefined,
     )
     text = env.get_template(TEMPLATE.name).render(
-        github_actions_runners=config["github_actions_runners"],
+        github_actions_runners=runners_cfg,
         inventory_hostname=HOST,
     )
     return yaml.safe_load(text)
 
 
 def test_renders_valid_yaml_with_seven_runners():
+    # Template-shape view (all configured runners forced enabled).
     compose = render()
     assert set(compose) == {"services", "networks"}
     # 5 ordago runners + 2 homelab-ci runners
     assert len(compose["services"]) == 7
+
+
+def test_live_config_deploys_only_homelab_runners():
+    """The deployed pool (real ``enabled`` flags): ordago runners are held
+    disabled for capacity, so only the two ephemeral homelab runners deploy."""
+    services = render(respect_enabled=True)["services"]
+    assert set(services) == {"homelab-ci-1", "homelab-ci-2"}
 
 
 def test_runner_names_and_labels():
