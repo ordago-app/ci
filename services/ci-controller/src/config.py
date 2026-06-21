@@ -78,4 +78,5 @@ class ControllerConfig(BaseModel):
         for label in labels:
             if label in match.label_class:
                 return match.label_class[label]
+        # Allowlisted repo with no matching label → fall back to default_class (intentional).
         return self.default_class
