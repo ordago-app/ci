@@ -147,6 +147,11 @@ if [ ! -f .runner ]; then
   )
   if [ "${RUNNER_EPHEMERAL:-0}" = "1" ]; then
     config_args+=(--ephemeral)
+    # An ephemeral runner lives for exactly one job; a self-update triggered
+    # mid-job deadlocks ("waiting for current job to finish" vs "job needs the
+    # update first"). Disable auto-update — keep the image's runner version
+    # current instead (ACTIONS_RUNNER_VERSION in the Dockerfile).
+    config_args+=(--disableupdate)
   fi
   ./config.sh "${config_args[@]}"
 fi

@@ -19,3 +19,9 @@ def test_app_creds_optional_when_token_supplied() -> None:
 def test_ephemeral_skips_remove_mint() -> None:
     text = ENTRY.read_text()
     assert 'if [ "${RUNNER_EPHEMERAL:-0}" != "1" ] && [ -f .runner ]; then' in text
+
+
+def test_ephemeral_disables_self_update() -> None:
+    text = ENTRY.read_text()
+    # ephemeral lanes must not self-update mid-job (deadlocks); they pin the image version.
+    assert "--disableupdate" in text
