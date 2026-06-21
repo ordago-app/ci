@@ -42,6 +42,7 @@ class ControllerConfig(BaseModel):
     runner_image: str
     work_dirs: dict[str, str]
     shared_mounts: list[Mount] = []
+    lane_env: dict[str, str] = {}
     classes: dict[str, JobClass]
     repos: list[RepoConfig]
 

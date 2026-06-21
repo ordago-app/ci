@@ -25,6 +25,9 @@ work_dirs:
   hdd: /opt/personal/github-actions/ci-controller
 shared_mounts:
   - { host: /mnt/ci-ssd/pnpm-store, container: /cache/pnpm }
+lane_env:
+  PNPM_HOME: /cache/pnpm
+  GRADLE_USER_HOME: /cache/gradle
 classes:
   emulator:
     ram_mb: 2500

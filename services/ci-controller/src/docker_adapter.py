@@ -36,15 +36,21 @@ class DockerAdapter:
         for mount in self._config.shared_mounts:
             volumes[mount.host] = {"bind": mount.container, "mode": "rw"}
 
-        environment = {
-            "RUNNER_REPOSITORY": job.repo,
-            "RUNNER_NAME": lane_id,
-            "RUNNER_LABELS": ",".join(job.labels),
-            "RUNNER_WORKDIR": "/runner-work",
-            "RUNNER_EPHEMERAL": "1",
-            "RUNNER_REGISTRATION_TOKEN": registration_token,
-            "SKIP_ANDROID_SDK": "0" if job_class.needs_android_sdk else "1",
-        }
+        # Start from the operator-configured lane_env (cache-path parity with the
+        # static runner pool — GRADLE_USER_HOME, PNPM_HOME, ANDROID_*), then layer the
+        # per-lane RUNNER_* on top so they always win.
+        environment = dict(self._config.lane_env)
+        environment.update(
+            {
+                "RUNNER_REPOSITORY": job.repo,
+                "RUNNER_NAME": lane_id,
+                "RUNNER_LABELS": ",".join(job.labels),
+                "RUNNER_WORKDIR": "/runner-work",
+                "RUNNER_EPHEMERAL": "1",
+                "RUNNER_REGISTRATION_TOKEN": registration_token,
+                "SKIP_ANDROID_SDK": "0" if job_class.needs_android_sdk else "1",
+            }
+        )
 
         run_kwargs: dict[str, object] = {
             "detach": True,

@@ -33,6 +33,9 @@ def test_spawn_light_lane(write_config) -> None:
     assert kwargs["environment"]["RUNNER_EPHEMERAL"] == "1"
     assert kwargs["environment"]["RUNNER_LABELS"] == "self-hosted,homelab"
     assert kwargs["environment"]["SKIP_ANDROID_SDK"] == "1"  # light class: no SDK
+    # lane_env from config is merged in (cache-path parity with the static runner pool)
+    assert kwargs["environment"]["PNPM_HOME"] == "/cache/pnpm"
+    assert kwargs["environment"]["GRADLE_USER_HOME"] == "/cache/gradle"
     assert "devices" not in kwargs or not kwargs["devices"]
     # work dir on ssd
     assert any(
