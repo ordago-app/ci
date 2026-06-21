@@ -25,3 +25,9 @@ dev = [
 asyncio_mode = "auto"
 addopts = "-ra"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "RUF", "BLE"]
