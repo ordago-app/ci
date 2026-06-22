@@ -25,3 +25,11 @@ def test_ephemeral_disables_self_update() -> None:
     text = ENTRY.read_text()
     # ephemeral lanes must not self-update mid-job (deadlocks); they pin the image version.
     assert "--disableupdate" in text
+
+
+def test_ephemeral_reaps_work_dir_on_exit() -> None:
+    text = ENTRY.read_text()
+    # The controller binds a shared work-dir base and the lane creates a per-lane
+    # subdir in it; that host subdir persists after the container auto-removes and
+    # accumulates. The cleanup trap must reap it (guarded to the ephemeral path).
+    assert 'rm -rf "${RUNNER_WORKDIR}"' in text

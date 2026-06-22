@@ -104,6 +104,15 @@ cleanup() {
     remove_token="$(mint_token remove-token)"
     ./config.sh remove --unattended --token "${remove_token}"
   fi
+  # The ci-controller binds a shared work-dir base and each ephemeral lane creates
+  # its own per-lane subdir (RUNNER_WORKDIR) inside it. The container auto-removes,
+  # but that host subdir would persist and accumulate (filled the SSD over time).
+  # Reap it here — runs as the runner uid that owns the files. Only for ephemeral
+  # lanes; the static pool reuses its work dir across jobs.
+  if [ "${RUNNER_EPHEMERAL:-0}" = "1" ] && [ -n "${RUNNER_WORKDIR:-}" ]; then
+    echo "Reaping ephemeral work dir ${RUNNER_WORKDIR}..."
+    rm -rf "${RUNNER_WORKDIR}"
+  fi
 }
 
 trap cleanup EXIT INT TERM
