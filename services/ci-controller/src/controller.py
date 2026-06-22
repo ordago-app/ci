@@ -170,6 +170,8 @@ class Controller:
             "lanes_running": self.ledger.lane_count(),
             "max_lanes": self.config.max_concurrent_lanes,
             "kvm_in_use": self.ledger.kvm_in_use(),
+            "config_version": self._config_version,
+            "admission_mode": self.config.admission_mode,
             "disk_gb": {
                 disk: {
                     "used": self.ledger.disk_gb_in_use(disk),
