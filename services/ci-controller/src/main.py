@@ -13,7 +13,9 @@ from src.config import ControllerConfig
 from src.controller import Controller
 from src.docker_adapter import DockerAdapter
 from src.github_adapter import GitHubAdapter
+from src.host_stats import read_host_stats
 from src.ledger import Ledger
+from src.metrics import MetricsStore
 
 
 def _require(name: str) -> str:
@@ -43,7 +45,15 @@ def main() -> None:
     docker_client = docker.DockerClient(base_url=proxy_url)
     docker_adapter = DockerAdapter(client=docker_client, config=config, host=host)
 
-    controller = Controller(config=config, github=github, docker=docker_adapter, ledger=Ledger())
+    metrics = MetricsStore(os.environ.get("CI_CONTROLLER_DB", "/var/lib/ci-controller/metrics.db"))
+    controller = Controller(
+        config=config,
+        github=github,
+        docker=docker_adapter,
+        ledger=Ledger(),
+        metrics=metrics,
+        host_stats_reader=read_host_stats,
+    )
     app = create_app(controller, poll_interval=poll_interval)
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 

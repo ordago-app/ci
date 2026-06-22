@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 
 from src.admission import evaluate
 from src.config import ControllerConfig
 from src.docker_adapter import DockerAdapter
 from src.github_adapter import GitHubAdapter
+from src.host_stats import HostStats
 from src.ledger import Ledger
+from src.metrics import MetricsStore
 from src.models import AdmitDecision, Decision, DeferDecision, QueuedJob, Reservation
 
 log = logging.getLogger("ci-controller")
+
+
+def _now() -> float:
+    return time.time()
 
 
 class Controller:
@@ -19,17 +27,53 @@ class Controller:
         github: GitHubAdapter,
         docker: DockerAdapter,
         ledger: Ledger,
+        metrics: MetricsStore | None = None,
+        host_stats_reader: Callable[[], HostStats] | None = None,
     ) -> None:
         self.config = config
         self.github = github
         self.docker = docker
         self.ledger = ledger
         self._last_decisions: list[Decision] = []
+        self.metrics = metrics
+        self._host_stats_reader = host_stats_reader
+        self._config_version = config.config_version()
+        self._peaks: dict[str, tuple[int, float]] = {}
+
+    def _emit(self, **fields: object) -> None:
+        if self.metrics is None:
+            return
+        try:
+            self.metrics.record_event(config_version=self._config_version, **fields)  # type: ignore[arg-type]
+        except Exception as exc:  # metrics must never break the loop
+            log.warning("metrics write failed: %s", exc)
 
     def reconcile(self) -> None:
         running = {lane.lane_id: lane for lane in self.docker.list_lanes()}
-        # Drop ledger entries whose lane is gone (frees budget).
+        # Sample live lanes and update peak footprint.
+        for lane in running.values():
+            try:
+                sampled = self.docker.sample(lane.container_id)
+            except Exception:  # sampling must never break the loop
+                sampled = None
+            if sampled is not None:
+                prev = self._peaks.get(lane.lane_id, (0, 0.0))
+                self._peaks[lane.lane_id] = (max(prev[0], sampled[0]), max(prev[1], sampled[1]))
+        # Drop ledger entries whose lane is gone (frees budget); emit reap events.
         for lane_id in self.ledger.lane_ids() - set(running):
+            res = next((r for r in self.ledger.reservations() if r.lane_id == lane_id), None)
+            peak = self._peaks.pop(lane_id, (None, None))
+            if res is not None:
+                self._emit(
+                    kind="reap",
+                    job_id=res.job_id,
+                    repo=res.repo,
+                    class_name=res.class_name,
+                    lane_id=lane_id,
+                    ts=_now(),
+                    peak_ram_mb=peak[0],
+                    peak_cpu_pct=peak[1],
+                )
             self.ledger.remove(lane_id)
         # Re-adopt running lanes the ledger doesn't know about (post-restart).
         known_jobs = {r.job_id for r in self.ledger.reservations()}
@@ -65,10 +109,33 @@ class Controller:
             except Exception as exc:  # one bad repo must not kill the loop
                 log.warning("poll failed for %s: %s", repo, exc)
 
-        decisions = evaluate(jobs, self.ledger, self.config)
+        host_stats = None
+        if self._host_stats_reader is not None:
+            try:
+                host_stats = self._host_stats_reader()
+            except Exception as exc:
+                log.warning("host stats read failed: %s", exc)
+
+        decisions = evaluate(jobs, self.ledger, self.config, host_stats)
         for decision in decisions:
             if isinstance(decision, AdmitDecision):
                 self._admit(decision)
+                self._emit(
+                    kind="admit",
+                    job_id=decision.job.job_id,
+                    repo=decision.job.repo,
+                    class_name=decision.class_name,
+                    work_disk=decision.work_disk,
+                    ts=_now(),
+                )
+            else:
+                self._emit(
+                    kind="defer",
+                    job_id=decision.job.job_id,
+                    repo=decision.job.repo,
+                    reason=decision.reason,
+                    ts=_now(),
+                )
         self._last_decisions = decisions
         return decisions
 
