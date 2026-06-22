@@ -55,12 +55,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && corepack enable \
  && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /opt/actions-runner \
- && curl -fsSL "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" \
-      -o /tmp/actions-runner.tar.gz \
- && tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner \
- && rm /tmp/actions-runner.tar.gz
-
 RUN mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools" \
  && curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip" \
       -o /tmp/android-commandline-tools.zip \
@@ -89,6 +83,16 @@ RUN curl -fsSL "https://github.com/mobile-dev-inc/maestro/releases/download/cli-
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libatomic1 \
  && rm -rf /var/lib/apt/lists/*
+
+# Runner download is kept LAST of the heavy layers, after the Android SDK and
+# maestro: it is the only consumer of ACTIONS_RUNNER_VERSION, so bumping the
+# runner version invalidates the build cache only from here down — the slow
+# (~hours) Android-SDK/maestro layers above stay cached.
+RUN mkdir -p /opt/actions-runner \
+ && curl -fsSL "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" \
+      -o /tmp/actions-runner.tar.gz \
+ && tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner \
+ && rm /tmp/actions-runner.tar.gz
 
 RUN install -d -o 1000 -g 1000 /home/runner /runner-work /cache /cache/gradle /cache/android-sdk /cache/android-avd /cache/pnpm \
  && chown 1000:1000 /opt/actions-runner \
