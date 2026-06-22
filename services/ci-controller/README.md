@@ -33,7 +33,8 @@ Supersedes the static pools in `services/github-actions-runner` (which become
 
 ## Ops
 
-- Health: `docker exec ci-controller curl -fsS localhost:8000/healthz`
+- Health: `docker exec ci-controller python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"`
+  (the slim image ships Python, not curl).
 - Live state: `curl http://ci-controller:8000/status` from another homelab container
   (shows the ledger, running lanes, and **why** queued jobs are deferred).
 - Onboard a repo: `make ci-onboard REPO=owner/name`.
