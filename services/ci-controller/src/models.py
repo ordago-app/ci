@@ -7,6 +7,7 @@ ALREADY_RUNNING = "already_running"
 LANE_CEILING = "lane_ceiling"
 KVM_BUSY = "kvm_busy"
 BUDGET_FULL = "budget_full"
+DISK_FULL = "disk_full"
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class Reservation:
     class_name: str
     ram_mb: int
     needs_kvm: bool
+    work_disk: str = "ssd"
+    work_gb: int = 0
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,8 @@ class AdmitDecision:
     class_name: str
     ram_mb: int
     needs_kvm: bool
+    work_disk: str = "ssd"
+    work_gb: int = 0
 
 
 @dataclass(frozen=True)

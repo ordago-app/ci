@@ -5,6 +5,7 @@ from src.ledger import Ledger
 from src.models import (
     ALREADY_RUNNING,
     BUDGET_FULL,
+    DISK_FULL,
     KVM_BUSY,
     LANE_CEILING,
     NOT_ALLOWLISTED,
@@ -20,6 +21,8 @@ def evaluate(jobs: list[QueuedJob], ledger: Ledger, config: ControllerConfig) ->
     ram = ledger.total_ram()
     lanes = ledger.lane_count()
     kvm = ledger.kvm_in_use()
+    # Per-disk GB committed so far (ledger + this batch's admissions).
+    disk_gb = {disk: ledger.disk_gb_in_use(disk) for disk in config.disk_budget_gb}
     decisions: list[Decision] = []
 
     for job in jobs:
@@ -43,6 +46,13 @@ def evaluate(jobs: list[QueuedJob], ledger: Ledger, config: ControllerConfig) ->
         if ram + job_class.ram_mb > config.ram_budget_mb:
             decisions.append(DeferDecision(job, BUDGET_FULL))
             continue
+        disk_budget = config.disk_budget_gb.get(job_class.work_disk)
+        if (
+            disk_budget is not None
+            and disk_gb[job_class.work_disk] + job_class.work_gb > disk_budget
+        ):
+            decisions.append(DeferDecision(job, DISK_FULL))
+            continue
 
         decisions.append(
             AdmitDecision(
@@ -50,10 +60,14 @@ def evaluate(jobs: list[QueuedJob], ledger: Ledger, config: ControllerConfig) ->
                 class_name=class_name,
                 ram_mb=job_class.ram_mb,
                 needs_kvm=job_class.needs_kvm,
+                work_disk=job_class.work_disk,
+                work_gb=job_class.work_gb,
             )
         )
         ram += job_class.ram_mb
         lanes += 1
         kvm = kvm or job_class.needs_kvm
+        if job_class.work_disk in disk_gb:
+            disk_gb[job_class.work_disk] += job_class.work_gb
 
     return decisions

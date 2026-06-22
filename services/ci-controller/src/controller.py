@@ -51,6 +51,8 @@ class Controller:
                 class_name=self.config.default_class,
                 ram_mb=job_class.ram_mb,
                 needs_kvm=job_class.needs_kvm,
+                work_disk=job_class.work_disk,
+                work_gb=job_class.work_gb,
             )
         )
 
@@ -85,6 +87,8 @@ class Controller:
                 class_name=decision.class_name,
                 ram_mb=decision.ram_mb,
                 needs_kvm=decision.needs_kvm,
+                work_disk=decision.work_disk,
+                work_gb=decision.work_gb,
             )
         )
         log.info(
@@ -99,6 +103,13 @@ class Controller:
             "lanes_running": self.ledger.lane_count(),
             "max_lanes": self.config.max_concurrent_lanes,
             "kvm_in_use": self.ledger.kvm_in_use(),
+            "disk_gb": {
+                disk: {
+                    "used": self.ledger.disk_gb_in_use(disk),
+                    "budget": budget,
+                }
+                for disk, budget in self.config.disk_budget_gb.items()
+            },
             "running": [
                 {
                     "lane_id": r.lane_id,

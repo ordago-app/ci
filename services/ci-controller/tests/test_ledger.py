@@ -3,7 +3,14 @@ from src.ledger import Ledger
 from src.models import Reservation
 
 
-def _res(lane_id: str, job_id: int, ram_mb: int = 700, kvm: bool = False) -> Reservation:
+def _res(
+    lane_id: str,
+    job_id: int,
+    ram_mb: int = 700,
+    kvm: bool = False,
+    work_disk: str = "ssd",
+    work_gb: int = 0,
+) -> Reservation:
     return Reservation(
         lane_id=lane_id,
         job_id=job_id,
@@ -11,6 +18,8 @@ def _res(lane_id: str, job_id: int, ram_mb: int = 700, kvm: bool = False) -> Res
         class_name="light",
         ram_mb=ram_mb,
         needs_kvm=kvm,
+        work_disk=work_disk,
+        work_gb=work_gb,
     )
 
 
@@ -51,6 +60,17 @@ def test_has_job() -> None:
     led.add(_res("a", 42))
     assert led.has_job(42) is True
     assert led.has_job(99) is False
+
+
+def test_disk_gb_in_use_is_per_disk() -> None:
+    led = Ledger()
+    led.add(_res("a", 1, work_disk="ssd", work_gb=4))
+    led.add(_res("b", 2, work_disk="ssd", work_gb=6))
+    led.add(_res("c", 3, work_disk="hdd", work_gb=50))
+    assert led.disk_gb_in_use("ssd") == 10
+    assert led.disk_gb_in_use("hdd") == 50
+    led.remove("b")
+    assert led.disk_gb_in_use("ssd") == 4
 
 
 def test_add_duplicate_lane_id_rejected() -> None:

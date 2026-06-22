@@ -70,6 +70,22 @@ def test_invalid_work_disk_rejected(write_config) -> None:
         ControllerConfig.load(write_config(bad))
 
 
+def test_disk_budget_references_known_disk(write_config) -> None:
+    bad = VALID_CONFIG.replace("work_dirs:", "disk_budget_gb:\n  floppy: 10\nwork_dirs:")
+    with pytest.raises(ConfigError, match="disk_budget_gb"):
+        ControllerConfig.load(write_config(bad))
+
+
+def test_disk_budget_and_work_gb_load(write_config) -> None:
+    text = VALID_CONFIG.replace(
+        "work_dirs:", "disk_budget_gb:\n  ssd: 6\n  hdd: 300\nwork_dirs:"
+    ).replace("    work_disk: ssd\n", "    work_disk: ssd\n    work_gb: 4\n")
+    cfg = ControllerConfig.load(write_config(text))
+    assert cfg.disk_budget_gb == {"ssd": 6, "hdd": 300}
+    assert cfg.classes["light"].work_gb == 4
+    assert cfg.classes["emulator"].work_gb == 0  # default when unspecified
+
+
 def test_missing_file_raises_config_error() -> None:
     with pytest.raises(ConfigError):
         ControllerConfig.load(Path("/nonexistent/ci-controller.yml"))

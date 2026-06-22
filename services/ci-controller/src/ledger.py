@@ -26,6 +26,9 @@ class Ledger:
     def kvm_in_use(self) -> bool:
         return any(r.needs_kvm for r in self._items.values())
 
+    def disk_gb_in_use(self, disk: str) -> int:
+        return sum(r.work_gb for r in self._items.values() if r.work_disk == disk)
+
     def has_job(self, job_id: int) -> bool:
         return any(r.job_id == job_id for r in self._items.values())
 

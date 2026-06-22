@@ -15,6 +15,7 @@ class JobClass(BaseModel):
     needs_kvm: bool = False
     needs_android_sdk: bool = False
     work_disk: str = "ssd"
+    work_gb: int = 0  # peak per-lane work-dir size; 0 = untracked (no disk gate)
     group_add: list[str] = []
 
     @field_validator("work_disk")
@@ -41,6 +42,7 @@ class ControllerConfig(BaseModel):
     default_class: str
     runner_image: str
     work_dirs: dict[str, str]
+    disk_budget_gb: dict[str, int] = {}
     shared_mounts: list[Mount] = []
     lane_env: dict[str, str] = {}
     classes: dict[str, JobClass]
@@ -53,6 +55,11 @@ class ControllerConfig(BaseModel):
         for disk in ("ssd", "hdd"):
             if disk not in self.work_dirs:
                 raise ValueError(f"work_dirs must define '{disk}'")
+        for disk in self.disk_budget_gb:
+            if disk not in self.work_dirs:
+                raise ValueError(
+                    f"disk_budget_gb references unknown disk '{disk}' (not in work_dirs)"
+                )
         for repo in self.repos:
             for label, class_name in repo.label_class.items():
                 if class_name not in self.classes:
