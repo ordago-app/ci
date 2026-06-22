@@ -87,3 +87,32 @@ def test_remove_ignores_missing(write_config) -> None:
     adapter, client, _ = _adapter(write_config)
     client.containers.get.side_effect = docker.errors.NotFound("gone")
     adapter.remove("ghost")  # must not raise
+
+
+def test_sample_parses_ram_and_cpu(write_config) -> None:
+    adapter, client, _ = _adapter(write_config)
+    container = MagicMock()
+    container.stats.return_value = {
+        "memory_stats": {"usage": 2961178624},  # 2824 MiB
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": 2000000000},
+            "system_cpu_usage": 100000000000,
+            "online_cpus": 8,
+        },
+        "precpu_stats": {
+            "cpu_usage": {"total_usage": 1000000000},
+            "system_cpu_usage": 99000000000,
+        },
+    }
+    client.containers.get.return_value = container
+    ram, cpu = adapter.sample("abc")
+    assert ram == 2824
+    assert round(cpu, 1) == 800.0  # (1e9 delta / 1e9 system delta) * 8 cpus * 100
+
+
+def test_sample_returns_none_when_missing(write_config) -> None:
+    import docker.errors
+
+    adapter, client, _ = _adapter(write_config)
+    client.containers.get.side_effect = docker.errors.NotFound("gone")
+    assert adapter.sample("ghost") is None

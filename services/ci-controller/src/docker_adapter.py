@@ -12,6 +12,17 @@ LANE_LABEL = "com.homelab.ci-controller.lane"
 JOB_LABEL = "com.homelab.ci-controller.job"
 
 
+def _cpu_percent(stats: dict) -> float:
+    cpu = stats["cpu_stats"]
+    pre = stats["precpu_stats"]
+    cpu_delta = cpu["cpu_usage"]["total_usage"] - pre["cpu_usage"]["total_usage"]
+    sys_delta = cpu["system_cpu_usage"] - pre["system_cpu_usage"]
+    online = cpu.get("online_cpus") or len(cpu["cpu_usage"].get("percpu_usage", [])) or 1
+    if sys_delta <= 0 or cpu_delta < 0:
+        return 0.0
+    return (cpu_delta / sys_delta) * online * 100.0
+
+
 @dataclass(frozen=True)
 class LaneInfo:
     lane_id: str
@@ -95,3 +106,12 @@ class DockerAdapter:
             container.remove(force=True)
         except docker.errors.NotFound:
             pass
+
+    def sample(self, container_id: str) -> tuple[int, float] | None:
+        try:
+            container = self._client.containers.get(container_id)
+            stats = container.stats(stream=False)
+            ram_mb = int(stats["memory_stats"]["usage"]) // (1024 * 1024)
+            return ram_mb, _cpu_percent(stats)
+        except (docker.errors.NotFound, KeyError, TypeError):
+            return None
