@@ -89,3 +89,24 @@ def test_disk_budget_and_work_gb_load(write_config) -> None:
 def test_missing_file_raises_config_error() -> None:
     with pytest.raises(ConfigError):
         ControllerConfig.load(Path("/nonexistent/ci-controller.yml"))
+
+
+def test_config_version_is_stable_and_sensitive(write_config) -> None:
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    same = ControllerConfig.load(write_config(VALID_CONFIG))
+    assert cfg.config_version() == same.config_version()
+    assert len(cfg.config_version()) == 8
+    changed = ControllerConfig.load(
+        write_config(VALID_CONFIG.replace("ram_budget_mb: 12000", "ram_budget_mb: 15000"))
+    )
+    assert changed.config_version() != cfg.config_version()
+
+
+def test_admission_mode_defaults_and_validates(write_config) -> None:
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    assert cfg.admission_mode == "reservation"
+    bad = VALID_CONFIG.replace(
+        "ram_budget_mb: 12000", "admission_mode: bogus\nram_budget_mb: 12000"
+    )
+    with pytest.raises(ConfigError, match="admission_mode"):
+        ControllerConfig.load(write_config(bad))

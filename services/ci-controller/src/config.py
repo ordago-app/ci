@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import yaml
@@ -38,6 +40,9 @@ class Mount(BaseModel):
 
 class ControllerConfig(BaseModel):
     ram_budget_mb: int
+    admission_mode: str = "reservation"
+    host_free_ram_floor_mb: int = 1500
+    host_load_ceiling: float = 0.0  # 0 disables the load gate
     max_concurrent_lanes: int
     default_class: str
     runner_image: str
@@ -66,6 +71,11 @@ class ControllerConfig(BaseModel):
                     raise ValueError(
                         f"repo {repo.repo}: label '{label}' maps to unknown class '{class_name}'"
                     )
+        if self.admission_mode not in {"reservation", "reservation_plus_guard"}:
+            raise ValueError(
+                f"admission_mode '{self.admission_mode}' must be "
+                "'reservation' or 'reservation_plus_guard'"
+            )
         return self
 
     @classmethod
@@ -75,6 +85,11 @@ class ControllerConfig(BaseModel):
             return cls.model_validate(raw)
         except (OSError, ValidationError, yaml.YAMLError) as exc:
             raise ConfigError(f"invalid ci-controller config {path}: {exc}") from exc
+
+    def config_version(self) -> str:
+        """8-char hash of the full config; any meaningful change yields a new id."""
+        blob = json.dumps(self.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(blob.encode()).hexdigest()[:8]
 
     def repo_names(self) -> set[str]:
         return {repo.repo for repo in self.repos}
