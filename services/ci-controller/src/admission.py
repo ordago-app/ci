@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from src.config import ControllerConfig
+from src.host_stats import HostStats
 from src.ledger import Ledger
 from src.models import (
     ALREADY_RUNNING,
     BUDGET_FULL,
     DISK_FULL,
+    HOST_PRESSURE,
     KVM_BUSY,
     LANE_CEILING,
     NOT_ALLOWLISTED,
@@ -16,7 +18,12 @@ from src.models import (
 )
 
 
-def evaluate(jobs: list[QueuedJob], ledger: Ledger, config: ControllerConfig) -> list[Decision]:
+def evaluate(
+    jobs: list[QueuedJob],
+    ledger: Ledger,
+    config: ControllerConfig,
+    host_stats: HostStats | None = None,
+) -> list[Decision]:
     """Decide admit/defer per job, accumulating admissions within the batch."""
     ram = ledger.total_ram()
     lanes = ledger.lane_count()
@@ -52,6 +59,17 @@ def evaluate(jobs: list[QueuedJob], ledger: Ledger, config: ControllerConfig) ->
             and disk_gb[job_class.work_disk] + job_class.work_gb > disk_budget
         ):
             decisions.append(DeferDecision(job, DISK_FULL))
+            continue
+
+        if (
+            config.admission_mode == "reservation_plus_guard"
+            and host_stats is not None
+            and (
+                host_stats.mem_available_mb < config.host_free_ram_floor_mb
+                or (config.host_load_ceiling > 0 and host_stats.load_1m > config.host_load_ceiling)
+            )
+        ):
+            decisions.append(DeferDecision(job, HOST_PRESSURE))
             continue
 
         decisions.append(

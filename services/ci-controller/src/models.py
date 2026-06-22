@@ -8,6 +8,7 @@ LANE_CEILING = "lane_ceiling"
 KVM_BUSY = "kvm_busy"
 BUDGET_FULL = "budget_full"
 DISK_FULL = "disk_full"
+HOST_PRESSURE = "host_pressure"
 
 
 @dataclass(frozen=True)

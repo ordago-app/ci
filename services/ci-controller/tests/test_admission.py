@@ -1,9 +1,11 @@
 from src.admission import evaluate
 from src.config import ControllerConfig
+from src.host_stats import HostStats
 from src.ledger import Ledger
 from src.models import (
     BUDGET_FULL,
     DISK_FULL,
+    HOST_PRESSURE,
     KVM_BUSY,
     LANE_CEILING,
     NOT_ALLOWLISTED,
@@ -161,3 +163,32 @@ def test_batch_admissions_accumulate(write_config) -> None:
     assert len(admitted) == 2
     assert len(deferred) == 1
     assert deferred[0].reason == BUDGET_FULL
+
+
+def test_guard_defers_on_low_host_ram(write_config) -> None:
+    cfg_text = VALID_CONFIG.replace(
+        "ram_budget_mb: 12000", "admission_mode: reservation_plus_guard\nram_budget_mb: 12000"
+    )
+    cfg = ControllerConfig.load(write_config(cfg_text))
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    low = HostStats(mem_available_mb=500, load_1m=1.0)  # below default floor 1500
+    decisions = evaluate([job], Ledger(), cfg, low)
+    assert isinstance(decisions[0], DeferDecision)
+    assert decisions[0].reason == HOST_PRESSURE
+
+
+def test_guard_admits_when_host_has_headroom(write_config) -> None:
+    cfg_text = VALID_CONFIG.replace(
+        "ram_budget_mb: 12000", "admission_mode: reservation_plus_guard\nram_budget_mb: 12000"
+    )
+    cfg = ControllerConfig.load(write_config(cfg_text))
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    ok = HostStats(mem_available_mb=8000, load_1m=1.0)
+    assert isinstance(evaluate([job], Ledger(), cfg, ok)[0], AdmitDecision)
+
+
+def test_reservation_mode_ignores_host_stats(write_config) -> None:
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))  # default reservation
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    low = HostStats(mem_available_mb=100, load_1m=99.0)
+    assert isinstance(evaluate([job], Ledger(), cfg, low)[0], AdmitDecision)
