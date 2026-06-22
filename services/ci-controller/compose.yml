@@ -39,15 +39,17 @@ services:
     depends_on:
       - docker-socket-proxy
     environment:
-      - CI_CONTROLLER_CONFIG=/etc/ci-controller/ci-controller.yml
-      - POLL_INTERVAL_SECONDS=15
-      - RUNNER_HOST=powerserver
-      - DOCKER_PROXY_URL=tcp://docker-socket-proxy:2375
+      CI_CONTROLLER_CONFIG: /etc/ci-controller/ci-controller.yml
+      POLL_INTERVAL_SECONDS: 15
+      RUNNER_HOST: powerserver
+      DOCKER_PROXY_URL: tcp://docker-socket-proxy:2375
+      CI_CONTROLLER_DB: /var/lib/ci-controller/metrics.db
     env_file:
       - path: /opt/personal/secrets/github-actions-runner.env
         required: false
     volumes:
       - /opt/personal/ci-controller.yml:/etc/ci-controller/ci-controller.yml:ro
+      - /opt/personal/state/ci-controller:/var/lib/ci-controller:rw
     expose:
       - "8000"
     networks:
