@@ -9,9 +9,7 @@ class HostStats:
     load_1m: float
 
 
-def read_host_stats(
-    meminfo: str = "/proc/meminfo", loadavg: str = "/proc/loadavg"
-) -> HostStats:
+def read_host_stats(meminfo: str = "/proc/meminfo", loadavg: str = "/proc/loadavg") -> HostStats:
     mem_available_kb = 0
     with open(meminfo) as fh:
         for line in fh:
