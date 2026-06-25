@@ -50,6 +50,12 @@ services:
     volumes:
       - /opt/personal/ci-controller.yml:/etc/ci-controller/ci-controller.yml:ro
       - /opt/personal/state/ci-controller:/var/lib/ci-controller:rw
+      # Lane work-dir bases (work_dirs.{ssd,hdd} in ci-controller.yml), mounted at
+      # their host paths so the controller can delete each lane's <lane_id>-work dir
+      # when it reaps the lane — otherwise ephemeral runners leak one dir per job and
+      # fill the disk. Keep these paths in sync with work_dirs in ci-controller.yml.
+      - /mnt/ci-ssd/ci-controller:/mnt/ci-ssd/ci-controller:rw
+      - /opt/personal/github-actions/ci-controller:/opt/personal/github-actions/ci-controller:rw
     expose:
       - "8000"
     networks:
