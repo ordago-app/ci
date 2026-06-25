@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from src.admission import evaluate
 from src.config import ControllerConfig
@@ -74,6 +76,7 @@ class Controller:
                     peak_ram_mb=peak[0],
                     peak_cpu_pct=peak[1],
                 )
+                self._reap_work_dir(lane_id, res.work_disk)
             self.ledger.remove(lane_id)
         # Re-adopt running lanes the ledger doesn't know about (post-restart).
         known_jobs = {r.job_id for r in self.ledger.reservations()}
@@ -81,6 +84,23 @@ class Controller:
             if lane.job_id in known_jobs:
                 continue
             self._readopt(lane.lane_id, lane.job_id)
+
+    def _reap_work_dir(self, lane_id: str, work_disk: str) -> None:
+        # The ephemeral runner auto-removes its container but leaves the per-lane
+        # host work dir behind (DockerAdapter binds work_dirs[disk] and the runner
+        # mkdir's <lane_id>-work inside it). Delete it when we reap the lane, or the
+        # disk fills one stale dir per job. work_dirs[disk] must be mounted into the
+        # controller (see compose.yml) for this path to be visible.
+        work_base = self.config.work_dirs.get(work_disk)
+        if work_base is None:
+            return
+        work_dir = Path(work_base) / f"{lane_id}-work"
+        try:
+            shutil.rmtree(work_dir)
+        except FileNotFoundError:
+            pass  # lane never wrote a work dir (or already cleaned) — nothing to do
+        except OSError as exc:  # never let cleanup break the reconcile loop
+            log.warning("failed to remove work dir %s: %s", work_dir, exc)
 
     def _readopt(self, lane_id: str, job_id: int) -> None:
         # Best-effort: we cannot recover the repo/labels from the lane label set,

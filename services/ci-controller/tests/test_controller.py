@@ -77,6 +77,38 @@ def test_reconcile_drops_finished_lane(write_config) -> None:
     assert ctrl.ledger.lane_count() == 0
 
 
+def test_reconcile_deletes_work_dir_when_lane_reaped(write_config, tmp_path) -> None:
+    # Regression: ephemeral runner containers auto-remove, but their per-lane host
+    # work dir ({work_dirs[disk]}/{lane_id}-work) was never deleted, so every job
+    # leaked a directory and slowly filled /mnt/ci-ssd to 100%.
+    ssd = tmp_path / "ssd"
+    hdd = tmp_path / "hdd"
+    ssd.mkdir()
+    hdd.mkdir()
+    cfg_text = VALID_CONFIG.replace("  ssd: /mnt/ci-ssd/ci-controller", f"  ssd: {ssd}").replace(
+        "  hdd: /opt/personal/github-actions/ci-controller", f"  hdd: {hdd}"
+    )
+    cfg = ControllerConfig.load(write_config(cfg_text))
+    docker = MagicMock()
+    docker.list_lanes.return_value = []  # lane finished + auto-removed
+    ctrl = Controller(config=cfg, github=MagicMock(), docker=docker, ledger=Ledger())
+
+    lane_id = "powerserver-cici-1"
+    work_dir = ssd / f"{lane_id}-work"
+    work_dir.mkdir()
+    (work_dir / "scratch.txt").write_text("leftover build output")
+    ctrl.ledger.add(
+        Reservation(
+            lane_id, 1, "alvaro-francisco-gil/homelab", "light", 700, False, work_disk="ssd"
+        )
+    )
+
+    ctrl.reconcile()
+
+    assert ctrl.ledger.lane_count() == 0
+    assert not work_dir.exists(), "reaped lane's work dir must be deleted, not leaked"
+
+
 def test_reconcile_readopts_orphan_lane(write_config) -> None:
     ctrl, _github, docker = _controller(write_config, [])
     # Controller restarted; a lane is running but the ledger is empty.
