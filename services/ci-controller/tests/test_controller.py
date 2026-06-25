@@ -109,6 +109,43 @@ def test_reconcile_deletes_work_dir_when_lane_reaped(write_config, tmp_path) -> 
     assert not work_dir.exists(), "reaped lane's work dir must be deleted, not leaked"
 
 
+def test_reconcile_does_not_delete_outside_work_base_for_malicious_lane_id(
+    write_config, tmp_path
+) -> None:
+    # Hardening: lane_id can come from a re-adopted Docker label (not just our own
+    # spawn naming), and labels are unconstrained. A lane_id with `../` must NOT let
+    # cleanup escape the work-dir base and rmtree an arbitrary path.
+    ssd = tmp_path / "ssd"
+    hdd = tmp_path / "hdd"
+    ssd.mkdir()
+    hdd.mkdir()
+    # A sibling dir outside the work base. The "-work" suffix the cleanup appends means
+    # the escape target must itself end in "-work"; lane_id "../outside" -> ssd/../outside-work.
+    outside = tmp_path / "outside-work"
+    outside.mkdir()
+    (outside / "precious.txt").write_text("must survive")
+    cfg_text = VALID_CONFIG.replace("  ssd: /mnt/ci-ssd/ci-controller", f"  ssd: {ssd}").replace(
+        "  hdd: /opt/personal/github-actions/ci-controller", f"  hdd: {hdd}"
+    )
+    cfg = ControllerConfig.load(write_config(cfg_text))
+    docker = MagicMock()
+    docker.list_lanes.return_value = []
+    ctrl = Controller(config=cfg, github=MagicMock(), docker=docker, ledger=Ledger())
+
+    # lane_id from an unconstrained Docker label: {work_base}/{lane_id}-work escapes ssd.
+    malicious = "../outside"  # -> ssd/../outside-work == tmp_path/outside-work
+    ctrl.ledger.add(
+        Reservation(
+            malicious, 1, "alvaro-francisco-gil/homelab", "light", 700, False, work_disk="ssd"
+        )
+    )
+
+    ctrl.reconcile()
+
+    assert outside.exists(), "cleanup must not escape the work-dir base"
+    assert (outside / "precious.txt").exists(), "cleanup must not delete files outside work_base"
+
+
 def test_reconcile_readopts_orphan_lane(write_config) -> None:
     ctrl, _github, docker = _controller(write_config, [])
     # Controller restarted; a lane is running but the ledger is empty.

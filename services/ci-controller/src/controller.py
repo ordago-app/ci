@@ -94,7 +94,15 @@ class Controller:
         work_base = self.config.work_dirs.get(work_disk)
         if work_base is None:
             return
-        work_dir = Path(work_base) / f"{lane_id}-work"
+        base = Path(work_base).resolve()
+        work_dir = (base / f"{lane_id}-work").resolve()
+        # lane_id can originate from an unconstrained Docker label (re-adopted lanes),
+        # so a `../` could otherwise escape the base. Refuse anything not directly under it.
+        if work_dir.parent != base:
+            log.warning(
+                "refusing to clean work dir outside base: lane_id=%r -> %s", lane_id, work_dir
+            )
+            return
         try:
             shutil.rmtree(work_dir)
         except FileNotFoundError:
