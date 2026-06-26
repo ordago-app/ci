@@ -40,7 +40,12 @@ services:
       - docker-socket-proxy
     environment:
       CI_CONTROLLER_CONFIG: /etc/ci-controller/ci-controller.yml
-      POLL_INTERVAL_SECONDS: 15
+      # 5s (was 15s): light jobs run ~20-40s, so a 15s reconcile left finished lanes
+      # unreaped for up to 15s — stale reservations consumed the lane budget and real
+      # container occupancy sat at ~3-4 despite a higher ceiling. 5s reaps + refills
+      # ~3x faster. Not lower: per-repo job polling at 1s would exceed the GitHub App's
+      # 5000/hr rate limit (2 repos x 1s ~= 7200/hr); 5s is ~1440/hr, safe.
+      POLL_INTERVAL_SECONDS: 5
       RUNNER_HOST: powerserver
       DOCKER_PROXY_URL: tcp://docker-socket-proxy:2375
       CI_CONTROLLER_DB: /var/lib/ci-controller/metrics.db
