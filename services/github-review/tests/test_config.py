@@ -150,7 +150,7 @@ def test_review_mode_defaults_to_all(tmp_path: Path) -> None:
 
 def test_invalid_review_mode_rejected(tmp_path: Path) -> None:
     cfg_path = write(tmp_path / "agent-review.yml", REVIEW_MODE_BAD_YAML)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match="review_mode"):
         ReviewConfig.load(cfg_path)
 
 
