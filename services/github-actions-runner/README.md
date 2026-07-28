@@ -30,9 +30,21 @@ fit (no concurrent emulator); 6+ lanes would need a memory upgrade. SSD capacity
 (4 light work dirs × ~3 GB ≈ 12–16 GB of 30 GB, plus one shared pnpm store
 ≈ 2–5 GB) has headroom. The next unlock is a larger SSD + more RAM.
 
-### pnpm store
+### pnpm binary + store
 
-The image sets pnpm `store-dir=/cache/pnpm` (a user-level `.npmrc`). Without it,
+The pnpm **binary** is baked into the image (`ARG PNPM_VERSION`, the standalone
+release from `github.com/pnpm/pnpm` — self-contained, independent of the system
+Node). Ordago CI used to provision it per job via `pnpm/action-setup`, which
+re-downloaded pnpm from the npm registry every run; that download flaked on this
+box (`curl error 23` → ENOENT → "self-installer exits with code 254"), failing
+the "Setup PNPM" step before any code ran. Self-hosted-pool jobs therefore
+**omit `pnpm/action-setup`** and rely on the baked binary; keep `PNPM_VERSION` in
+lockstep with ordago-apps `package.json` `"packageManager"` (a mismatch makes
+pnpm self-provision that version at job time, re-introducing the download until
+this image is rebuilt). GitHub-hosted (`ubuntu-latest`) ordago jobs keep
+`action-setup` — they don't run here.
+
+The image also sets pnpm `store-dir=/cache/pnpm` (a user-level `.npmrc`). Without it,
 `PNPM_HOME=/cache/pnpm` only relocated the global bin — pnpm kept its store on
 the container layer and the mounted volume sat empty, so every job re-fetched
 dependencies. The **light pool shares one store at `/mnt/ci-ssd/pnpm-store`**:
