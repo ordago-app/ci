@@ -94,6 +94,20 @@ RUN mkdir -p /opt/actions-runner \
  && tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner \
  && rm /tmp/actions-runner.tar.gz
 
+# Bake pnpm into the image (self-contained standalone binary from the pnpm
+# GitHub release — bundles its own Node, independent of the system Node above).
+# Ordago CI previously provisioned pnpm per job via pnpm/action-setup, which
+# re-downloaded the binary from the npm registry every run; on this box that
+# download intermittently failed (curl error 23 -> ENOENT -> "self-installer
+# exits with code 254"), flaking the "Setup PNPM" step before any code ran.
+# Baking removes the per-job network hop. Keep PNPM_VERSION in lockstep with
+# ordago-apps package.json "packageManager"; on a mismatch pnpm self-provisions
+# that version (re-introducing the download) until this image is rebuilt.
+ARG PNPM_VERSION=10.24.0
+RUN curl -fsSL "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/pnpm-linux-x64" \
+      -o /usr/local/bin/pnpm \
+ && chmod +x /usr/local/bin/pnpm
+
 RUN install -d -o 1000 -g 1000 /home/runner /runner-work /cache /cache/gradle /cache/android-sdk /cache/android-avd /cache/pnpm \
  && chown 1000:1000 /opt/actions-runner \
  && chmod +x /opt/actions-runner/config.sh /opt/actions-runner/run.sh
