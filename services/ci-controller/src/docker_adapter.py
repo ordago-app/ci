@@ -111,7 +111,15 @@ class DockerAdapter:
         try:
             container = self._client.containers.get(container_id)
             stats = container.stats(stream=False)
-            ram_mb = int(stats["memory_stats"]["usage"]) // (1024 * 1024)
+            memory = stats["memory_stats"]
+            # `usage` counts reclaimable page cache, which for CI lanes dwarfs the
+            # anonymous working set: a git checkout plus reads from the shared pnpm
+            # store are charged to whichever cgroup first touched those pages. Left
+            # uncorrected it recorded >12 GB peaks for jobs that only run `grep`,
+            # making every reservation tuned against this metric wrong.
+            # Subtracting inactive_file is what `docker stats` reports as MEM USAGE.
+            inactive_file = int(memory.get("stats", {}).get("inactive_file", 0))
+            ram_mb = max(0, int(memory["usage"]) - inactive_file) // (1024 * 1024)
             return ram_mb, _cpu_percent(stats)
         except (docker.errors.NotFound, KeyError, TypeError):
             return None

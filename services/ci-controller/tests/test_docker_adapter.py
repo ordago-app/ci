@@ -93,7 +93,7 @@ def test_sample_parses_ram_and_cpu(write_config) -> None:
     adapter, client, _ = _adapter(write_config)
     container = MagicMock()
     container.stats.return_value = {
-        "memory_stats": {"usage": 2961178624},  # 2824 MiB
+        "memory_stats": {"usage": 2961178624, "stats": {"inactive_file": 0}},  # 2824 MiB
         "cpu_stats": {
             "cpu_usage": {"total_usage": 2000000000},
             "system_cpu_usage": 100000000000,
@@ -108,6 +108,55 @@ def test_sample_parses_ram_and_cpu(write_config) -> None:
     ram, cpu = adapter.sample("abc")
     assert ram == 2824
     assert round(cpu, 1) == 800.0  # (1e9 delta / 1e9 system delta) * 8 cpus * 100
+
+
+def test_sample_excludes_reclaimable_page_cache(write_config) -> None:
+    """A lane whose usage is mostly page cache must not report it as RAM.
+
+    Regression: CI lanes charged the git checkout + shared pnpm-store reads to
+    their cgroup, so `usage` showed >12 GB for jobs that only run `grep`.
+    """
+    adapter, client, _ = _adapter(write_config)
+    container = MagicMock()
+    container.stats.return_value = {
+        "memory_stats": {
+            "usage": 13421772800,  # 12800 MiB total charged to the cgroup
+            "stats": {"inactive_file": 13212057600},  # 12600 MiB of it page cache
+        },
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": 2000000000},
+            "system_cpu_usage": 100000000000,
+            "online_cpus": 8,
+        },
+        "precpu_stats": {
+            "cpu_usage": {"total_usage": 1000000000},
+            "system_cpu_usage": 99000000000,
+        },
+    }
+    client.containers.get.return_value = container
+    ram, _ = adapter.sample("abc")
+    assert ram == 200
+
+
+def test_sample_survives_missing_inactive_file(write_config) -> None:
+    """Older daemons omit memory_stats.stats — fall back to raw usage, not a crash."""
+    adapter, client, _ = _adapter(write_config)
+    container = MagicMock()
+    container.stats.return_value = {
+        "memory_stats": {"usage": 1073741824},  # 1024 MiB, no `stats` key
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": 2000000000},
+            "system_cpu_usage": 100000000000,
+            "online_cpus": 8,
+        },
+        "precpu_stats": {
+            "cpu_usage": {"total_usage": 1000000000},
+            "system_cpu_usage": 99000000000,
+        },
+    }
+    client.containers.get.return_value = container
+    ram, _ = adapter.sample("abc")
+    assert ram == 1024
 
 
 def test_sample_returns_none_when_missing(write_config) -> None:
