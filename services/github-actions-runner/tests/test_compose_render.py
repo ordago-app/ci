@@ -54,11 +54,26 @@ def test_renders_valid_yaml_with_seven_runners():
     assert len(compose["services"]) == 7
 
 
-def test_live_config_deploys_only_homelab_runners():
-    """The deployed pool (real ``enabled`` flags): ordago runners are held
-    disabled for capacity, so only the two ephemeral homelab runners deploy."""
-    services = render(respect_enabled=True)["services"]
-    assert set(services) == {"homelab-ci-1", "homelab-ci-2"}
+def test_live_config_deploys_no_static_runners():
+    """The deployed pool (real ``enabled`` flags) is now empty.
+
+    The static homelab pool was retired in `bc4c2f0` when CI cut over to
+    ci-controller, which spawns ephemeral lanes on demand instead; the ordago
+    runners stay held for capacity. So every runner in the committed config is
+    disabled and the template emits a `services:` key with nothing under it.
+
+    Ansible never deploys that: the compose-render and stack-up tasks are gated
+    on `runners | selectattr('enabled') | length > 0`, because docker compose
+    rejects a services-less file. This test asserts the config side of that
+    invariant — if a runner is ever re-enabled by hand it fires, forcing a
+    decision about whether a static runner should coexist with ci-controller's
+    dynamic lanes (they would compete for the same labels).
+
+    (This test previously asserted `{"homelab-ci-1", "homelab-ci-2"}` and had
+    been failing since the cutover — nothing ran it, as `services/*/tests`
+    outside the pytest.yml matrix had no CI job.)
+    """
+    assert render(respect_enabled=True)["services"] is None
 
 
 def test_runner_names_and_labels():
