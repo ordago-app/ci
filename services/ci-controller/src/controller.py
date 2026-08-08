@@ -107,7 +107,7 @@ class Controller:
         for lane in running.values():
             if lane.job_id in known_jobs:
                 continue
-            self._readopt(lane.lane_id, lane.job_id)
+            self._readopt(lane.lane_id, lane.job_id, lane.class_name)
 
     def _reap_work_dir(self, lane_id: str, work_disk: str) -> None:
         # The ephemeral runner auto-removes its container but leaves the per-lane
@@ -134,17 +134,34 @@ class Controller:
         except OSError as exc:  # never let cleanup break the reconcile loop
             log.warning("failed to remove work dir %s: %s", work_dir, exc)
 
-    def _readopt(self, lane_id: str, job_id: int) -> None:
-        # Best-effort: we cannot recover the repo/labels from the lane label set,
-        # so reserve the default class's footprint (a safe over- or exact-estimate
-        # for the common light lane). Heavy lanes self-correct when they finish.
-        job_class = self.config.classes[self.config.default_class]
+    def _readopt(self, lane_id: str, job_id: int, class_name: str | None) -> None:
+        # The repo is unrecoverable from the label set, so it stays the "(adopted)"
+        # sentinel (reap skips the conclusion lookup for it). The class is recoverable:
+        # it is stamped on the container at spawn. Re-adopting at default_class instead
+        # booked multi-GB lanes at the cheapest reserve — observed twice in production,
+        # 7084 MB and 7100 MB peaks against a 700 MB reservation, which hands the
+        # difference to new admissions and lands the host in the OOM path.
+        resolved = class_name if class_name in self.config.classes else None
+        if resolved is None:
+            # Pre-CLASS_LABEL container, or a class dropped from the config since spawn.
+            # Reserve the ceiling: over-reserving costs deferrals, which are free and
+            # recoverable; under-reserving is what kills the host.
+            resolved = max(self.config.classes, key=lambda name: self.config.classes[name].ram_mb)
+            log.warning(
+                "lane %s (job %s) has no known class label %r; "
+                "re-adopting at the largest class '%s'",
+                lane_id,
+                job_id,
+                class_name,
+                resolved,
+            )
+        job_class = self.config.classes[resolved]
         self.ledger.add(
             Reservation(
                 lane_id=lane_id,
                 job_id=job_id,
                 repo="(adopted)",
-                class_name=self.config.default_class,
+                class_name=resolved,
                 ram_mb=job_class.ram_mb,
                 needs_kvm=job_class.needs_kvm,
                 work_disk=job_class.work_disk,

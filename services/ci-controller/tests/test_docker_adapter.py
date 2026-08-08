@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock
 
 from src.config import ControllerConfig
-from src.docker_adapter import JOB_LABEL, LANE_LABEL, DockerAdapter
+from src.docker_adapter import CLASS_LABEL, JOB_LABEL, LANE_LABEL, DockerAdapter
 from src.models import AdmitDecision, QueuedJob
 
 from tests.conftest import VALID_CONFIG
@@ -27,7 +27,11 @@ def test_spawn_light_lane(write_config) -> None:
     assert kwargs["name"] == "github-runner-powerserver-cici-42"
     assert kwargs["network"] == "homelab"
     assert kwargs["auto_remove"] is True
-    assert kwargs["labels"] == {LANE_LABEL: "powerserver-cici-42", JOB_LABEL: "42"}
+    assert kwargs["labels"] == {
+        LANE_LABEL: "powerserver-cici-42",
+        JOB_LABEL: "42",
+        CLASS_LABEL: "light",
+    }
     assert kwargs["environment"]["RUNNER_REGISTRATION_TOKEN"] == "ARRT"
     assert kwargs["environment"]["RUNNER_REPOSITORY"] == "alvaro-francisco-gil/homelab"
     assert kwargs["environment"]["RUNNER_EPHEMERAL"] == "1"
@@ -77,8 +81,27 @@ def test_list_lanes(write_config) -> None:
     assert lanes[0].lane_id == "powerserver-cici-9"
     assert lanes[0].job_id == 9
     assert lanes[0].container_id == "abc123"
+    # No class label: this container predates CLASS_LABEL, so its class is unknown
+    # rather than assumed — the controller prices unknowns at the largest class.
+    assert lanes[0].class_name is None
     _, kwargs = client.containers.list.call_args
     assert kwargs["filters"] == {"label": LANE_LABEL}
+
+
+def test_list_lanes_reads_the_class_label(write_config) -> None:
+    adapter, client, _ = _adapter(write_config)
+    container = MagicMock()
+    container.id = "def456"
+    container.labels = {
+        LANE_LABEL: "powerserver-cici-11",
+        JOB_LABEL: "11",
+        CLASS_LABEL: "emulator",
+    }
+    client.containers.list.return_value = [container]
+
+    lanes = adapter.list_lanes()
+
+    assert lanes[0].class_name == "emulator"
 
 
 def test_remove_ignores_missing(write_config) -> None:

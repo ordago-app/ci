@@ -4,6 +4,7 @@ import yaml
 
 COMPOSE = Path(__file__).resolve().parents[1] / "compose.yml"
 SERVICES_PLAYBOOK = Path(__file__).resolve().parents[3] / "ansible" / "playbooks" / "services.yml"
+GROUP_VARS = Path(__file__).resolve().parents[3] / "inventory" / "group_vars" / "all.yml"
 
 
 def _load() -> dict:
@@ -81,3 +82,27 @@ def test_prune_workdir_timer_and_service_are_deployed() -> None:
         for t in tasks
     )
     assert enabled, "prune timer must be enabled/started via systemd"
+
+
+def test_operator_config_is_copied_to_the_host() -> None:
+    # personal/ci-controller.yml is the only place lane classes and their reserves are
+    # defined, and the controller reads it from a read-only bind mount. If the copy task
+    # loses its dest, the container keeps running against whatever stale file is on the
+    # host and a reserve change silently never takes effect.
+    personal_root = yaml.safe_load(GROUP_VARS.read_text())["personal_root"]
+    tasks = _ci_controller_tasks()
+    dests = []
+    for t in tasks:
+        copy = t.get("ansible.builtin.copy") or t.get("copy")
+        if copy and "src" in copy and "ci-controller.yml" in str(copy["src"]):
+            dests.append(str(copy["dest"]).replace("{{ personal_root }}", personal_root))
+    assert dests, "personal/ci-controller.yml must be copied to the host"
+
+    compose = _load()
+    mounts = compose["services"]["ci-controller"]["volumes"]
+    config_env = compose["services"]["ci-controller"]["environment"]["CI_CONTROLLER_CONFIG"]
+    for dest in dests:
+        assert any(m.startswith(f"{dest}:") for m in mounts), f"{dest} must be mounted"
+        assert any(m == f"{dest}:{config_env}:ro" for m in mounts), (
+            f"{dest} must be mounted read-only at {config_env}"
+        )

@@ -157,6 +157,40 @@ def test_reconcile_readopts_orphan_lane(write_config) -> None:
     assert ctrl.ledger.has_job(5)
 
 
+def test_readopt_restores_the_lanes_real_class(write_config) -> None:
+    # Regression: a restart re-adopted every running lane at default_class (light/700),
+    # so a lane actually running a multi-GB job was booked at 700 MB and the ledger
+    # handed the freed budget to new admissions. Measured twice in production — reaps
+    # tagged class=light repo=(adopted) with 7084 MB and 7100 MB peaks, a 10x
+    # under-reserve on the exact path that OOM-kills the host.
+    ctrl, _github, docker = _controller(write_config, [])
+    docker.list_lanes.return_value = [
+        LaneInfo("powerserver-cici-5", 5, "cid", class_name="emulator")
+    ]
+
+    ctrl.reconcile()
+
+    res = next(r for r in ctrl.ledger.reservations() if r.job_id == 5)
+    assert res.class_name == "emulator"
+    assert res.ram_mb == 2500
+    assert res.needs_kvm is True
+    assert res.work_disk == "hdd"
+
+
+def test_readopt_without_a_class_label_reserves_the_largest_class(write_config) -> None:
+    # Lanes spawned before the class label existed carry no class, and the container
+    # labels are the only surviving record. Over-reserving costs deferrals, which are
+    # free; under-reserving is the OOM path — so price the unknown at the ceiling
+    # rather than at default_class.
+    ctrl, _github, docker = _controller(write_config, [])
+    docker.list_lanes.return_value = [LaneInfo("powerserver-cici-6", 6, "cid", class_name=None)]
+
+    ctrl.reconcile()
+
+    res = next(r for r in ctrl.ledger.reservations() if r.job_id == 6)
+    assert res.ram_mb == 2500, "unknown class must reserve the largest class, not light/700"
+
+
 def test_spawn_failure_does_not_add_to_ledger(write_config) -> None:
     job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
     ctrl, _github, docker = _controller(write_config, [job])

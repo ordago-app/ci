@@ -10,6 +10,10 @@ from src.models import AdmitDecision
 
 LANE_LABEL = "com.homelab.ci-controller.lane"
 JOB_LABEL = "com.homelab.ci-controller.job"
+# The lane's class, stamped at spawn so a restarted controller can re-adopt the lane at
+# the reserve it was actually admitted under. The container labels are the only record
+# that survives losing the in-memory ledger.
+CLASS_LABEL = "com.homelab.ci-controller.class"
 
 
 def _cpu_percent(stats: dict) -> float:
@@ -28,6 +32,9 @@ class LaneInfo:
     lane_id: str
     job_id: int
     container_id: str
+    # None for containers spawned before CLASS_LABEL existed — the caller must price
+    # an unknown class conservatively rather than assume the default.
+    class_name: str | None = None
 
 
 class DockerAdapter:
@@ -76,7 +83,11 @@ class DockerAdapter:
             "network": "homelab",
             "environment": environment,
             "volumes": volumes,
-            "labels": {LANE_LABEL: lane_id, JOB_LABEL: str(job.job_id)},
+            "labels": {
+                LANE_LABEL: lane_id,
+                JOB_LABEL: str(job.job_id),
+                CLASS_LABEL: decision.class_name,
+            },
         }
         if decision.needs_kvm:
             run_kwargs["devices"] = ["/dev/kvm:/dev/kvm:rwm"]
@@ -96,6 +107,7 @@ class DockerAdapter:
                     lane_id=labels[LANE_LABEL],
                     job_id=int(labels[JOB_LABEL]),
                     container_id=container.id,
+                    class_name=labels.get(CLASS_LABEL),
                 )
             )
         return lanes

@@ -110,3 +110,28 @@ def test_admission_mode_defaults_and_validates(write_config) -> None:
     )
     with pytest.raises(ConfigError, match="admission_mode"):
         ControllerConfig.load(write_config(bad))
+
+
+OPERATOR_CONFIG = Path(__file__).resolve().parents[3] / "personal" / "ci-controller.yml"
+
+
+def test_operator_config_loads() -> None:
+    # personal/ci-controller.yml is copied to the host verbatim and only parsed at
+    # container start, so a schema error there surfaces as a crash-looping controller
+    # after deploy rather than as a failing check. Parse it here instead.
+    cfg = ControllerConfig.load(OPERATOR_CONFIG)
+    assert cfg.ram_budget_mb > 0
+    assert cfg.default_class in cfg.classes
+
+
+def test_operator_config_never_underprices_a_mapped_label() -> None:
+    # class_for falls through to default_class for any self-hosted label it does not
+    # recognise, and default_class is the cheapest class. A label that is mapped in one
+    # repo but missing in another therefore silently books the cheapest reserve for a
+    # job that may need many times that — the same under-reserve shape as the readopt
+    # bug. Pin every mapped label so a rename cannot half-land.
+    cfg = ControllerConfig.load(OPERATOR_CONFIG)
+    for repo in cfg.repos:
+        for label, class_name in repo.label_class.items():
+            assert class_name in cfg.classes, f"{repo.repo}: '{label}' -> unknown '{class_name}'"
+            assert cfg.class_for(repo.repo, ["self-hosted", label]) == class_name
