@@ -17,6 +17,25 @@ from src.models import (
 
 from tests.conftest import VALID_CONFIG
 
+# Crowded config: lane ceiling of 1 and a tight RAM budget so both gates bind at once.
+CROWDED_CONFIG = """\
+ram_budget_mb: 1000
+max_concurrent_lanes: 1
+default_class: light
+runner_image: homelab/github-actions-runner:latest
+work_dirs:
+  ssd: /mnt/ci-ssd/ci-controller
+  hdd: /opt/personal/github-actions/ci-controller
+classes:
+  light:
+    ram_mb: 900
+    work_disk: ssd
+repos:
+  - repo: alvaro-francisco-gil/homelab
+    label_class:
+      homelab: light
+"""
+
 # Disk-only config: RAM/lane ceilings are slack so the disk-GB budget is the sole gate.
 DISK_CONFIG = """\
 ram_budget_mb: 100000
@@ -192,3 +211,51 @@ def test_reservation_mode_ignores_host_stats(write_config) -> None:
     job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
     low = HostStats(mem_available_mb=100, load_1m=99.0)
     assert isinstance(evaluate([job], Ledger(), cfg, low)[0], AdmitDecision)
+
+
+def test_defer_records_every_binding_gate_not_just_the_first(write_config) -> None:
+    """lane_ceiling must not mask budget_full: both gates bind, both are recorded."""
+    config = ControllerConfig.load(write_config(CROWDED_CONFIG))
+    ledger = Ledger()
+    ledger.add(
+        Reservation(
+            lane_id="lane-1",
+            job_id=1,
+            repo="alvaro-francisco-gil/homelab",
+            class_name="light",
+            ram_mb=900,
+            needs_kvm=False,
+        )
+    )
+    job = QueuedJob(job_id=2, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+
+    (decision,) = evaluate([job], ledger, config)
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reasons == (LANE_CEILING, BUDGET_FULL)
+    assert decision.reason == LANE_CEILING  # primary stays first-gate, for the historical rows
+
+
+def test_single_binding_gate_yields_one_reason(write_config) -> None:
+    # SSD budget 10 GB; 8 GB already reserved on ssd -> no room for a 4 GB light job.
+    # Lanes/RAM/kvm are all slack, so disk_full is the only gate that binds.
+    config = ControllerConfig.load(write_config(DISK_CONFIG))
+    ledger = Ledger()
+    ledger.add(Reservation("a", 100, "o/r", "light", 700, False, work_disk="ssd", work_gb=8))
+    job = QueuedJob(job_id=3, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+
+    (decision,) = evaluate([job], ledger, config)
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reasons == (DISK_FULL,)
+
+
+def test_not_allowlisted_short_circuits_before_capacity_gates(write_config) -> None:
+    """A job we may not run has no capacity verdict to report."""
+    config = ControllerConfig.load(write_config(CROWDED_CONFIG))
+    job = QueuedJob(job_id=4, repo="someone/else", labels=["homelab"])
+
+    (decision,) = evaluate([job], Ledger(), config)
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reasons == (NOT_ALLOWLISTED,)

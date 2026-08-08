@@ -64,6 +64,16 @@ class GitHubAdapter:
         resp.raise_for_status()
         return str(resp.json()["token"])
 
+    def job_conclusion(self, repo: str, job_id: int) -> str | None:
+        """Terminal conclusion of a job, or None if it never reached one."""
+        resp = self._client.get(
+            f"{self._base_url}/repos/{repo}/actions/jobs/{job_id}",
+            headers=self._headers(self.installation_token()),
+        )
+        resp.raise_for_status()
+        conclusion = resp.json().get("conclusion")
+        return str(conclusion) if conclusion else None
+
     def list_queued_jobs(self, repo: str) -> list[QueuedJob]:
         headers = self._headers(self.installation_token())
         runs_resp = self._client.get(
@@ -86,6 +96,8 @@ class GitHubAdapter:
                             job_id=int(job["id"]),
                             repo=repo,
                             labels=[str(label) for label in job.get("labels", [])],
+                            workflow=str(run.get("name") or ""),
+                            job_name=str(job.get("name") or ""),
                         )
                     )
         return jobs

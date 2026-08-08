@@ -34,42 +34,46 @@ def evaluate(
 
     for job in jobs:
         if ledger.has_job(job.job_id):
-            decisions.append(DeferDecision(job, ALREADY_RUNNING))
+            decisions.append(DeferDecision(job, (ALREADY_RUNNING,)))
             continue
 
         class_name = config.class_for(job.repo, job.labels)
         if class_name is None:
-            decisions.append(DeferDecision(job, NOT_ALLOWLISTED))
+            decisions.append(DeferDecision(job, (NOT_ALLOWLISTED,)))
             continue
 
         job_class = config.classes[class_name]
-
-        if lanes >= config.max_concurrent_lanes:
-            decisions.append(DeferDecision(job, LANE_CEILING))
-            continue
-        if job_class.needs_kvm and kvm:
-            decisions.append(DeferDecision(job, KVM_BUSY))
-            continue
-        if ram + job_class.ram_mb > config.ram_budget_mb:
-            decisions.append(DeferDecision(job, BUDGET_FULL))
-            continue
         disk_budget = config.disk_budget_gb.get(job_class.work_disk)
+        guard_active = config.admission_mode == "reservation_plus_guard" and host_stats is not None
+
+        # Evaluate EVERY capacity gate. Returning on the first one made lane_ceiling
+        # mask budget_full, so the defer counts could not distinguish a CPU-bound
+        # host from a ledger-bound one. Order is preserved: reasons[0] is the gate
+        # that would have been reported before this change.
+        reasons: list[str] = []
+        if lanes >= config.max_concurrent_lanes:
+            reasons.append(LANE_CEILING)
+        if job_class.needs_kvm and kvm:
+            reasons.append(KVM_BUSY)
+        if ram + job_class.ram_mb > config.ram_budget_mb:
+            reasons.append(BUDGET_FULL)
         if (
             disk_budget is not None
             and disk_gb[job_class.work_disk] + job_class.work_gb > disk_budget
         ):
-            decisions.append(DeferDecision(job, DISK_FULL))
-            continue
-
+            reasons.append(DISK_FULL)
         if (
-            config.admission_mode == "reservation_plus_guard"
+            guard_active
             and host_stats is not None
             and (
                 host_stats.mem_available_mb < config.host_free_ram_floor_mb
                 or (config.host_load_ceiling > 0 and host_stats.load_1m > config.host_load_ceiling)
             )
         ):
-            decisions.append(DeferDecision(job, HOST_PRESSURE))
+            reasons.append(HOST_PRESSURE)
+
+        if reasons:
+            decisions.append(DeferDecision(job, tuple(reasons)))
             continue
 
         decisions.append(

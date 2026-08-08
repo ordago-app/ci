@@ -15,6 +15,7 @@ def _controller(write_config, queued, metrics=None):
     github = MagicMock()
     github.list_queued_jobs.side_effect = lambda repo: [j for j in queued if j.repo == repo]
     github.mint_registration_token.return_value = "ARRT"
+    github.job_conclusion.return_value = None
     docker = MagicMock()
     docker.list_lanes.return_value = []
     docker.spawn.side_effect = lambda decision, registration_token: (
@@ -195,3 +196,123 @@ def test_reap_records_peak_footprint(make_controller, tmp_path) -> None:
     reap = store.conn.execute("SELECT peak_ram_mb FROM events WHERE kind='reap'").fetchone()
     assert reap is not None and reap[0] == 2900
     store.close()
+
+
+def _events(metrics, kind):
+    return [c.kwargs for c in metrics.record_event.call_args_list if c.kwargs["kind"] == kind]
+
+
+def test_admit_event_records_job_identity(write_config) -> None:
+    job = QueuedJob(
+        job_id=1,
+        repo="alvaro-francisco-gil/homelab",
+        labels=["self-hosted", "homelab"],
+        workflow="CI",
+        job_name="build-android",
+    )
+    metrics = MagicMock()
+    ctrl, _github, _docker = _controller(write_config, [job], metrics=metrics)
+
+    ctrl.tick()
+
+    (admit,) = _events(metrics, "admit")
+    assert admit["job_name"] == "build-android"
+    assert admit["workflow"] == "CI"
+
+
+def test_defer_event_records_every_binding_reason(write_config) -> None:
+    """The masked-gate fix has to survive the trip into the events log."""
+    job = QueuedJob(
+        job_id=2, repo="alvaro-francisco-gil/homelab", labels=["self-hosted", "homelab"]
+    )
+    metrics = MagicMock()
+    ctrl, _github, docker = _controller(write_config, [job], metrics=metrics)
+    # Fill every lane so lane_ceiling binds, and the budget so budget_full binds too.
+    for lane in range(8):  # VALID_CONFIG: max_concurrent_lanes 8, ram_budget_mb 12000
+        ctrl.ledger.add(
+            Reservation(
+                f"lane-{lane}", 100 + lane, "alvaro-francisco-gil/homelab", "light", 1600, False
+            )
+        )
+    docker.list_lanes.return_value = [
+        LaneInfo(f"lane-{lane}", 100 + lane, f"cid-{lane}") for lane in range(8)
+    ]
+
+    ctrl.tick()
+
+    (defer,) = _events(metrics, "defer")
+    assert defer["reason"] == "lane_ceiling"
+    assert defer["reasons"] == "lane_ceiling,budget_full"
+
+
+def test_reap_records_the_job_conclusion(write_config) -> None:
+    """A lane that vanishes without a terminal conclusion is what a sleep-kill looks like."""
+    job = QueuedJob(job_id=3, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    metrics = MagicMock()
+    ctrl, github, docker = _controller(write_config, [], metrics=metrics)
+    github.job_conclusion.return_value = None
+    ctrl.ledger.add(Reservation("lane-3", 3, job.repo, "light", 700, False))
+    docker.list_lanes.return_value = []  # the lane is gone
+
+    ctrl.tick()
+
+    (reap,) = _events(metrics, "reap")
+    assert reap["conclusion"] is None
+    github.job_conclusion.assert_called_once_with("alvaro-francisco-gil/homelab", 3)
+
+
+def test_reap_of_an_adopted_lane_skips_the_conclusion_lookup(write_config) -> None:
+    """The '(adopted)' sentinel is not a real repo — querying it would 404 every tick.
+
+    It must not be recorded as a plain NULL conclusion either: ci_bench's
+    infra_failures() would otherwise count every re-adopted lane as a genuine infra
+    failure, when it's actually just "we never looked, by design".
+    """
+    metrics = MagicMock()
+    ctrl, github, docker = _controller(write_config, [], metrics=metrics)
+    ctrl.ledger.add(Reservation("lane-9", 9, "(adopted)", "light", 700, False))
+    docker.list_lanes.return_value = []
+
+    ctrl.tick()
+
+    github.job_conclusion.assert_not_called()
+    (reap,) = _events(metrics, "reap")
+    assert reap["conclusion"] == "adopted"
+
+
+def test_reap_records_lookup_failed_sentinel_when_the_conclusion_lookup_raises(
+    write_config,
+) -> None:
+    """A swallowed exception must not be conflated with a genuine NULL conclusion — see
+    Critical 1(b): under the old code, an App missing Actions:Read would 403 every lookup
+    and every one of those would silently read as a real infra failure."""
+    job = QueuedJob(job_id=4, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    metrics = MagicMock()
+    ctrl, github, docker = _controller(write_config, [], metrics=metrics)
+    github.job_conclusion.side_effect = RuntimeError("403 Forbidden")
+    ctrl.ledger.add(Reservation("lane-4", 4, job.repo, "light", 700, False))
+    docker.list_lanes.return_value = []
+
+    ctrl.tick()
+
+    (reap,) = _events(metrics, "reap")
+    assert reap["conclusion"] == "lookup_failed"
+
+
+def test_events_record_the_controller_host(write_config) -> None:
+    """events.host must populate, or the per-host report path can never work."""
+    job = QueuedJob(
+        job_id=1, repo="alvaro-francisco-gil/homelab", labels=["self-hosted", "homelab"]
+    )
+    metrics = MagicMock()
+    ctrl, _github, docker = _controller(write_config, [job], metrics=metrics)
+
+    ctrl.tick()
+    ctrl.ledger.add(Reservation("gone", 99, "alvaro-francisco-gil/homelab", "light", 700, False))
+    docker.list_lanes.return_value = []
+    ctrl.tick()
+
+    kinds = {c.kwargs["kind"]: c.kwargs for c in metrics.record_event.call_args_list}
+    assert {"admit", "reap"} <= kinds.keys()
+    for kind, kwargs in kinds.items():
+        assert kwargs["host"] == "powerserver", f"{kind} event missing host"

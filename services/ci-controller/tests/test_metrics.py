@@ -1,3 +1,5 @@
+import sqlite3
+
 from src.metrics import MetricsStore
 
 
@@ -46,4 +48,64 @@ def test_defer_event_stores_reason(tmp_path) -> None:
     )
     (reason,) = store.conn.execute("SELECT reason FROM events WHERE job_id=7").fetchone()
     assert reason == "budget_full"
+    store.close()
+
+
+def test_new_columns_round_trip(tmp_path) -> None:
+    store = MetricsStore(str(tmp_path / "m.db"))
+    store.record_event(
+        kind="defer",
+        job_id=9,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        reason="lane_ceiling",
+        reasons="lane_ceiling,budget_full",
+        job_name="build-android",
+        workflow="ci.yml",
+        host="powerserver",
+    )
+    row = store.conn.execute(
+        "SELECT reason, reasons, job_name, workflow, host FROM events WHERE job_id=9"
+    ).fetchone()
+    assert row == (
+        "lane_ceiling",
+        "lane_ceiling,budget_full",
+        "build-android",
+        "ci.yml",
+        "powerserver",
+    )
+    store.close()
+
+
+def test_migrates_a_preexisting_db_without_losing_rows(tmp_path) -> None:
+    """The live DB has 112k rows written before these columns existed."""
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(str(db))
+    old.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL, kind TEXT NOT NULL, job_id INTEGER NOT NULL,
+            repo TEXT NOT NULL, class TEXT, work_disk TEXT, reason TEXT,
+            config_version TEXT NOT NULL, lane_id TEXT,
+            peak_ram_mb INTEGER, peak_cpu_pct REAL
+        );
+        """
+    )
+    old.execute(
+        "INSERT INTO events (ts, kind, job_id, repo, reason, config_version) "
+        "VALUES (1.0, 'defer', 1, 'o/r', 'budget_full', 'old')"
+    )
+    old.commit()
+    old.close()
+
+    store = MetricsStore(str(db))
+
+    assert store.conn.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+    assert store.conn.execute("SELECT reasons FROM events WHERE job_id=1").fetchone()[0] is None
+    store.record_event(
+        kind="defer", job_id=2, repo="o/r", ts=2.0, config_version="new", reasons="budget_full"
+    )
+    assert store.conn.execute("SELECT count(*) FROM events").fetchone()[0] == 2
     store.close()

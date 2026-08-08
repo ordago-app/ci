@@ -1,6 +1,7 @@
 import datetime as dt
 
 import httpx
+import pytest
 import respx
 from src.github_adapter import GitHubAdapter
 
@@ -94,3 +95,97 @@ def test_list_queued_jobs() -> None:
     assert jobs[0].job_id == 1
     assert jobs[0].repo == "o/r"
     assert jobs[0].labels == ["self-hosted", "homelab"]
+
+
+@respx.mock
+def test_queued_jobs_carry_workflow_and_job_name() -> None:
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    respx.get(
+        "https://api.github.com/repos/o/r/actions/runs",
+        params={"status": "queued", "per_page": "50"},
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={"workflow_runs": [{"id": 5, "name": "CI", "path": ".github/workflows/ci.yml"}]},
+        )
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/runs/5/jobs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": 77,
+                        "status": "queued",
+                        "name": "build-android",
+                        "labels": ["self-hosted", "ordago-ci"],
+                    }
+                ]
+            },
+        )
+    )
+
+    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    (job,) = gh.list_queued_jobs("o/r")
+
+    assert job.job_id == 77
+    assert job.job_name == "build-android"
+    assert job.workflow == "CI"
+
+
+@respx.mock
+def test_job_conclusion_returns_the_terminal_value_when_present() -> None:
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/jobs/42").mock(
+        return_value=httpx.Response(
+            200, json={"id": 42, "status": "completed", "conclusion": "success"}
+        )
+    )
+    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    assert gh.job_conclusion("o/r", 42) == "success"
+
+
+@respx.mock
+def test_job_conclusion_is_none_when_the_conclusion_key_is_missing_entirely() -> None:
+    """A job payload with no `conclusion` key at all (some in-progress responses omit it)."""
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/jobs/42").mock(
+        return_value=httpx.Response(200, json={"id": 42, "status": "in_progress"})
+    )
+    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    assert gh.job_conclusion("o/r", 42) is None
+
+
+@respx.mock
+def test_job_conclusion_is_none_for_an_explicit_null_conclusion_on_an_in_progress_job() -> None:
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/jobs/42").mock(
+        return_value=httpx.Response(
+            200, json={"id": 42, "status": "in_progress", "conclusion": None}
+        )
+    )
+    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    assert gh.job_conclusion("o/r", 42) is None
+
+
+@respx.mock
+def test_job_conclusion_raises_on_a_non_2xx_response() -> None:
+    """The caller (controller.reconcile) is responsible for catching this and writing the
+    'lookup_failed' sentinel — job_conclusion itself must not swallow it."""
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/jobs/42").mock(
+        return_value=httpx.Response(403, json={"message": "Resource not accessible by integration"})
+    )
+    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    with pytest.raises(httpx.HTTPStatusError):
+        gh.job_conclusion("o/r", 42)

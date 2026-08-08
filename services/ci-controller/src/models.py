@@ -16,6 +16,8 @@ class QueuedJob:
     job_id: int
     repo: str
     labels: list[str] = field(default_factory=list)
+    workflow: str = ""
+    job_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,8 @@ class Reservation:
     needs_kvm: bool
     work_disk: str = "ssd"
     work_gb: int = 0
+    workflow: str = ""
+    job_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,7 +47,12 @@ class AdmitDecision:
 @dataclass(frozen=True)
 class DeferDecision:
     job: QueuedJob
-    reason: str
+    reasons: tuple[str, ...]
+
+    @property
+    def reason(self) -> str:
+        """Primary (first-binding) gate. Keeps parity with rows written before multi-gate."""
+        return self.reasons[0]
 
 
 Decision = AdmitDecision | DeferDecision

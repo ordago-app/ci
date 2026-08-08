@@ -53,6 +53,7 @@ def main() -> None:
         ledger=Ledger(),
         metrics=metrics,
         host_stats_reader=read_host_stats,
+        host=host,
     )
     app = create_app(controller, poll_interval=poll_interval)
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

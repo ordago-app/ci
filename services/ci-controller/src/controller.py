@@ -31,6 +31,7 @@ class Controller:
         ledger: Ledger,
         metrics: MetricsStore | None = None,
         host_stats_reader: Callable[[], HostStats] | None = None,
+        host: str = "powerserver",
     ) -> None:
         self.config = config
         self.github = github
@@ -41,12 +42,19 @@ class Controller:
         self._host_stats_reader = host_stats_reader
         self._config_version = config.config_version()
         self._peaks: dict[str, tuple[int, float]] = {}
+        # Stamped on every event so the per-host report path can populate. Without it
+        # events.host stays NULL forever and that section is dead surface.
+        self._host = host
 
     def _emit(self, **fields: object) -> None:
         if self.metrics is None:
             return
         try:
-            self.metrics.record_event(config_version=self._config_version, **fields)  # type: ignore[arg-type]
+            self.metrics.record_event(
+                config_version=self._config_version,
+                host=self._host,
+                **fields,  # type: ignore[arg-type]
+            )
         except Exception as exc:  # metrics must never break the loop
             log.warning("metrics write failed: %s", exc)
 
@@ -66,6 +74,19 @@ class Controller:
             res = next((r for r in self.ledger.reservations() if r.lane_id == lane_id), None)
             peak = self._peaks.pop(lane_id, (None, None))
             if res is not None:
+                # "(adopted)" is a sentinel for lanes recovered after a restart, not a
+                # real repo — looking it up would 404 on every tick. Both this and a
+                # failed lookup get their own sentinel string, distinct from a genuine
+                # NULL conclusion (job reached no terminal outcome) — ci_bench.py's
+                # infra_failures()/lookup_failures() depend on telling the three apart.
+                if res.repo == "(adopted)":
+                    conclusion: str | None = "adopted"
+                else:
+                    try:
+                        conclusion = self.github.job_conclusion(res.repo, res.job_id)
+                    except Exception as exc:  # classification must never break reconcile
+                        log.warning("conclusion lookup failed for job %s: %s", res.job_id, exc)
+                        conclusion = "lookup_failed"
                 self._emit(
                     kind="reap",
                     job_id=res.job_id,
@@ -75,6 +96,9 @@ class Controller:
                     ts=_now(),
                     peak_ram_mb=peak[0],
                     peak_cpu_pct=peak[1],
+                    conclusion=conclusion,
+                    job_name=res.job_name,
+                    workflow=res.workflow,
                 )
                 self._reap_work_dir(lane_id, res.work_disk)
             self.ledger.remove(lane_id)
@@ -155,6 +179,8 @@ class Controller:
                     class_name=decision.class_name,
                     work_disk=decision.work_disk,
                     ts=_now(),
+                    job_name=decision.job.job_name,
+                    workflow=decision.job.workflow,
                 )
             else:
                 self._emit(
@@ -162,7 +188,10 @@ class Controller:
                     job_id=decision.job.job_id,
                     repo=decision.job.repo,
                     reason=decision.reason,
+                    reasons=",".join(decision.reasons),
                     ts=_now(),
+                    job_name=decision.job.job_name,
+                    workflow=decision.job.workflow,
                 )
         self._last_decisions = decisions
         return decisions
@@ -184,6 +213,8 @@ class Controller:
                 needs_kvm=decision.needs_kvm,
                 work_disk=decision.work_disk,
                 work_gb=decision.work_gb,
+                workflow=decision.job.workflow,
+                job_name=decision.job.job_name,
             )
         )
         log.info(
