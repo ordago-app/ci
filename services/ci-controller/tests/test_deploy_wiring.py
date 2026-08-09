@@ -331,6 +331,65 @@ def test_lane_host_prunes_its_own_stale_work_dirs() -> None:
     assert "OnCalendar=daily" in timer
 
 
+def test_lane_host_proxy_survives_a_reboot() -> None:
+    """The proxy publishes on the TAILNET address, which does not exist at boot.
+
+    Observed 2026-08-09: after the VM was resized and restarted, docker's
+    `restart: unless-stopped` raced tailscaled and lost —
+
+        failed to bind host port 100.117.169.88:2375/tcp:
+        cannot assign requested address
+
+    docker backs off, gives up, and the host stays silently dead until someone
+    re-runs this play. `ci-lane-firewall.service` already exists for the same class
+    of reason (rules lost on boot); the proxy needs its own unit for the same
+    reason, ordered after tailscaled rather than merely after docker.
+    """
+    by_dest = {}
+    for task in _lane_host_tasks():
+        copy = task.get("ansible.builtin.copy") or task.get("copy")
+        if copy and "dest" in copy:
+            by_dest[copy["dest"]] = copy.get("content", "")
+
+    unit = by_dest.get("/etc/systemd/system/ci-lane-proxy.service")
+    assert unit is not None, (
+        "a boot unit must (re)start the proxy once the tailnet address exists — "
+        "docker's restart policy alone loses the race and gives up"
+    )
+    # After docker is not enough: docker is up long before tailscaled has an address.
+    assert "tailscaled.service" in unit, "the unit must be ordered after tailscaled"
+    assert "docker.service" in unit, "compose needs docker up"
+
+    script = by_dest.get("/usr/local/sbin/ci-lane-proxy-start.sh")
+    assert script is not None, "the unit must run a script this play owns"
+    # The whole hazard is a bind address that is absent or stale, so the script
+    # re-derives it rather than trusting the .env rendered at deploy time.
+    assert "tailscale ip -4" in script, (
+        "the address must be re-derived at boot — the deploy-time .env goes stale "
+        "if the node's tailnet address ever changes"
+    )
+    # Same invariant as the play's own guard: never fall back to every interface.
+    assert "0.0.0.0" not in script, (
+        "no wildcard fallback: an absent tailnet address must mean NO listener, "
+        "never an unauthenticated container-create API on every interface"
+    )
+    assert "exit 1" in script, "an address that never arrives must fail, not proceed"
+
+    enabled = [
+        t
+        for t in _lane_host_tasks()
+        if (t.get("ansible.builtin.systemd") or t.get("systemd") or {}).get("name")
+        == "ci-lane-proxy.service"
+    ]
+    assert (
+        enabled
+        and enabled[0][
+            next(k for k in ("ansible.builtin.systemd", "systemd") if k in enabled[0])
+        ].get("enabled")
+        is True
+    ), "the unit is useless unless enabled for the next boot"
+
+
 def test_lane_hosts_are_excluded_from_the_services_stack() -> None:
     """services.yml renders every secret env file. A lane host must never receive
     them — that isolation is the whole reason the desktop can host lanes at all.
