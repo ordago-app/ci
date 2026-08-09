@@ -9,6 +9,8 @@ GROUP_VARS = REPO / "inventory" / "group_vars" / "all.yml"
 LANE_HOST_COMPOSE = REPO / "services" / "ci-lane-host" / "compose.yml"
 LANE_HOST_PLAYBOOK = REPO / "ansible" / "playbooks" / "ci-lane-host.yml"
 CONTROLLER_CONFIG = REPO / "personal" / "ci-controller.yml"
+LANE_AGENT_SCRIPT = REPO / "scripts" / "wsl-ci-sleep-inhibit.ps1"
+DISTRO_SCRIPT = REPO / "scripts" / "wsl-ci-distro.ps1"
 
 
 def _load() -> dict:
@@ -314,6 +316,54 @@ def test_lane_host_firewall_survives_a_reboot() -> None:
     assert any(
         u.get("name") == "ci-lane-firewall.service" and u.get("enabled") is True for u in enabled
     ), "the unit must be enabled, or it never runs at boot"
+
+
+def test_windows_scripts_are_ascii_only() -> None:
+    """Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, not UTF-8.
+
+    A non-ASCII byte inside a string then desynchronises the parser and the script dies
+    several lines later with an error pointing nowhere near the real cause. This already
+    cost one failed operator run, from an em-dash in a comment. No CI job executes these
+    scripts, so this byte-level check is the only guard they get.
+    """
+    for script in (LANE_AGENT_SCRIPT, DISTRO_SCRIPT):
+        raw = script.read_bytes()
+        offending = [(i, b) for i, b in enumerate(raw) if b > 0x7F]
+        assert not offending, (
+            f"{script.name} has non-ASCII bytes at offsets "
+            f"{[i for i, _ in offending[:5]]} - PowerShell 5.1 will mis-parse it"
+        )
+
+
+def test_lane_agent_keeps_the_distro_running() -> None:
+    """A WSL distro stops as soon as its last client process exits.
+
+    systemd inside the distro does not prevent this, and nothing starts it at logon, so a
+    fully provisioned lane host is simply absent a minute after the operator's last wsl
+    command returns. The controller then correctly skips an unreachable host and the
+    second lane host contributes nothing. Something must hold a process open.
+    """
+    script = LANE_AGENT_SCRIPT.read_text()
+
+    assert "sleep" in script and "infinity" in script, (
+        "the agent must hold a long-lived process inside the distro, or it stops"
+    )
+    assert "--exec" in script, "pin the process directly; this distro has interop disabled"
+    assert "HasExited" in script, "a pin that is never re-established dies with the first crash"
+
+    # The cmdlet's default ExecutionTimeLimit is 3 days: without an explicit override the
+    # agent is killed on day 3 and the lane host vanishes until the next logon.
+    assert "ExecutionTimeLimit" in script, (
+        "the logon task must override the default 3-day execution time limit"
+    )
+    assert "[TimeSpan]::Zero" in script, "unlimited is the only correct limit for an agent"
+
+    # Installing it is part of provisioning, not optional polish for `node` later.
+    runbook = (REPO / "docs" / "runbook.md").read_text()
+    section = runbook.split("## Second CI lane host")[1].split("\n## ")[0]
+    assert LANE_AGENT_SCRIPT.name in section, (
+        "the provisioning sequence must install the agent; without it there is no host"
+    )
 
 
 def test_lane_host_endpoint_and_ssh_port_agree_with_the_inventory() -> None:
