@@ -358,12 +358,20 @@ def test_lane_agent_keeps_the_distro_running() -> None:
     )
     assert "[TimeSpan]::Zero" in script, "unlimited is the only correct limit for an agent"
 
+    # -Install fails with a raw CIM "Access is denied" without elevation, which reads
+    # as a bug in the script. It must say so itself, and the runbook must say so too.
+    assert "Test-Elevated" in script, "-Install must check for elevation, not just fail"
+    assert script.index("function Test-Elevated") < script.index("if ($Uninstall)"), (
+        "the check must precede the -Uninstall branch, which returns early"
+    )
+
     # Installing it is part of provisioning, not optional polish for `node` later.
     runbook = (REPO / "docs" / "runbook.md").read_text()
     section = runbook.split("## Second CI lane host")[1].split("\n## ")[0]
     assert LANE_AGENT_SCRIPT.name in section, (
         "the provisioning sequence must install the agent; without it there is no host"
     )
+    assert "Administrator" in section, "the runbook must say -Install needs elevation"
 
 
 def test_lane_host_endpoint_and_ssh_port_agree_with_the_inventory() -> None:
