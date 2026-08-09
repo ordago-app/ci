@@ -390,3 +390,75 @@ def test_lane_host_endpoint_and_ssh_port_agree_with_the_inventory() -> None:
     assert f"Port {entry['ansible_port']}" in ps1, (
         "the distro script must configure sshd on the port the inventory expects"
     )
+
+
+def _daemon_json_template() -> str:
+    """The literal content block of docker.yml's daemon.json task."""
+    play = yaml.safe_load((SERVICES_PLAYBOOK.parent / "docker.yml").read_text())[0]
+    for task in play["tasks"]:
+        copy = task.get("ansible.builtin.copy") or task.get("copy") or {}
+        if copy.get("dest") == "/etc/docker/daemon.json":
+            return copy["content"]
+    raise AssertionError("docker.yml no longer writes /etc/docker/daemon.json")
+
+
+def _render(template: str, **ctx: object) -> str:
+    import json as _json
+
+    from jinja2 import Environment
+
+    # trim_blocks=True mirrors ansible's own Templar. It is load-bearing: under it a
+    # block tag ending a line swallows the newline after it.
+    env = Environment(  # noqa: S701 - rendering a config file, not HTML
+        autoescape=False, trim_blocks=True, keep_trailing_newline=True
+    )
+    env.filters["to_json"] = _json.dumps  # ansible's to_json is json.dumps
+    return env.from_string(template).render(**ctx)
+
+
+def test_daemon_json_is_unchanged_when_no_dns_is_configured() -> None:
+    """Adding conditional DNS must not reformat the file on hosts that don't set it.
+
+    This task notifies `restart docker`. Restarting the daemon on powerserver stops
+    every service container and kills every live CI lane, so a cosmetic whitespace or
+    key-order change here is an outage, not a diff. Pin the exact bytes.
+    """
+    rendered = _render(_daemon_json_template(), docker_daemon_dns=[])
+    assert rendered == (
+        "{\n"
+        '  "log-driver": "json-file",\n'
+        '  "log-opts": {\n'
+        '    "max-size": "10m",\n'
+        '    "max-file": "3"\n'
+        "  },\n"
+        '  "default-address-pools": [\n'
+        '    { "base": "172.30.0.0/16", "size": 24 }\n'
+        "  ]\n"
+        "}\n"
+    )
+
+
+def test_daemon_json_carries_dns_when_configured() -> None:
+    """A WSL lane host's resolver is unreachable from the docker bridge.
+
+    /etc/resolv.conf points at 10.255.255.254 (the WSL DNS proxy), docker copies that
+    into every container, and nothing on the bridge can reach it — so the daemon pulls
+    images fine while every container fails to resolve. Measured on powervaro-ci: it
+    failed the runner image build at `apt-get update`.
+    """
+    import json as _json
+
+    rendered = _render(_daemon_json_template(), docker_daemon_dns=["8.8.8.8", "1.1.1.1"])
+    parsed = _json.loads(rendered)  # must still be valid JSON, or dockerd will not start
+    assert parsed["dns"] == ["8.8.8.8", "1.1.1.1"]
+    assert parsed["default-address-pools"] == [{"base": "172.30.0.0/16", "size": 24}], (
+        "the conditional must not disturb the existing keys"
+    )
+
+    # And the lane hosts must actually set it, or the rendering above is dead surface.
+    group_vars = yaml.safe_load((REPO / "inventory" / "group_vars" / "ci_hosts.yml").read_text())
+    assert group_vars["docker_daemon_dns"], "ci_hosts must configure container DNS"
+    defaults = yaml.safe_load(GROUP_VARS.read_text())
+    assert defaults.get("docker_daemon_dns") == [], (
+        "the default must be empty, or every other host's daemon.json changes"
+    )

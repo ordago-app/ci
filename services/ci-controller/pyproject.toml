@@ -15,6 +15,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  # Ansible's template engine. Used by the wiring tests to render a playbook's
+  # conditional daemon.json block and assert what it actually produces, rather
+  # than eyeballing the Jinja.
+  "jinja2>=3.1",
   "pytest>=8",
   "pytest-asyncio>=0.23",
   "respx>=0.21",
