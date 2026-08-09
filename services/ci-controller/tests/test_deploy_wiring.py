@@ -362,7 +362,7 @@ def test_lane_agent_keeps_the_distro_running() -> None:
     # start the subsystem that serves that path, and fails silently (LastTaskResult=1,
     # task "running", no distro). The registered command must reference a local copy.
     assert "LOCALAPPDATA" in script, "the task must run from a local copy, not the repo"
-    assert "-File `\"$installed`\"" in script, (
+    assert '-File `"$installed`"' in script, (
         "the scheduled action must point at the copy, not at $self in the repo"
     )
     assert "Copy-Item" in script, "-Install must make that copy"
@@ -426,9 +426,7 @@ def _render(template: str, **ctx: object) -> str:
 
     # trim_blocks=True mirrors ansible's own Templar. It is load-bearing: under it a
     # block tag ending a line swallows the newline after it.
-    env = Environment(  # noqa: S701 - rendering a config file, not HTML
-        autoescape=False, trim_blocks=True, keep_trailing_newline=True
-    )
+    env = Environment(autoescape=False, trim_blocks=True, keep_trailing_newline=True)
     env.filters["to_json"] = _json.dumps  # ansible's to_json is json.dumps
     return env.from_string(template).render(**ctx)
 
@@ -493,3 +491,62 @@ def test_daemon_json_carries_dns_when_configured() -> None:
     assert defaults.get("docker_daemon_dns") == [], (
         "the default must be empty, or every other host's daemon.json changes"
     )
+
+
+def test_ci_status_script_reports_each_host_and_a_correct_total() -> None:
+    """`make ci-status` must not read as an over-admission on a multi-host pool.
+
+    The fleet-wide `lanes_running` counts every host but `max_lanes` is one host's
+    ceiling, so printing them together showed "6 / 5" while both hosts were within
+    their limits. Anyone diagnosing capacity would chase a bug that isn't there.
+    Executes the real script against a synthetic payload — asserting on its source
+    text would not catch a formatting change that drops a host.
+    """
+    import io
+    import json
+    import urllib.request
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+
+    payload = {
+        "hosts": {
+            "powerserver": {
+                "lanes": 4,
+                "max_lanes": 5,
+                "ram_mb": 9000,
+                "budget_ram_mb": 11000,
+                "healthy": True,
+            },
+            "powervaro-ci": {
+                "lanes": 2,
+                "max_lanes": 2,
+                "ram_mb": 1400,
+                "budget_ram_mb": 11000,
+                "healthy": False,
+            },
+        },
+        "lanes_running": 6,
+        "max_lanes": 5,
+        "ledger_ram_mb": 10400,
+        "budget_ram_mb": 11000,
+        "disk_gb": {"ssd": {"used": 30, "budget": 300}},
+        "running": [{"class": "node"}],
+        "deferred": [{"reason": "budget_full"}],
+        "admission_mode": "reservation_plus_guard",
+    }
+    source = (REPO / "scripts" / "ci_status.py").read_text()
+    buf = io.StringIO()
+    with (
+        patch.object(urllib.request, "urlopen", return_value=io.StringIO(json.dumps(payload))),
+        redirect_stdout(buf),
+    ):
+        exec(compile(source, "ci_status.py", "exec"), {"__name__": "__main__"})
+    out = buf.getvalue()
+
+    assert "powerserver" in out and "powervaro-ci" in out, "every host must be listed"
+    assert "4/5" in out, "powerserver's own lanes against its own ceiling"
+    assert "2/2" in out, "the lane host's own lanes against its own ceiling"
+    assert "6/7" in out, "the total must sum the per-host ceilings, not reuse one host's"
+    assert "6/5" not in out, "the misleading aggregate-vs-one-ceiling line must be gone"
+    # An unhealthy host receives no work, which is indistinguishable from an idle pool.
+    assert "UNHEALTHY" in out, "an unhealthy host must be called out, not silently idle"
