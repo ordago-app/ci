@@ -1,4 +1,5 @@
 import re
+import shlex
 from pathlib import Path
 
 import yaml
@@ -390,6 +391,30 @@ def test_lane_host_proxy_survives_a_reboot() -> None:
     ), "the unit is useless unless enabled for the next boot"
 
 
+def _iptables_specs(script: str) -> tuple[set, set]:
+    """Parse a firewall script into (added specs, deleted specs), comparably.
+
+    Normalises away everything iptables does NOT compare when matching a rule for
+    deletion — the chain name, the `-I` insert position, and surrounding shell — so
+    that what remains is exactly the rule specification. Two rules are the same rule
+    iff these token tuples are equal.
+    """
+    adds: set = set()
+    dels: set = set()
+    for line in script.replace("\\\n", " ").splitlines():
+        match = re.search(r"iptables\s+(-[DIA])\s+DOCKER-USER\s+(.*)", line.strip())
+        if not match:
+            continue
+        op, rest = match.group(1), match.group(2)
+        # Trim the shell that wraps the command (redirects, `|| true`, loop bodies).
+        rest = re.split(r"2>/dev/null|;\s*do\b|\|\|", rest)[0]
+        tokens = shlex.split(rest)
+        if tokens and tokens[0].isdigit():  # the `-I <position>` argument
+            tokens = tokens[1:]
+        (adds if op in ("-I", "-A") else dels).add(tuple(tokens))
+    return adds, dels
+
+
 def test_lane_hosts_are_excluded_from_the_services_stack() -> None:
     """services.yml renders every secret env file. A lane host must never receive
     them — that isolation is the whole reason the desktop can host lanes at all.
@@ -498,8 +523,19 @@ def test_lane_host_firewall_survives_a_reboot() -> None:
     assert "DOCKER-USER" in script
     assert "-I DOCKER-USER 1" in script, "the allow must precede the catch-all deny"
 
-    # Idempotent: re-running must not stack duplicate rules.
-    assert script.count("-D DOCKER-USER") >= 2, "each rule must be deleted before it is added"
+    # Idempotent: re-running must not stack duplicate rules. Counting `-D` occurrences
+    # (what this used to do) proves only that deletes are PRESENT, which is why the real
+    # defect survived: iptables matches the FULL rule spec, so a `-D` that omits the
+    # `-m comment` its `-A` adds never matches, and every run appends another copy.
+    # Observed on powervaro-ci 2026-08-10: three identical RETURN and three identical DROP
+    # rules after one boot plus two play runs. Compare the specs, not the count.
+    adds, dels = _iptables_specs(script)
+    assert adds, "expected at least one rule to be added"
+    unmatched = adds - dels
+    assert not unmatched, (
+        "every added rule needs a delete with the IDENTICAL spec, comment matches "
+        f"included, or re-running stacks duplicates. Missing deletes for: {sorted(unmatched)}"
+    )
 
     # docker rebuilds its chains on start, so ordering after it is load-bearing.
     assert "After=docker.service" in unit
