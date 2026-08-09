@@ -122,8 +122,11 @@ def test_lane_host_proxy_never_binds_all_interfaces() -> None:
     """Port 2375 is an unauthenticated container-create API.
 
     Reachable from anywhere it is a root shell on the operator's desktop, so the
-    published port must name a bind address and that address must not be a
-    wildcard. The real value is rendered by ansible from `tailscale ip -4`.
+    published port must name a bind address and that address must not be a wildcard.
+    The real value is rendered into .env by ansible, which discovers the tailnet
+    address among the host's IPs (mirrored in from Windows — this host runs no
+    tailscaled of its own). The bind address is necessary but NOT sufficient; see
+    test_lane_host_restricts_the_socket_proxy_at_the_firewall.
     """
     (published,) = _lane_host_compose()["services"]["docker-socket-proxy"]["ports"]
     host_part = str(published).rsplit(":", 2)[0]
@@ -272,3 +275,60 @@ def test_documented_provisioning_sequence_installs_the_lane_plays_prerequisites(
 
     ps1 = (REPO / "scripts" / "wsl-ci-distro.ps1").read_text()
     assert "base.yml" in ps1, "the distro script's printed next steps must include base.yml"
+
+
+def test_lane_host_restricts_the_socket_proxy_at_the_firewall() -> None:
+    """The bind address alone does NOT restrict 2375 on a mirrored-networking host.
+
+    Every WSL distro shares one namespace there, and a lane container can route out
+    through the docker bridge — so the dev distro, anything on Windows, and PR code
+    running in a lane could all reach an unauthenticated container-create API and become
+    root on the lane host. The restriction has to be enforced on the host (DOCKER-USER),
+    not assumed from the Tailscale ACL. See ADR 0016 decision 7.
+    """
+    rules = [
+        t.get("ansible.builtin.iptables")
+        for t in _lane_host_tasks()
+        if t.get("ansible.builtin.iptables")
+    ]
+    on_2375 = [r for r in rules if str(r.get("destination_port")) == "2375"]
+    assert len(on_2375) >= 2, "expected an allow rule and a catch-all deny on 2375"
+
+    allow = [r for r in on_2375 if r.get("jump") == "RETURN"]
+    deny = [r for r in on_2375 if r.get("jump") == "DROP"]
+    assert allow, "the controller must be permitted explicitly"
+    assert deny, "everything else must be dropped — an allow-only rule restricts nothing"
+    assert all(r.get("chain") == "DOCKER-USER" for r in on_2375), (
+        "must live in DOCKER-USER: it is consulted before docker's own FORWARD rules "
+        "and survives container restarts"
+    )
+    assert allow[0].get("source"), "the allow rule must be scoped to a source address"
+    # Ordering is load-bearing: the allow is inserted, the deny appended.
+    assert allow[0].get("action") == "insert"
+    assert deny[0].get("action") == "append"
+
+
+def test_lane_host_endpoint_and_ssh_port_agree_with_the_inventory() -> None:
+    """Under mirrored networking the host is identified by (Windows name, port).
+
+    The controller reaches the socket proxy at the Windows machine's tailnet name, and
+    ansible reaches the distro at that same name on a non-default SSH port. If those
+    drift apart, the controller talks to one machine and ansible provisions another.
+    """
+    config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
+    endpoint = config["hosts"]["powervaro-ci"]["docker_endpoint"]
+    inventory = yaml.safe_load((REPO / "inventory" / "hosts.yml").read_text())
+    entry = inventory["all"]["children"]["ci_hosts"]["hosts"]["powervaro-ci"]
+
+    endpoint_host = endpoint.split("//", 1)[1].rsplit(":", 1)[0]
+    assert endpoint_host == entry["ansible_host"], (
+        f"controller talks to {endpoint_host}, ansible provisions {entry['ansible_host']}"
+    )
+    assert entry.get("ansible_port") not in (None, 22), (
+        "port 22 belongs to the shared namespace; the CI distro needs its own port"
+    )
+
+    ps1 = (REPO / "scripts" / "wsl-ci-distro.ps1").read_text()
+    assert f"Port {entry['ansible_port']}" in ps1, (
+        "the distro script must configure sshd on the port the inventory expects"
+    )

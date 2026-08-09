@@ -134,7 +134,7 @@ hosts:
   powerserver:
     docker_endpoint: tcp://docker-socket-proxy:2375
   powervaro-ci:
-    docker_endpoint: tcp://powervaro-ci.REDACTED-PERSONAL-TAILNET.ts.net:2375
+    docker_endpoint: tcp://powervaro.REDACTED-PERSONAL-TAILNET.ts.net:2375
     allowed_classes: [light]
     cpu_shares: 256
     max_concurrent_lanes: 3
