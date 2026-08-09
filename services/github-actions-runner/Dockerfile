@@ -62,7 +62,7 @@ RUN mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools" \
  && mv /tmp/android-commandline-tools/cmdline-tools "${ANDROID_SDK_ROOT}/cmdline-tools/latest" \
  && rm -rf /tmp/android-commandline-tools /tmp/android-commandline-tools.zip \
  && yes | sdkmanager --licenses >/dev/null \
- && sdkmanager \
+ && yes | sdkmanager \
       "platform-tools" \
       "emulator" \
       "platforms;android-33" \

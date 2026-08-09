@@ -9,8 +9,6 @@ GROUP_VARS = REPO / "inventory" / "group_vars" / "all.yml"
 LANE_HOST_COMPOSE = REPO / "services" / "ci-lane-host" / "compose.yml"
 LANE_HOST_PLAYBOOK = REPO / "ansible" / "playbooks" / "ci-lane-host.yml"
 CONTROLLER_CONFIG = REPO / "personal" / "ci-controller.yml"
-LANE_AGENT_SCRIPT = REPO / "scripts" / "wsl-ci-sleep-inhibit.ps1"
-DISTRO_SCRIPT = REPO / "scripts" / "wsl-ci-distro.ps1"
 
 
 def _load() -> dict:
@@ -125,9 +123,8 @@ def test_lane_host_proxy_never_binds_all_interfaces() -> None:
 
     Reachable from anywhere it is a root shell on the operator's desktop, so the
     published port must name a bind address and that address must not be a wildcard.
-    The real value is rendered into .env by ansible, which discovers the tailnet
-    address among the host's IPs (mirrored in from Windows — this host runs no
-    tailscaled of its own). The bind address is necessary but NOT sufficient; see
+    The real value is rendered into .env by ansible, which asks the host's own
+    tailscaled for it. The bind address is necessary but NOT sufficient; see
     test_lane_host_restricts_the_socket_proxy_at_the_firewall.
     """
     (published,) = _lane_host_compose()["services"]["docker-socket-proxy"]["ports"]
@@ -136,6 +133,54 @@ def test_lane_host_proxy_never_binds_all_interfaces() -> None:
         f"lane-host proxy publishes {published!r} without a specific bind address"
     )
     assert "CI_LANE_BIND_ADDR" in host_part, "bind address must come from the ansible-rendered .env"
+
+
+def test_lane_host_bind_address_comes_from_tailscaled_and_stops_the_play_when_empty() -> None:
+    """An empty bind address must abort, because the fallback is 0.0.0.0.
+
+    `.env` is rendered unconditionally, so a discovery step that yields "" produces
+    `CI_LANE_BIND_ADDR=` — and docker reads an empty host part as every interface,
+    publishing an unauthenticated container-create API to every network the host can
+    see. The guard, not the discovery, is what makes this safe; pin both.
+    """
+    tasks = _lane_host_tasks()
+
+    discovery = [
+        t for t in tasks if "tailscale ip -4" in str(t.get("ansible.builtin.command") or "")
+    ]
+    assert discovery, (
+        "the bind address must be asked of the host's own tailscaled — a lane host is "
+        "its own tailnet node now (ADR 0017)"
+    )
+    # Without this the play dies on a host that has no tailscale binary, before ever
+    # reaching the guard that explains why.
+    assert discovery[0].get("failed_when") is False, (
+        "a missing/failed tailscale must fall through to the guard, not abort raw"
+    )
+
+    guards = [
+        t
+        for t in tasks
+        if (t.get("ansible.builtin.fail") or t.get("fail"))
+        and "ci_lane_bind_addr" in str(t.get("when", ""))
+    ]
+    assert guards, "an empty bind address must stop the play"
+    assert "length == 0" in str(guards[0]["when"]), (
+        f"the guard must trip on an empty address, not on {guards[0]['when']!r}"
+    )
+
+    # Ordering is the whole point: a guard after the render has already written 0.0.0.0.
+    def index_of(pred) -> int:
+        return next(i for i, t in enumerate(tasks) if pred(t))
+
+    render = index_of(
+        lambda t: (
+            (t.get("ansible.builtin.copy") or t.get("copy") or {})
+            .get("dest", "")
+            .endswith("ci-lane-host/.env")
+        )
+    )
+    assert tasks.index(guards[0]) < render, "the guard must precede rendering .env"
 
 
 def test_lane_host_playbook_creates_every_configured_work_dir() -> None:
@@ -256,7 +301,7 @@ def test_documented_provisioning_sequence_installs_the_lane_plays_prerequisites(
 
     rsync is installed by base.yml, so a runbook that tells the operator to run only
     docker.yml before the lane-host play fails at the first synchronize task on a fresh
-    WSL distro — and silently skips the base hardening too. Pin both the requirement and
+    lane VM — and silently skips the base hardening too. Pin both the requirement and
     the documented sequence so they cannot drift apart again.
     """
     lane_play_text = LANE_HOST_PLAYBOOK.read_text()
@@ -275,15 +320,18 @@ def test_documented_provisioning_sequence_installs_the_lane_plays_prerequisites(
         "base.yml must be run before the lane-host play (it provides rsync)"
     )
 
-    ps1 = (REPO / "scripts" / "wsl-ci-distro.ps1").read_text()
-    assert "base.yml" in ps1, "the distro script's printed next steps must include base.yml"
+    # The VM has to exist before any play can reach it, so the sequence starts there.
+    assert "make ci-lane-up" in section, "the provisioning sequence must start by creating the VM"
+    assert section.index("make ci-lane-up") < section.index("base.yml"), (
+        "the VM must exist before base.yml can run against it"
+    )
 
 
 def test_lane_host_firewall_survives_a_reboot() -> None:
     """The restriction must be boot-restored, not a one-shot live iptables mutation.
 
     iptables rules are runtime state and docker restarts the `unless-stopped` proxy on
-    boot, so a deploy-time-only rule leaves 2375 unfiltered after every WSL restart until
+    boot, so a deploy-time-only rule leaves 2375 unfiltered after every VM start until
     someone re-runs the play — an unnoticed hole in the thing called a trust boundary.
     """
     by_dest = {}
@@ -318,77 +366,18 @@ def test_lane_host_firewall_survives_a_reboot() -> None:
     ), "the unit must be enabled, or it never runs at boot"
 
 
-def test_windows_scripts_are_ascii_only() -> None:
-    """Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, not UTF-8.
-
-    A non-ASCII byte inside a string then desynchronises the parser and the script dies
-    several lines later with an error pointing nowhere near the real cause. This already
-    cost one failed operator run, from an em-dash in a comment. No CI job executes these
-    scripts, so this byte-level check is the only guard they get.
-    """
-    for script in (LANE_AGENT_SCRIPT, DISTRO_SCRIPT):
-        raw = script.read_bytes()
-        offending = [(i, b) for i, b in enumerate(raw) if b > 0x7F]
-        assert not offending, (
-            f"{script.name} has non-ASCII bytes at offsets "
-            f"{[i for i, _ in offending[:5]]} - PowerShell 5.1 will mis-parse it"
-        )
-
-
-def test_lane_agent_keeps_the_distro_running() -> None:
-    """A WSL distro stops as soon as its last client process exits.
-
-    systemd inside the distro does not prevent this, and nothing starts it at logon, so a
-    fully provisioned lane host is simply absent a minute after the operator's last wsl
-    command returns. The controller then correctly skips an unreachable host and the
-    second lane host contributes nothing. Something must hold a process open.
-    """
-    script = LANE_AGENT_SCRIPT.read_text()
-
-    assert "sleep" in script and "infinity" in script, (
-        "the agent must hold a long-lived process inside the distro, or it stops"
-    )
-    assert "--exec" in script, "pin the process directly; this distro has interop disabled"
-    assert "HasExited" in script, "a pin that is never re-established dies with the first crash"
-
-    # The cmdlet's default ExecutionTimeLimit is 3 days: without an explicit override the
-    # agent is killed on day 3 and the lane host vanishes until the next logon.
-    assert "ExecutionTimeLimit" in script, (
-        "the logon task must override the default 3-day execution time limit"
-    )
-    assert "[TimeSpan]::Zero" in script, "unlimited is the only correct limit for an agent"
-
-    # The repo checkout lives inside WSL. A task pointed at \\wsl.localhost\... cannot
-    # start the subsystem that serves that path, and fails silently (LastTaskResult=1,
-    # task "running", no distro). The registered command must reference a local copy.
-    assert "LOCALAPPDATA" in script, "the task must run from a local copy, not the repo"
-    assert '-File `"$installed`"' in script, (
-        "the scheduled action must point at the copy, not at $self in the repo"
-    )
-    assert "Copy-Item" in script, "-Install must make that copy"
-
-    # -Install fails with a raw CIM "Access is denied" without elevation, which reads
-    # as a bug in the script. It must say so itself, and the runbook must say so too.
-    assert "Test-Elevated" in script, "-Install must check for elevation, not just fail"
-    assert script.index("function Test-Elevated") < script.index("if ($Uninstall)"), (
-        "the check must precede the -Uninstall branch, which returns early"
-    )
-
-    # Installing it is part of provisioning, not optional polish for `node` later.
-    runbook = (REPO / "docs" / "runbook.md").read_text()
-    section = runbook.split("## Second CI lane host")[1].split("\n## ")[0]
-    assert LANE_AGENT_SCRIPT.name in section, (
-        "the provisioning sequence must install the agent; without it there is no host"
-    )
-    assert "Administrator" in section, "the runbook must say -Install needs elevation"
-
-
 def test_lane_host_endpoint_and_ssh_port_agree_with_the_inventory() -> None:
-    """Under mirrored networking the host is identified by (Windows name, port).
+    """A lane host is one machine reached two ways, so both ways must name it.
 
-    The controller reaches the socket proxy at the Windows machine's tailnet name, and
-    ansible reaches the distro at that same name on a non-default SSH port. If those
-    drift apart, the controller talks to one machine and ansible provisions another.
+    The controller reaches the socket proxy at the host's tailnet name and ansible
+    reaches sshd at the same name. If those drift apart, the controller talks to one
+    machine and ansible provisions another.
+
+    The port assertion is inverted from what it was under the WSL predecessor. That host
+    shared the Windows machine's network namespace, so port 2222 was the only thing
+    telling it apart from the desktop. The VM has its own stack and its own tailnet
+    identity, so 22 is correct — and a non-default port here would mean someone
+    reintroduced the shared-namespace hack. See ADR 0017.
     """
     config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
     endpoint = config["hosts"]["powervaro-ci"]["docker_endpoint"]
@@ -399,13 +388,13 @@ def test_lane_host_endpoint_and_ssh_port_agree_with_the_inventory() -> None:
     assert endpoint_host == entry["ansible_host"], (
         f"controller talks to {endpoint_host}, ansible provisions {entry['ansible_host']}"
     )
-    assert entry.get("ansible_port") not in (None, 22), (
-        "port 22 belongs to the shared namespace; the CI distro needs its own port"
+    assert entry.get("ansible_port", 22) == 22, (
+        "a lane VM is its own tailnet node, so sshd is on 22; a custom port means the "
+        "shared-namespace workaround came back"
     )
-
-    ps1 = (REPO / "scripts" / "wsl-ci-distro.ps1").read_text()
-    assert f"Port {entry['ansible_port']}" in ps1, (
-        "the distro script must configure sshd on the port the inventory expects"
+    assert entry["ansible_host"].startswith("powervaro-ci."), (
+        "the VM has its own MagicDNS name; pointing at the Windows host's name would "
+        "provision the operator's desktop instead"
     )
 
 
@@ -419,39 +408,20 @@ def _daemon_json_template() -> str:
     raise AssertionError("docker.yml no longer writes /etc/docker/daemon.json")
 
 
-def _render(template: str, **ctx: object) -> str:
-    import json as _json
+def test_daemon_json_is_a_byte_exact_literal() -> None:
+    """Rewriting this file notifies `restart docker`, which is an outage.
 
-    from jinja2 import Environment
+    On powerserver a docker restart stops every service container and kills every
+    live CI lane, so a cosmetic reformat here is not a diff -- it is downtime. The
+    content must therefore stay a plain literal with no templating: pin it byte for
+    byte, so any edit has to be deliberate.
 
-    # trim_blocks=True mirrors ansible's own Templar. It is load-bearing: under it a
-    # block tag ending a line swallows the newline after it.
-    env = Environment(autoescape=False, trim_blocks=True, keep_trailing_newline=True)
-    env.filters["to_json"] = _json.dumps  # ansible's to_json is json.dumps
-    return env.from_string(template).render(**ctx)
-
-
-def test_daemon_json_template_uses_no_backslash_escapes() -> None:
-    """Ansible does not interpret a `\\n` escape inside a Jinja string literal.
-
-    It emits a literal backslash-n. That produced invalid JSON on powervaro-ci and dockerd
-    refused to start. Plain jinja2 *does* interpret the escape, so the render test below
-    passed while the real thing was broken -- this check is the one that generalises.
+    This replaces three tests that guarded a conditional `dns` key. That key existed
+    only for the WSL lane host's unreachable resolver (#116/#117) and lost its last
+    consumer when the host became a VM (ADR 0017); rendering with no consumer is the
+    dead surface those tests were themselves written to forbid.
     """
-    assert "\\n" not in _daemon_json_template(), (
-        "use the _newline var (a YAML double-quoted scalar) instead of a Jinja escape"
-    )
-
-
-def test_daemon_json_is_unchanged_when_no_dns_is_configured() -> None:
-    """Adding conditional DNS must not reformat the file on hosts that don't set it.
-
-    This task notifies `restart docker`. Restarting the daemon on powerserver stops
-    every service container and kills every live CI lane, so a cosmetic whitespace or
-    key-order change here is an outage, not a diff. Pin the exact bytes.
-    """
-    rendered = _render(_daemon_json_template(), docker_daemon_dns=[], _newline="\n")
-    assert rendered == (
+    expected = (
         "{\n"
         '  "log-driver": "json-file",\n'
         '  "log-opts": {\n'
@@ -463,34 +433,13 @@ def test_daemon_json_is_unchanged_when_no_dns_is_configured() -> None:
         "  ]\n"
         "}\n"
     )
+    assert _daemon_json_template() == expected
 
-
-def test_daemon_json_carries_dns_when_configured() -> None:
-    """A WSL lane host's resolver is unreachable from the docker bridge.
-
-    /etc/resolv.conf points at 10.255.255.254 (the WSL DNS proxy), docker copies that
-    into every container, and nothing on the bridge can reach it — so the daemon pulls
-    images fine while every container fails to resolve. Measured on powervaro-ci: it
-    failed the runner image build at `apt-get update`.
-    """
-    import json as _json
-
-    rendered = _render(
-        _daemon_json_template(), docker_daemon_dns=["8.8.8.8", "1.1.1.1"], _newline="\n"
-    )
-    parsed = _json.loads(rendered)  # must still be valid JSON, or dockerd will not start
-    assert parsed["dns"] == ["8.8.8.8", "1.1.1.1"]
-    assert parsed["default-address-pools"] == [{"base": "172.30.0.0/16", "size": 24}], (
-        "the conditional must not disturb the existing keys"
-    )
-
-    # And the lane hosts must actually set it, or the rendering above is dead surface.
-    group_vars = yaml.safe_load((REPO / "inventory" / "group_vars" / "ci_hosts.yml").read_text())
-    assert group_vars["docker_daemon_dns"], "ci_hosts must configure container DNS"
-    defaults = yaml.safe_load(GROUP_VARS.read_text())
-    assert defaults.get("docker_daemon_dns") == [], (
-        "the default must be empty, or every other host's daemon.json changes"
-    )
+    # No Jinja at all: ansible does not interpret a `\n` escape inside a string
+    # literal, and a block tag ending a line swallows the newline after it under
+    # trim_blocks. Both produced real outages here. A literal cannot do either.
+    assert "{{" not in _daemon_json_template()
+    assert "{%" not in _daemon_json_template()
 
 
 def test_ci_status_script_reports_each_host_and_a_correct_total() -> None:
@@ -622,30 +571,3 @@ def test_every_controller_label_is_registered_with_actionlint() -> None:
     )
     missing = set(homelab["label_class"]) - known
     assert not missing, f"labels used by homelab jobs but unknown to actionlint: {sorted(missing)}"
-
-
-def test_windows_scripts_avoid_the_int32_hex_literal_trap() -> None:
-    """`[uint32]0x80000000` throws at runtime in Windows PowerShell 5.1.
-
-    A hex literal is typed Int32 when it fits the token width, so 0x80000000 becomes
-    -2147483648 and the cast fails with "Value was either too large or too small for a
-    UInt32". This killed the lane agent on every launch; the scheduled task reported only
-    LastTaskResult=1, so it looked like the three unrelated bugs fixed before it.
-
-    No test can execute these scripts — the API they call is Windows-only and CI is Linux
-    — so this checks the one pattern that produced a silent, total failure. Write the
-    constant in decimal: it exceeds Int32, so PowerShell types it Int64 and the cast is
-    exact.
-    """
-    import re
-
-    pattern = re.compile(r"\[uint32\]\s*0x", re.IGNORECASE)
-    for script in (LANE_AGENT_SCRIPT, DISTRO_SCRIPT):
-        # Strip comments first: the fix's own comment quotes the broken form on purpose,
-        # and that is worth keeping. Naive `#`-to-end-of-line, which is exact for these
-        # two scripts (no `#` appears inside a string in either).
-        code = "\n".join(line.split("#", 1)[0] for line in script.read_text().splitlines())
-        assert not pattern.search(code), (
-            f"{script.name} casts a hex literal to [uint32]; PowerShell 5.1 types it Int32 "
-            f"first and the cast throws. Use a decimal literal with the hex in a comment."
-        )

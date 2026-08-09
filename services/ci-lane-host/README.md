@@ -3,8 +3,11 @@
 An **opportunistic CI lane host**: a machine that lends spare capacity to the
 homelab's CI pool without becoming part of its trusted core.
 
-`powervaro-ci` — a dedicated WSL distro on the operator's desktop — is the first
-one. See [ADR 0016](../../docs/decisions/0016-opportunistic-second-ci-host.md).
+`powervaro-ci` — an **opt-in** Multipass VM on the operator's desktop, off unless
+lent — is the first one. See
+[ADR 0017](../../docs/decisions/0017-ci-lane-host-as-an-opt-in-vm.md), and
+[ADR 0016](../../docs/decisions/0016-opportunistic-second-ci-host.md) for the
+controller-side design it still governs.
 
 ## What a lane host runs
 
@@ -26,8 +29,9 @@ That is the whole inventory.
 Two steps, both operator-run — see the "Second CI lane host" section of
 [`docs/runbook.md`](../../docs/runbook.md) for the full sequence:
 
-1. `scripts/wsl-ci-distro.ps1` on Windows, once, to create the distro. It cannot
-   be an ansible play: it needs `wsl.exe`, which only exists on the Windows side.
+1. `make ci-lane-up`, which creates the VM and joins it to the tailnet. It cannot
+   be an ansible play: there is nothing to SSH into until it has run. The same
+   command later just starts the VM, so it is also how the machine is lent.
 2. `make ci-lane-host host=powervaro-ci`, which runs
    `ansible/playbooks/ci-lane-host.yml` — docker network, work dirs, the runner
    image, the proxy stack, and the stale-work-dir prune timer.

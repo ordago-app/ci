@@ -178,6 +178,31 @@ def test_image_points_pnpm_store_at_the_mounted_volume():
     )
 
 
+def test_every_sdkmanager_invocation_is_non_interactive():
+    # Regression, 2026-08-09: the package-install sdkmanager was missing the `yes |`
+    # its sibling --licenses call had. When a package's license is not already
+    # accepted, sdkmanager prompts and reads stdin -- which in a docker build never
+    # arrives -- so the build hangs forever with no output, no CPU and no network.
+    # It wedged the powervaro-ci provision for 20 minutes and looked like a dead
+    # network rather than a blocked read.
+    #
+    # No CI job builds this image (it is ~16 GB and built on the host by
+    # ci-lane-host.yml), so a static check is the only guard available.
+    dockerfile = (REPO_ROOT / "services/github-actions-runner/Dockerfile").read_text()
+    # Join continuations, THEN split on && -- one shell command per segment. Splitting
+    # by source line is not enough: the whole RUN is one logical line, so a single
+    # correct `yes | sdkmanager --licenses` would vouch for every other call on it.
+    logical = dockerfile.replace("\\\n", " ")
+    commands = [seg.strip() for seg in logical.split("&&")]
+    invocations = [c for c in commands if "sdkmanager" in c]
+    assert invocations, "expected the image to install the Android SDK"
+    for cmd in invocations:
+        assert cmd.startswith("yes | sdkmanager"), (
+            f"every sdkmanager call must be fed from `yes` so a license prompt cannot "
+            f"block on a stdin that docker build never provides: {cmd[:120]}"
+        )
+
+
 def test_every_runner_runs_an_init_to_reap_zombies():
     # run.sh is PID 1 and CI jobs spawn many git/node children; without an init
     # their orphaned grandchildren accumulate as zombies (same class of leak as
