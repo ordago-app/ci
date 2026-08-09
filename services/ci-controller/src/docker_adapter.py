@@ -146,7 +146,14 @@ class DockerAdapter:
         if self._host_config.cpu_shares is not None:
             run_kwargs["cpu_shares"] = self._host_config.cpu_shares
 
-        container = self._client.containers.run(self._config.runner_image, **run_kwargs)
+        # Per-host image, falling back to the top-level one. A lane host may run an
+        # image built without the Android SDK, since its allowed_classes forbid the
+        # jobs that need it. _resolve() has already filled this in from the top level
+        # when the host omitted it; the `or` is a belt-and-braces default for a
+        # HostConfig built directly in a test.
+        container = self._client.containers.run(
+            self._host_config.runner_image or self._config.runner_image, **run_kwargs
+        )
         return lane_id, container.id
 
     def list_lanes(self) -> list[LaneInfo]:

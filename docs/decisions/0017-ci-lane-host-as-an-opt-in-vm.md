@@ -92,7 +92,26 @@ the dev distro; the disk half of that contributed to `C:` reaching 98% full and 
    the machine when not using it. If it ever proves necessary it returns as a
    plain scheduled task with no WSL coupling — a far smaller thing.
 
-5. **`allowed_classes` stays `[light]`, for a new reason.** Decision 4 of ADR 0016
+5. **A lane host runs a different image: `:light`, built with `WITH_ANDROID=0`.**
+   Added 2026-08-09 after provisioning. The Android SDK layer is ~10 GB that a
+   `light`-only host can never use, and downloading it is the least reliable part
+   of the build: `sdkmanager` blocks in a socket read with no timeout, which wedged
+   the provision twice with no output, no CPU and no bytes — indistinguishable from
+   a dead network until a thread dump showed `SocketDispatcher.read0`.
+
+   This is the "slim runner image" ADR 0016 and the migration plan both deferred,
+   on the reasoning that a large image "cannot hurt the host" inside a capped disk.
+   That was true about disk and wrong about provisioning: it did not hurt the host,
+   it prevented there being one.
+
+   `runner_image` therefore becomes per-host, inheriting from the top level exactly
+   as `work_dirs` does, so powerserver is untouched. Two invariants are pinned by
+   tests, because the socket proxy denies `IMAGES` and `BUILD` and the controller
+   can only run an image that is already there: the tag ansible builds must equal
+   the tag the config names, and a host built without the SDK must not allow a class
+   that needs it.
+
+6. **`allowed_classes` stays `[light]`, for a new reason.** Decision 4 of ADR 0016
    gated `node` on the sleep-inhibit shipping. That gate is gone with the script,
    and what replaces it is a promise rather than a mechanism. Widening therefore
    waits on `make ci-report` data about real `infra_failure` rates on this host.

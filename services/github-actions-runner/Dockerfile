@@ -55,7 +55,17 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && corepack enable \
  && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools" \
+# ── Android SDK + maestro: skippable, because a light-only host cannot use them ──
+# WITH_ANDROID=0 drops ~10 GB from the image. It exists for lane hosts whose
+# `allowed_classes` is [light] (see personal/ci-controller.yml): they can never be
+# scheduled an emulator or android job, so the SDK is pure cost -- and downloading it
+# is the least reliable part of this build. sdkmanager blocks in a socket read with
+# no timeout, which wedged the powervaro-ci provision twice with no output at all.
+# Keep the default 1 so powerserver's image is unchanged.
+ARG WITH_ANDROID=1
+
+RUN test "${WITH_ANDROID}" = "1" || exit 0; \
+    mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools" \
  && curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip" \
       -o /tmp/android-commandline-tools.zip \
  && unzip -q /tmp/android-commandline-tools.zip -d /tmp/android-commandline-tools \
@@ -74,7 +84,8 @@ RUN mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools" \
  && mv "${ANDROID_SDK_ROOT}" /opt/android-sdk-seed \
  && mkdir -p "${ANDROID_SDK_ROOT}"
 
-RUN curl -fsSL "https://github.com/mobile-dev-inc/maestro/releases/download/cli-${MAESTRO_VERSION}/maestro.zip" \
+RUN test "${WITH_ANDROID}" = "1" || exit 0; \
+    curl -fsSL "https://github.com/mobile-dev-inc/maestro/releases/download/cli-${MAESTRO_VERSION}/maestro.zip" \
       -o /tmp/maestro.zip \
  && unzip -q /tmp/maestro.zip -d /opt \
  && rm /tmp/maestro.zip \

@@ -167,6 +167,30 @@ def test_per_host_keys_override_and_the_rest_inherit(write_config) -> None:
     assert desktop.host_load_ceiling == cfg.host_load_ceiling
     assert desktop.allowed_classes == ["light"]
     assert desktop.cpu_shares == 256
+    # runner_image is omitted here, so it must fall back to the top-level image.
+    # A host silently getting None would make DockerAdapter run "None" and 404.
+    assert desktop.runner_image == cfg.runner_image
+
+
+def test_a_host_may_override_the_runner_image(write_config) -> None:
+    """A lane host runs an image built without the Android SDK it cannot schedule.
+
+    The socket proxy denies IMAGES and BUILD, so the controller can only run what
+    ansible already built there -- which for a light-only host is a different tag
+    from powerserver's. Without a per-host override the controller would name
+    powerserver's tag on a host that does not have it, 404ing every admission.
+    """
+    cfg = ControllerConfig.load(
+        write_config(
+            HOSTS_CONFIG.replace(
+                "    allowed_classes: [light]",
+                "    allowed_classes: [light]\n    runner_image: homelab/x:light",
+            )
+        )
+    )
+    assert cfg.resolved_hosts()["powervaro-ci"].runner_image == "homelab/x:light"
+    # ...and the override must not leak onto the other host.
+    assert cfg.resolved_hosts()["powerserver"].runner_image == cfg.runner_image
 
 
 def test_unknown_class_in_allowed_classes_is_rejected(write_config) -> None:

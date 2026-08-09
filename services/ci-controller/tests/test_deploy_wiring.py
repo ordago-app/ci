@@ -183,6 +183,53 @@ def test_lane_host_bind_address_comes_from_tailscaled_and_stops_the_play_when_em
     assert tasks.index(guards[0]) < render, "the guard must precede rendering .env"
 
 
+def test_lane_host_image_tag_and_runner_image_agree() -> None:
+    """The controller can only RUN an image, never build or pull one.
+
+    The lane-host proxy denies IMAGES and BUILD, so if the tag ansible builds and the
+    tag the controller names ever drift apart, every admission to that host 404s --
+    and it reads as a controller bug rather than a naming mismatch. Pin them together.
+    """
+    build = [
+        (t.get("community.docker.docker_image") or {})
+        for t in _lane_host_tasks()
+        if t.get("community.docker.docker_image")
+    ]
+    assert build, "the play must build the runner image locally"
+    built = f"{build[0]['name']}:{build[0]['tag']}"
+
+    config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
+    lane = config["hosts"]["powervaro-ci"]
+    assert lane["runner_image"] == built, (
+        f"ansible builds {built} but the controller would run {lane['runner_image']} on this host"
+    )
+
+
+def test_a_host_without_the_android_sdk_may_not_schedule_jobs_that_need_it() -> None:
+    """The light image carries no Android SDK, so its host must not allow such classes.
+
+    This is the invariant that makes the smaller image safe. `light` sets
+    SKIP_ANDROID_SDK=1 so the entrypoint never looks for the seed; any class with
+    needs_android_sdk would look, find nothing, and fail every job on the host.
+    """
+    play_build = [
+        (t.get("community.docker.docker_image") or {}).get("build", {})
+        for t in _lane_host_tasks()
+        if t.get("community.docker.docker_image")
+    ]
+    built_without_android = str(play_build[0].get("args", {}).get("WITH_ANDROID")) == "0"
+    if not built_without_android:
+        return  # the host builds the full image; nothing to constrain
+
+    config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
+    classes = config["classes"]
+    for class_name in config["hosts"]["powervaro-ci"]["allowed_classes"]:
+        assert not classes[class_name].get("needs_android_sdk", False), (
+            f"host builds the image with WITH_ANDROID=0 but allows class "
+            f"'{class_name}', which needs the Android SDK"
+        )
+
+
 def test_lane_host_playbook_creates_every_configured_work_dir() -> None:
     """The controller binds work_dirs straight into the lane container.
 

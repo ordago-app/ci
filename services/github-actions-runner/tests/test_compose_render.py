@@ -189,10 +189,14 @@ def test_every_sdkmanager_invocation_is_non_interactive():
     # No CI job builds this image (it is ~16 GB and built on the host by
     # ci-lane-host.yml), so a static check is the only guard available.
     dockerfile = (REPO_ROOT / "services/github-actions-runner/Dockerfile").read_text()
-    # Join continuations, THEN split on && -- one shell command per segment. Splitting
-    # by source line is not enough: the whole RUN is one logical line, so a single
-    # correct `yes | sdkmanager --licenses` would vouch for every other call on it.
-    logical = dockerfile.replace("\\\n", " ")
+    # Drop comments first -- the Dockerfile's own comments discuss sdkmanager, and a
+    # comment is not an invocation. Then join continuations and split on && so each
+    # segment is one shell command. Splitting by source line is not enough: the whole
+    # RUN is one logical line, so a single correct `yes | sdkmanager --licenses` would
+    # vouch for every other call on it (this test's first version did exactly that,
+    # and passed against the broken Dockerfile it was written to catch).
+    source = "\n".join(ln for ln in dockerfile.splitlines() if not ln.lstrip().startswith("#"))
+    logical = source.replace("\\\n", " ")
     commands = [seg.strip() for seg in logical.split("&&")]
     invocations = [c for c in commands if "sdkmanager" in c]
     assert invocations, "expected the image to install the Android SDK"

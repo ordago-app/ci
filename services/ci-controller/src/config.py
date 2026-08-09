@@ -58,6 +58,11 @@ class HostConfig(BaseModel):
     work_dirs: dict[str, str] | None = None
     shared_mounts: list[Mount] | None = None
     lane_env: dict[str, str] | None = None
+    # Per-host so a lane host can run an image built without the Android SDK it is
+    # not allowed to schedule anyway (see allowed_classes). The proxy denies IMAGES
+    # and BUILD, so whatever is named here must already exist on that host or every
+    # admission 404s.
+    runner_image: str | None = None
 
     def _resolve(self, top: ControllerConfig) -> HostConfig:
         return self.model_copy(
@@ -72,6 +77,9 @@ class HostConfig(BaseModel):
                 ),
                 "disk_budget_gb": (
                     top.disk_budget_gb if self.disk_budget_gb is None else self.disk_budget_gb
+                ),
+                "runner_image": (
+                    top.runner_image if self.runner_image is None else self.runner_image
                 ),
                 "host_free_ram_floor_mb": (
                     top.host_free_ram_floor_mb

@@ -120,9 +120,22 @@ trap cleanup EXIT INT TERM
 mkdir -p "${RUNNER_WORKDIR}"
 
 if [ "${SKIP_ANDROID_SDK:-0}" != "1" ] && [ ! -x "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" ]; then
+  # Images built with WITH_ANDROID=0 carry no seed (lane hosts allow only `light`,
+  # which sets SKIP_ANDROID_SDK=1 and never gets here). If an SDK-needing job ever
+  # does land on one, say so plainly -- the bare `cp` failure reads as a corrupt
+  # image rather than a job scheduled onto the wrong host.
+  # Overridable only so the tests can exercise both branches for real; the image
+  # always bakes the seed at the default path.
+  android_sdk_seed="${ANDROID_SDK_SEED:-/opt/android-sdk-seed}"
+  if [ ! -d "${android_sdk_seed}" ]; then
+    echo "::error::this runner image was built without the Android SDK (WITH_ANDROID=0)," \
+         "but the job's class needs it. Check allowed_classes and runner_image for this" \
+         "host in personal/ci-controller.yml." >&2
+    exit 1
+  fi
   echo "Seeding persistent Android SDK cache at ${ANDROID_SDK_ROOT}..."
   mkdir -p "${ANDROID_SDK_ROOT}"
-  cp -a /opt/android-sdk-seed/. "${ANDROID_SDK_ROOT}/"
+  cp -a "${android_sdk_seed}/." "${ANDROID_SDK_ROOT}/"
 fi
 
 export PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${ANDROID_SDK_ROOT}/emulator:${PATH}"

@@ -74,6 +74,43 @@ def test_spawn_light_lane(write_config) -> None:
     assert kwargs["environment"]["RUNNER_NAME"] == "powerserver-cici-42-000001"
 
 
+def test_spawn_uses_the_hosts_own_runner_image(write_config) -> None:
+    """A lane host's image is not powerserver's, so spawn must not hardcode the latter.
+
+    The lane host builds :light (no Android SDK, which its allowed_classes forbid it
+    from needing). Running the top-level :latest tag there 404s -- the proxy denies
+    IMAGES and BUILD, so the controller cannot pull or build a missing image.
+    """
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    host_config = cfg.resolved_hosts()["powerserver"].model_copy(
+        update={"runner_image": "homelab/github-actions-runner:light"}
+    )
+    adapter, client, _ = _adapter(write_config, host_config=host_config)
+    job = QueuedJob(
+        job_id=7, repo="alvaro-francisco-gil/homelab", labels=["self-hosted", "homelab"]
+    )
+    decision = AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False)
+
+    adapter.spawn(decision, registration_token="T")
+
+    args, _ = client.containers.run.call_args
+    assert args[0] == "homelab/github-actions-runner:light"
+
+
+def test_spawn_falls_back_to_the_top_level_runner_image(write_config) -> None:
+    """A host that names no image of its own runs the shared one."""
+    adapter, client, cfg = _adapter(write_config)
+    job = QueuedJob(
+        job_id=8, repo="alvaro-francisco-gil/homelab", labels=["self-hosted", "homelab"]
+    )
+    adapter.spawn(
+        AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False),
+        registration_token="T",
+    )
+    args, _ = client.containers.run.call_args
+    assert args[0] == cfg.runner_image
+
+
 def test_spawn_emulator_lane_gets_kvm(write_config) -> None:
     adapter, client, _ = _adapter(write_config)
     job = QueuedJob(
