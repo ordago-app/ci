@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import docker
 import docker.errors
+from docker.errors import DockerException
 
 from src.config import ControllerConfig, HostConfig
 from src.models import AdmitDecision
@@ -46,15 +47,32 @@ class LaneInfo:
 class DockerAdapter:
     def __init__(
         self,
-        client: docker.DockerClient,
+        client: docker.DockerClient | None,
         config: ControllerConfig,
         host: str,
         host_config: HostConfig,
+        client_factory: Callable[[str], docker.DockerClient] | None = None,
     ) -> None:
-        self._client = client
+        # Either a ready client (tests, and the single-host callers) or a factory that
+        # builds one on demand. NEVER build it eagerly in __init__: docker.DockerClient
+        # contacts the daemon in its constructor (_retrieve_server_version), so an
+        # unreachable host would raise before the controller ever reaches its health
+        # check — turning "a lane host is asleep" into "the controller crash-loops".
+        self._client_or_none = client
+        self._client_factory = client_factory
         self._config = config
         self._host = host
         self._host_config = host_config
+
+    @property
+    def _client(self) -> docker.DockerClient:
+        """Build on first use and cache. A failure is NOT cached: the next tick retries,
+        which is what lets a lane host that wakes up rejoin the pool on its own."""
+        if self._client_or_none is None:
+            if self._client_factory is None:
+                raise DockerException(f"no docker client or factory for host {self._host!r}")
+            self._client_or_none = self._client_factory(self._host_config.docker_endpoint)
+        return self._client_or_none
 
     def spawn(self, decision: AdmitDecision, registration_token: str) -> str:
         job = decision.job
@@ -180,12 +198,17 @@ class DockerPool:
         client_factory: Callable[[str], docker.DockerClient] | None = None,
     ) -> None:
         factory = client_factory or (lambda endpoint: docker.DockerClient(base_url=endpoint))
+        # Adapters are cheap and connectionless: the client behind each is built on first
+        # use. Constructing the pool must never touch the network, or a single sleeping
+        # lane host takes the whole controller down at startup — before any health check
+        # can skip it. That is the failure this pool exists to tolerate.
         self._adapters: dict[str, DockerAdapter] = {
             name: DockerAdapter(
-                client=factory(host_config.docker_endpoint),
+                client=None,
                 config=config,
                 host=name,
                 host_config=host_config,
+                client_factory=factory,
             )
             for name, host_config in config.resolved_hosts().items()
         }

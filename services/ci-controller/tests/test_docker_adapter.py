@@ -1,3 +1,4 @@
+from collections import defaultdict
 from unittest.mock import MagicMock
 
 import docker.errors
@@ -363,18 +364,20 @@ hosts:
 
 def test_docker_pool_builds_an_adapter_per_host(write_config) -> None:
     cfg = ControllerConfig.load(write_config(HOSTS_CONFIG))
-    clients = {}
+    # Pre-created, because clients are now built lazily on first use: a factory that
+    # populated `clients` on call would leave the dict empty until a host is touched.
+    clients = defaultdict(MagicMock)
 
     def factory(endpoint: str):
-        client = MagicMock()
-        clients[endpoint] = client
-        return client
+        return clients[endpoint]
 
     pool = DockerPool(cfg, client_factory=factory)
 
     assert isinstance(pool.for_host("powerserver"), DockerAdapter)
     assert isinstance(pool.for_host("powervaro-ci"), DockerAdapter)
-    assert set(clients) == {"tcp://docker-socket-proxy:2375", "tcp://100.64.0.1:2375"}
+    # An adapter per host, but no client behind any of them yet — see
+    # test_pool_construction_never_contacts_a_host for why that matters.
+    assert set(clients) == set()
 
 
 def test_docker_pool_for_host_unknown_raises_key_error(write_config) -> None:
@@ -389,12 +392,12 @@ def test_docker_pool_for_host_unknown_raises_key_error(write_config) -> None:
 
 def test_docker_pool_healthy_reports_only_hosts_that_ping(write_config) -> None:
     cfg = ControllerConfig.load(write_config(HOSTS_CONFIG))
-    clients = {}
+    # Pre-created, because clients are now built lazily on first use: a factory that
+    # populated `clients` on call would leave the dict empty until a host is touched.
+    clients = defaultdict(MagicMock)
 
     def factory(endpoint: str):
-        client = MagicMock()
-        clients[endpoint] = client
-        return client
+        return clients[endpoint]
 
     pool = DockerPool(cfg, client_factory=factory)
     clients["tcp://docker-socket-proxy:2375"].ping.return_value = True
@@ -406,12 +409,12 @@ def test_docker_pool_healthy_reports_only_hosts_that_ping(write_config) -> None:
 
 def test_docker_pool_snapshot_skips_down_hosts(write_config) -> None:
     cfg = ControllerConfig.load(write_config(HOSTS_CONFIG))
-    clients = {}
+    # Pre-created, because clients are now built lazily on first use: a factory that
+    # populated `clients` on call would leave the dict empty until a host is touched.
+    clients = defaultdict(MagicMock)
 
     def factory(endpoint: str):
-        client = MagicMock()
-        clients[endpoint] = client
-        return client
+        return clients[endpoint]
 
     pool = DockerPool(cfg, client_factory=factory)
     up = clients["tcp://docker-socket-proxy:2375"]
@@ -426,3 +429,81 @@ def test_docker_pool_snapshot_skips_down_hosts(write_config) -> None:
     assert lanes["powerserver"] == []
     # Health and lanes come from the same pass, so they can never disagree.
     assert healthy == set(lanes)
+
+
+def test_pool_construction_never_contacts_a_host(write_config) -> None:
+    """Building the pool must not touch the network.
+
+    Production incident: docker.DockerClient contacts the daemon inside its own
+    constructor (_retrieve_server_version), so building every client eagerly meant one
+    unreachable lane host raised out of DockerPool.__init__ — before the controller
+    reached the health check that exists to skip exactly that host. The controller
+    crash-looped at startup and took CI down with it. Every other test injected a fake
+    factory, so none of them ever ran the real constructor.
+    """
+    cfg = ControllerConfig.load(write_config(HOSTS_CONFIG))
+    calls: list[str] = []
+
+    def factory(endpoint: str):
+        calls.append(endpoint)
+        return MagicMock()
+
+    pool = DockerPool(cfg, client_factory=factory)
+
+    assert calls == [], "no client may be built until a host is actually used"
+
+    pool.for_host("powerserver").ping()
+    assert calls == ["tcp://docker-socket-proxy:2375"], "only the used host's client is built"
+
+
+def test_an_unreachable_host_reports_unhealthy_instead_of_raising(write_config) -> None:
+    """The real failure path, through the real default factory.
+
+    A host whose name does not resolve must degrade to ping()==False, not an exception.
+    `.invalid` is reserved by RFC 2606 and can never resolve, so this needs no network.
+    """
+    cfg = ControllerConfig.load(
+        write_config(
+            HOSTS_CONFIG.replace(
+                "tcp://100.64.0.1:2375", "tcp://powervaro-ci.does-not-exist.invalid:2375"
+            )
+        )
+    )
+
+    pool = DockerPool(cfg)  # no factory: the real docker.DockerClient path
+
+    healthy, lanes = pool.snapshot()
+    assert "powervaro-ci" not in healthy
+    assert "powervaro-ci" not in lanes
+
+
+def test_a_host_that_wakes_up_rejoins_the_pool_on_a_later_tick(write_config) -> None:
+    """A failed client build must NOT be cached — the whole point of an opportunistic host.
+
+    The desktop is expected to sleep and wake. If the first failed construction were
+    remembered, that host would report unhealthy forever and only a controller restart
+    would recover it — silently converting "the desktop was asleep for an hour" into
+    "the second host never comes back". Lazy construction alone does not guarantee this:
+    an implementation that stored the failure would pass every other test here.
+    """
+    cfg = ControllerConfig.load(write_config(HOSTS_CONFIG))
+    live = MagicMock()
+    live.ping.return_value = True
+    live.containers.list.return_value = []
+    asleep = {"desktop": True}
+
+    def factory(endpoint: str):
+        if endpoint == "tcp://100.64.0.1:2375" and asleep["desktop"]:
+            raise docker.errors.DockerException("host is asleep")
+        return live
+
+    pool = DockerPool(cfg, client_factory=factory)
+
+    healthy, _lanes = pool.snapshot()
+    assert "powervaro-ci" not in healthy, "asleep host must be unhealthy"
+
+    asleep["desktop"] = False  # the desktop wakes up
+    healthy, lanes = pool.snapshot()
+
+    assert "powervaro-ci" in healthy, "a woken host must rejoin without a controller restart"
+    assert lanes["powervaro-ci"] == []

@@ -1,3 +1,4 @@
+from collections import defaultdict
 from unittest.mock import MagicMock
 
 import pytest
@@ -477,13 +478,13 @@ def test_health_and_lane_listing_come_from_one_observation(write_config) -> None
     from src.docker_adapter import DockerPool
 
     cfg = _Config.load(write_config(MULTI_HOST_CONFIG))
-    clients = {}
+    # Pre-created: clients are built lazily on first use, so a factory that populated
+    # this dict on call would leave it empty at configure time.
+    clients = defaultdict(MagicMock)
 
     def _factory(endpoint):
-        client = MagicMock()
-        client.ping.return_value = True
-        clients[endpoint] = client
-        return client
+        clients[endpoint].ping.return_value = True
+        return clients[endpoint]
 
     pool = DockerPool(cfg, client_factory=_factory)
     # The desktop answers ping but cannot list: exactly the inconsistent middle state.
