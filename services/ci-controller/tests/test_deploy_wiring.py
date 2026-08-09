@@ -277,35 +277,43 @@ def test_documented_provisioning_sequence_installs_the_lane_plays_prerequisites(
     assert "base.yml" in ps1, "the distro script's printed next steps must include base.yml"
 
 
-def test_lane_host_restricts_the_socket_proxy_at_the_firewall() -> None:
-    """The bind address alone does NOT restrict 2375 on a mirrored-networking host.
+def test_lane_host_firewall_survives_a_reboot() -> None:
+    """The restriction must be boot-restored, not a one-shot live iptables mutation.
 
-    Every WSL distro shares one namespace there, and a lane container can route out
-    through the docker bridge — so the dev distro, anything on Windows, and PR code
-    running in a lane could all reach an unauthenticated container-create API and become
-    root on the lane host. The restriction has to be enforced on the host (DOCKER-USER),
-    not assumed from the Tailscale ACL. See ADR 0016 decision 7.
+    iptables rules are runtime state and docker restarts the `unless-stopped` proxy on
+    boot, so a deploy-time-only rule leaves 2375 unfiltered after every WSL restart until
+    someone re-runs the play — an unnoticed hole in the thing called a trust boundary.
     """
-    rules = [
-        t.get("ansible.builtin.iptables")
-        for t in _lane_host_tasks()
-        if t.get("ansible.builtin.iptables")
-    ]
-    on_2375 = [r for r in rules if str(r.get("destination_port")) == "2375"]
-    assert len(on_2375) >= 2, "expected an allow rule and a catch-all deny on 2375"
+    by_dest = {}
+    for task in _lane_host_tasks():
+        copy = task.get("ansible.builtin.copy") or task.get("copy")
+        if copy and "dest" in copy:
+            by_dest[copy["dest"]] = copy.get("content", "")
 
-    allow = [r for r in on_2375 if r.get("jump") == "RETURN"]
-    deny = [r for r in on_2375 if r.get("jump") == "DROP"]
-    assert allow, "the controller must be permitted explicitly"
-    assert deny, "everything else must be dropped — an allow-only rule restricts nothing"
-    assert all(r.get("chain") == "DOCKER-USER" for r in on_2375), (
-        "must live in DOCKER-USER: it is consulted before docker's own FORWARD rules "
-        "and survives container restarts"
-    )
-    assert allow[0].get("source"), "the allow rule must be scoped to a source address"
-    # Ordering is load-bearing: the allow is inserted, the deny appended.
-    assert allow[0].get("action") == "insert"
-    assert deny[0].get("action") == "append"
+    script = by_dest.get("/usr/local/sbin/ci-lane-firewall.sh")
+    unit = by_dest.get("/etc/systemd/system/ci-lane-firewall.service")
+    assert script is not None, "the rules need one definition, in a script"
+    assert unit is not None, "the rules need a boot-time restore unit"
+
+    # Both directions: an allow-only rule restricts nothing.
+    assert "-j RETURN" in script, "the controller must be permitted explicitly"
+    assert "-j DROP" in script, "everything else forwarded must be dropped"
+    assert "DOCKER-USER" in script
+    assert "-I DOCKER-USER 1" in script, "the allow must precede the catch-all deny"
+
+    # Idempotent: re-running must not stack duplicate rules.
+    assert script.count("-D DOCKER-USER") >= 2, "each rule must be deleted before it is added"
+
+    # docker rebuilds its chains on start, so ordering after it is load-bearing.
+    assert "After=docker.service" in unit
+    assert "WantedBy=multi-user.target" in unit, "must actually be enabled at boot"
+
+    enabled = [
+        (t.get("ansible.builtin.systemd") or t.get("systemd") or {}) for t in _lane_host_tasks()
+    ]
+    assert any(
+        u.get("name") == "ci-lane-firewall.service" and u.get("enabled") is True for u in enabled
+    ), "the unit must be enabled, or it never runs at boot"
 
 
 def test_lane_host_endpoint_and_ssh_port_agree_with_the_inventory() -> None:
