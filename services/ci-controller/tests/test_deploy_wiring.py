@@ -550,3 +550,75 @@ def test_ci_status_script_reports_each_host_and_a_correct_total() -> None:
     assert "6/5" not in out, "the misleading aggregate-vs-one-ceiling line must be gone"
     # An unhealthy host receives no work, which is indistinguishable from an idle pool.
     assert "UNHEALTHY" in out, "an unhealthy host must be called out, not silently idle"
+
+
+def test_jobs_reaching_in_cluster_services_are_pinned_to_the_host_running_them() -> None:
+    """A lane host creates the `homelab` network but nothing runs on it.
+
+    So a job that curls a service by container name (`http://github-review:8000`)
+    resolves only on the host where that container lives. Every lane used to run on
+    powerserver, so the coupling existed but was never exercised; with a second host
+    the job fails with "could not reach github-review" whenever it lands there.
+
+    `allowed_classes` is the only per-host placement control, so such a job must map to
+    a class no lane host allows. Reimplements `class_for`'s first-match-in-runs-on-order
+    semantics, because that ordering is exactly how this silently regresses: adding the
+    generic label alongside the specific one makes the generic one win.
+    """
+    import re
+
+    config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
+    default_host = config["default_host"]
+    all_classes = set(config["classes"])
+
+    # Every class any NON-default host would accept.
+    off_default: set[str] = set()
+    for name, host in config["hosts"].items():
+        if name == default_host:
+            continue
+        allowed = host.get("allowed_classes")
+        off_default |= all_classes if allowed is None else set(allowed)
+
+    label_class = next(r["label_class"] for r in config["repos"] if r["repo"].endswith("/homelab"))
+    # A dotted host is a real DNS name; a bare one is a docker-network alias.
+    in_cluster = re.compile(r"http://(?!localhost|127\.0\.0\.1)[a-z0-9-]+:\d+")
+
+    checked = 0
+    for workflow in sorted((REPO / ".github" / "workflows").glob("*.yml")):
+        text = workflow.read_text()
+        if not in_cluster.search(text):
+            continue
+        for job_name, job in yaml.safe_load(text)["jobs"].items():
+            runs_on = job.get("runs-on")
+            if not isinstance(runs_on, list):
+                continue
+            resolved = next((label_class[x] for x in runs_on if x in label_class), None)
+            assert resolved is not None, (
+                f"{workflow.name}:{job_name} reaches an in-cluster service but its "
+                f"runs-on {runs_on} maps to no class"
+            )
+            assert resolved not in off_default, (
+                f"{workflow.name}:{job_name} reaches an in-cluster service but resolves "
+                f"to class {resolved!r}, which a lane host accepts — it will fail there"
+            )
+            checked += 1
+
+    assert checked, "no workflow matched; the guard would pass vacuously"
+
+
+def test_every_controller_label_is_registered_with_actionlint() -> None:
+    """actionlint rejects an unknown self-hosted label, failing the whole workflow lint.
+
+    A label added to the controller's map but not here fails CI with a message about
+    runs-on rather than about the controller, so the two lists must be kept together.
+    Cheap to assert; it cost a full CI round-trip to learn the hard way.
+    """
+    config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
+    homelab = next(r for r in config["repos"] if r["repo"].endswith("/homelab"))
+    known = set(
+        yaml.safe_load((REPO / ".github" / "actionlint.yaml").read_text())["self-hosted-runner"][
+            "labels"
+        ]
+    )
+    missing = set(homelab["label_class"]) - known
+    assert not missing, f"labels used by homelab jobs but unknown to actionlint: {sorted(missing)}"
