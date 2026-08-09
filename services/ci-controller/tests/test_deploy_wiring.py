@@ -747,6 +747,49 @@ def test_jobs_reaching_in_cluster_services_are_pinned_to_the_host_running_them()
     assert checked, "no workflow matched; the guard would pass vacuously"
 
 
+def test_the_shared_review_workflow_resolves_in_every_configured_repo() -> None:
+    """`request-review.yml` is a reusable workflow other repos call cross-repo.
+
+    Its jobs run under the CALLING repo, so `runs-on: [self-hosted, homelab-services]`
+    is looked up in that repo's `label_class` — not homelab's. The test above guards
+    homelab's own workflows; this one guards the repos that borrow this one, whose
+    workflows do not live in this repo and so cannot be scanned.
+
+    Unmapped, `class_for` falls through to `default_class` (light), which every lane
+    host accepts — and there `http://github-review:8000` resolves to nothing, so the
+    job fails with "could not reach github-review" only when it happens to land off
+    powerserver. Intermittent by construction, which is why it wants a test.
+    """
+    config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
+    default_host = config["default_host"]
+    all_classes = set(config["classes"])
+
+    off_default: set[str] = set()
+    for name, host in config["hosts"].items():
+        if name == default_host:
+            continue
+        allowed = host.get("allowed_classes")
+        off_default |= all_classes if allowed is None else set(allowed)
+
+    shared = yaml.safe_load((REPO / ".github" / "workflows" / "request-review.yml").read_text())
+    assert "workflow_call" in (shared.get("on") or shared.get(True)), (
+        "this guard only applies while request-review.yml is reusable"
+    )
+    runs_on = shared["jobs"]["request-review"]["runs-on"]
+
+    for repo in config["repos"]:
+        label_class = repo["label_class"]
+        resolved = next((label_class[x] for x in runs_on if x in label_class), None)
+        assert resolved is not None, (
+            f"{repo['repo']} maps none of {runs_on} — a request-review job there would "
+            f"take the default class and could land on a lane host"
+        )
+        assert resolved not in off_default, (
+            f"{repo['repo']} resolves {runs_on} to class {resolved!r}, which a lane host "
+            f"accepts — the review call will fail whenever it lands there"
+        )
+
+
 def test_every_controller_label_is_registered_with_actionlint() -> None:
     """actionlint rejects an unknown self-hosted label, failing the whole workflow lint.
 
