@@ -5,13 +5,12 @@ import logging
 import os
 from pathlib import Path
 
-import docker
 import uvicorn
 
 from src.api import create_app
 from src.config import ControllerConfig
 from src.controller import Controller
-from src.docker_adapter import DockerAdapter
+from src.docker_adapter import DockerPool
 from src.github_adapter import GitHubAdapter
 from src.host_stats import read_host_stats
 from src.ledger import Ledger
@@ -32,9 +31,10 @@ def main() -> None:
     )
     poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
     host = os.environ.get("RUNNER_HOST", "powerserver")
-    proxy_url = os.environ.get("DOCKER_PROXY_URL", "tcp://docker-socket-proxy:2375")
 
     config = ControllerConfig.load(config_path)
+    if host not in config.resolved_hosts():
+        raise SystemExit(f"RUNNER_HOST '{host}' is not a configured host")
 
     private_key = base64.b64decode(_require("GITHUB_RUNNER_APP_PRIVATE_KEY_B64")).decode()
     github = GitHubAdapter(
@@ -42,14 +42,16 @@ def main() -> None:
         installation_id=_require("GITHUB_RUNNER_APP_INSTALLATION_ID"),
         private_key_pem=private_key,
     )
-    docker_client = docker.DockerClient(base_url=proxy_url)
-    docker_adapter = DockerAdapter(client=docker_client, config=config, host=host)
+    # One DockerAdapter per configured host, each dialing its own docker_endpoint
+    # (resolved_hosts() falls back to DOCKER_PROXY_URL when `hosts:` is absent, so
+    # a single-host deploy stays wired exactly as before per-host config existed).
+    docker_pool = DockerPool(config)
 
     metrics = MetricsStore(os.environ.get("CI_CONTROLLER_DB", "/var/lib/ci-controller/metrics.db"))
     controller = Controller(
         config=config,
         github=github,
-        docker=docker_adapter,
+        docker=docker_pool,
         ledger=Ledger(),
         metrics=metrics,
         host_stats_reader=read_host_stats,

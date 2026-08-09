@@ -112,6 +112,69 @@ def test_admission_mode_defaults_and_validates(write_config) -> None:
         ControllerConfig.load(write_config(bad))
 
 
+def test_absent_hosts_key_synthesises_one_host_from_the_top_level(write_config) -> None:
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    hosts = cfg.resolved_hosts()
+    assert list(hosts) == ["powerserver"]
+    only = hosts["powerserver"]
+    assert only.ram_budget_mb == cfg.ram_budget_mb
+    assert only.max_concurrent_lanes == cfg.max_concurrent_lanes
+    assert only.work_dirs == cfg.work_dirs
+    assert only.disk_budget_gb == cfg.disk_budget_gb
+    assert only.host_free_ram_floor_mb == cfg.host_free_ram_floor_mb
+    assert only.allowed_classes == sorted(cfg.classes)  # omitted => every class
+    assert only.cpu_shares is None  # omitted => docker's default weight
+
+
+HOSTS_CONFIG = (
+    VALID_CONFIG
+    + """
+default_host: powerserver
+hosts:
+  powerserver:
+    docker_endpoint: tcp://docker-socket-proxy:2375
+  powervaro-ci:
+    docker_endpoint: tcp://powervaro-ci.REDACTED-PERSONAL-TAILNET.ts.net:2375
+    allowed_classes: [light]
+    cpu_shares: 256
+    max_concurrent_lanes: 3
+    host_free_ram_floor_mb: 8000
+    work_dirs:
+      ssd: /var/lib/ci-lanes
+      hdd: /var/lib/ci-lanes
+"""
+)
+
+
+def test_per_host_keys_override_and_the_rest_inherit(write_config) -> None:
+    cfg = ControllerConfig.load(write_config(HOSTS_CONFIG))
+    desktop = cfg.resolved_hosts()["powervaro-ci"]
+    assert desktop.max_concurrent_lanes == 3  # overridden
+    assert desktop.host_free_ram_floor_mb == 8000  # overridden
+    assert desktop.ram_budget_mb == cfg.ram_budget_mb  # inherited
+    assert desktop.host_load_ceiling == cfg.host_load_ceiling
+    assert desktop.allowed_classes == ["light"]
+    assert desktop.cpu_shares == 256
+
+
+def test_unknown_class_in_allowed_classes_is_rejected(write_config) -> None:
+    bad = (
+        VALID_CONFIG
+        + """
+hosts:
+  powerserver: {docker_endpoint: "tcp://p:2375", allowed_classes: [nope]}
+"""
+    )
+    with pytest.raises(ConfigError):
+        ControllerConfig.load(write_config(bad))
+
+
+def test_default_host_must_be_in_the_hosts_map(write_config) -> None:
+    bad = HOSTS_CONFIG.replace("default_host: powerserver", "default_host: ghost")
+    with pytest.raises(ConfigError):
+        ControllerConfig.load(write_config(bad))
+
+
 OPERATOR_CONFIG = Path(__file__).resolve().parents[3] / "personal" / "ci-controller.yml"
 
 

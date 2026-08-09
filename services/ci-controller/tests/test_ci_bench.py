@@ -399,6 +399,113 @@ def test_adopted_lanes_are_not_counted_as_infra_failures(tmp_path) -> None:
     store.close()
 
 
+def test_infra_failures_counts_the_explicit_sentinel_too(tmp_path) -> None:
+    """Task 13 emits conclusion='infra_failure' when a lane's host disappears mid-job.
+    infra_failures() must count that sentinel alongside a NULL conclusion, or the exact
+    events this section exists to surface stay invisible in the report."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=2,
+        repo="o/r",
+        ts=2.0,
+        config_version="v",
+        class_name="light",
+        conclusion=None,
+    )
+    store.record_event(
+        kind="reap",
+        job_id=3,
+        repo="o/r",
+        ts=3.0,
+        config_version="v",
+        class_name="light",
+        conclusion="infra_failure",
+    )
+    assert infra_failures(store.conn) == 2  # job 2 (NULL) and job 3 (sentinel)
+    store.close()
+
+
+def test_infra_failure_sentinel_still_respects_the_conclusion_validity_floor(tmp_path) -> None:
+    """Pre-deploy rows (conclusion NULL because the column didn't exist yet) must stay
+    excluded even now that the predicate also matches the 'infra_failure' sentinel."""
+    store = _store(tmp_path)
+    for job_id in (1, 2):
+        store.record_event(
+            kind="reap",
+            job_id=job_id,
+            repo="o/r",
+            ts=float(job_id),
+            config_version="v",
+            class_name="light",
+        )  # pre-deploy: conclusion NULL because the column didn't exist yet
+    store.record_event(
+        kind="reap",
+        job_id=4,
+        repo="o/r",
+        ts=100.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=5,
+        repo="o/r",
+        ts=101.0,
+        config_version="v",
+        class_name="light",
+        conclusion="infra_failure",
+    )
+    # Naive counting (no floor) would give 3 (jobs 1, 2, 5). Only job 5 is real.
+    assert infra_failures(store.conn) == 1
+    store.close()
+
+
+def test_infra_failure_sentinel_does_not_pull_in_adopted_or_lookup_failed(tmp_path) -> None:
+    """The 'adopted' and 'lookup_failed' sentinels must stay excluded even though the
+    predicate now matches a third sentinel string."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="(adopted)",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="adopted",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=2,
+        repo="o/r",
+        ts=2.0,
+        config_version="v",
+        class_name="light",
+        conclusion="lookup_failed",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=3,
+        repo="o/r",
+        ts=3.0,
+        config_version="v",
+        class_name="light",
+        conclusion="infra_failure",
+    )
+    assert infra_failures(store.conn) == 1  # only job 3
+    store.close()
+
+
 def test_report_states_the_peak_validity_window(tmp_path) -> None:
     store = _store(tmp_path)
     store.record_event(
@@ -605,6 +712,149 @@ def test_report_includes_host_section_when_multiple_hosts_present(tmp_path) -> N
         )
     report = render_report(store.conn)
     assert "powerserver" in report and "second-host" in report
+    store.close()
+
+
+def test_host_section_shows_admits_per_host(tmp_path) -> None:
+    """The two numbers a second host is bought to move: admits and binding gates."""
+    store = _store(tmp_path)
+    for job_id, host in ((1, "powerserver"), (2, "second-host")):
+        store.record_event(
+            kind="admit",
+            job_id=job_id,
+            repo="o/r",
+            ts=1.0,
+            config_version="v",
+            class_name="light",
+            host=host,
+        )
+        store.record_event(
+            kind="reap",
+            job_id=job_id,
+            repo="o/r",
+            ts=2.0,
+            config_version="v",
+            class_name="light",
+            conclusion="success",
+            host=host,
+        )
+    report = render_report(store.conn)
+    assert "| host | reaped jobs | admits | infra failures |" in report
+    assert "| powerserver | 1 | 1 | 0 |" in report
+    assert "| second-host | 1 | 1 | 0 |" in report
+    store.close()
+
+
+def test_host_section_counts_the_infra_failure_sentinel_per_host(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="infra_failure",
+        host="second-host",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=2,
+        repo="o/r",
+        ts=2.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        host="powerserver",
+    )
+    report = render_report(store.conn)
+    assert "| second-host | 1 | 0 | 1 |" in report
+    assert "| powerserver | 1 | 0 | 0 |" in report
+    store.close()
+
+
+def test_host_binding_gate_table_reuses_the_reasons_floor(tmp_path) -> None:
+    """A per-host gate table built from pre-fix (pre-floor) rows would reintroduce
+    exactly the masking bias this plan exists to remove — it must share
+    _binding_window() with the fleet-wide table, not compute its own window."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=100,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        host="powerserver",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=101,
+        repo="o/r",
+        ts=2.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        host="second-host",
+    )
+    # Pre-floor: masked historical row on second-host, reasons NULL.
+    store.record_event(
+        kind="defer",
+        job_id=1,
+        repo="o/r",
+        ts=10.0,
+        config_version="v",
+        reason="disk_full",
+        host="second-host",
+    )
+    # At/after the floor: a real multi-gate row on powerserver.
+    store.record_event(
+        kind="defer",
+        job_id=2,
+        repo="o/r",
+        ts=20.0,
+        config_version="v",
+        reason="lane_ceiling",
+        reasons="lane_ceiling,budget_full",
+        host="powerserver",
+    )
+    report = render_report(store.conn)
+    assert "disk_full" not in report  # pre-floor row excluded from the per-host table too
+    assert "| powerserver | lane_ceiling |" in report
+    assert "| powerserver | budget_full |" in report
+    assert "second-host | disk_full" not in report
+    store.close()
+
+
+def test_host_binding_gate_subtable_omitted_with_the_fleet_wide_wording(tmp_path) -> None:
+    """When no post-floor rows exist, the sub-table is omitted with the SAME
+    explanatory line the fleet-wide gate table already uses — not a re-derived one."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        host="powerserver",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=2,
+        repo="o/r",
+        ts=2.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        host="second-host",
+    )
+    report = render_report(store.conn)
+    assert "### Binding Gates by Host" in report
+    # The exact fleet-wide wording appears twice: once for the fleet table, once here.
+    assert report.count("no defer row in this database has") == 2
     store.close()
 
 

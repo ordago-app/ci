@@ -78,3 +78,33 @@ def test_add_duplicate_lane_id_rejected() -> None:
     led.add(_res("a", 1))
     with pytest.raises(ValueError, match="already"):
         led.add(_res("a", 2))
+
+
+def test_per_host_totals_are_separate_but_has_job_is_global() -> None:
+    led = Ledger()
+    led.add(
+        Reservation(
+            lane_id="a",
+            job_id=1,
+            repo="r",
+            class_name="light",
+            ram_mb=700,
+            needs_kvm=False,
+            host="powerserver",
+        )
+    )
+    led.add(
+        Reservation(
+            lane_id="b",
+            job_id=2,
+            repo="r",
+            class_name="light",
+            ram_mb=700,
+            needs_kvm=False,
+            host="powervaro-ci",
+        )
+    )
+    assert led.total_ram() == 1400
+    assert led.total_ram(host="powerserver") == 700
+    assert led.lane_count(host="powervaro-ci") == 1
+    assert led.has_job(1) and led.has_job(2)  # global: no host filter exists

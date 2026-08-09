@@ -309,7 +309,13 @@ def infra_failures(
     since: float | None = None,
     config_version: str | None = None,
 ) -> int | None:
-    """Reap events with no conclusion — the job genuinely reached no terminal outcome.
+    """Reap events that never reached a terminal GitHub conclusion.
+
+    Two shapes count: a NULL conclusion (the controller looked up the job and
+    GitHub reported nothing terminal) and the explicit `'infra_failure'` sentinel
+    (Task 13 — the controller reaped the lane without even attempting a lookup,
+    because the lane's host had already disappeared mid-job). Counting only NULL
+    would make Task 13's whole reason for existing invisible in this report.
 
     Counted only at or after `_conclusion_validity_floor()`: rows older than
     that are NULL because the `conclusion` column did not exist yet, not
@@ -319,8 +325,9 @@ def infra_failures(
 
     "Lookup failed" (exception swallowed) and "adopted" (lookup skipped, no
     repo to query) are written as distinct sentinel strings by the
-    controller — see lookup_failures() — so a NULL conclusion here means
-    only "genuinely no terminal conclusion", never "we don't know".
+    controller — see lookup_failures() — so this predicate must not match them:
+    only NULL and the 'infra_failure' sentinel mean "genuinely no terminal
+    conclusion", never "we don't know" or "this lane was adopted, not reaped".
 
     Returns None if the validity floor cannot be derived (see
     _conclusion_validity_floor) — reporting 0 would misrepresent "cannot
@@ -334,7 +341,8 @@ def infra_failures(
         return None
     sql = (
         "SELECT COUNT(DISTINCT job_id) AS n FROM events "
-        "WHERE kind='reap' AND conclusion IS NULL AND ts >= ?"
+        "WHERE kind='reap' AND (conclusion IS NULL OR conclusion = 'infra_failure') "
+        "AND ts >= ?"
     )
     params: list[float | str] = [floor]
     if since is not None:
@@ -433,21 +441,36 @@ def _host_summary(
 ) -> dict[str, dict[str, int | None]]:
     """Distinct reaped jobs and infra failures per host, for the per-host section.
 
-    Only called once _distinct_hosts() has confirmed `host` exists. If
-    `conclusion` is also missing (an unlikely partial-migration state, since
-    metrics.py adds both columns in the same pass), infra_failures per host
-    is reported as None rather than a wrong 0 — same reasoning as
+    Only called once _distinct_hosts() has confirmed `host` exists. An infra
+    failure here uses the same two-shape predicate as infra_failures() — a NULL
+    conclusion OR the explicit 'infra_failure' sentinel (Task 13, emitted when a
+    lane's host disappears mid-job) — and is gated behind the same
+    _conclusion_validity_floor(). Without that floor, the ~4,000 pre-migration
+    reap rows (conclusion NULL because the column didn't exist yet, not because
+    anything failed) would all read as infra failures the first time a second
+    host makes this table render at all.
+
+    If `conclusion` is missing entirely (an unlikely partial-migration state,
+    since metrics.py adds both columns in the same pass) or the floor cannot
+    yet be derived (deployed, but no reap has landed since), infra_failures
+    per host is reported as None rather than a wrong 0 — same reasoning as
     infra_failures() above.
     """
     has_conclusion = "conclusion" in available_columns(conn)
-    infra_expr = (
-        "COUNT(DISTINCT CASE WHEN conclusion IS NULL THEN job_id END)" if has_conclusion else "NULL"
-    )
+    floor = _conclusion_validity_floor(conn) if has_conclusion else None
+    params: list[float] = []
+    if floor is not None:
+        infra_expr = (
+            "COUNT(DISTINCT CASE WHEN (conclusion IS NULL OR conclusion = 'infra_failure') "
+            "AND ts >= ? THEN job_id END)"
+        )
+        params.append(floor)
+    else:
+        infra_expr = "NULL"
     sql = (
         f"SELECT host, COUNT(DISTINCT job_id) AS jobs, {infra_expr} AS infra_failures "
         "FROM events WHERE kind='reap' AND host IS NOT NULL"
     )
-    params: list[float] = []
     if since is not None:
         sql += " AND ts > ?"
         params.append(since)
@@ -456,6 +479,50 @@ def _host_summary(
         row["host"]: {"jobs": row["jobs"], "infra_failures": row["infra_failures"]}
         for row in _rows(conn, sql, params)
     }
+
+
+def _host_admits(conn: sqlite3.Connection, since: float | None) -> dict[str, int]:
+    """Distinct admitted jobs per host — one of the two numbers a second host is
+    bought to move (the other is _host_binding_gate_counts())."""
+    sql = (
+        "SELECT host, COUNT(DISTINCT job_id) AS n FROM events "
+        "WHERE kind='admit' AND host IS NOT NULL"
+    )
+    params: list[float] = []
+    if since is not None:
+        sql += " AND ts > ?"
+        params.append(since)
+    sql += " GROUP BY host"
+    return {row["host"]: row["n"] for row in _rows(conn, sql, params)}
+
+
+def _host_binding_gate_counts(
+    conn: sqlite3.Connection, since: float | None
+) -> dict[str, dict[str, int]]:
+    """Per-host binding-gate counts — the masking-corrected view, broken down by host.
+
+    Mirrors binding_gate_counts()'s logic (the reasons/reason fallback, the
+    already_running exclusion, the distinct-job dedup) but groups by host. The
+    caller MUST pass `since` from _binding_window(), the same reasons-validity
+    floor the fleet-wide table uses — a per-host table built from pre-fix rows
+    would reintroduce exactly the masking bias this plan exists to remove.
+    """
+    has_reasons = "reasons" in available_columns(conn)
+    select = "host, job_id, reason, reasons" if has_reasons else "host, job_id, reason"
+    sql = f"SELECT {select} FROM events WHERE kind='defer' AND host IS NOT NULL"
+    params: list[float] = []
+    if since is not None:
+        sql += " AND ts > ?"
+        params.append(since)
+    seen: dict[str, dict[str, set[int]]] = {}
+    for row in _rows(conn, sql, params):
+        reasons_val = row["reasons"] if has_reasons else None
+        gates = (reasons_val or row["reason"] or "").split(",")
+        host = row["host"]
+        for gate in gates:
+            if gate and gate not in EXCLUDED_REASONS:
+                seen.setdefault(host, {}).setdefault(gate, set()).add(row["job_id"])
+    return {host: {gate: len(jobs) for gate, jobs in gates.items()} for host, gates in seen.items()}
 
 
 def _effective_since(since: float | None, floor: float) -> float:
@@ -506,6 +573,26 @@ def _split_by_eligibility(counts: dict[str, int]) -> tuple[dict[str, int], dict[
     return capacity, eligibility
 
 
+def _binding_unavailable_note() -> list[str]:
+    """The explanatory line shown wherever a binding-gate view cannot be rendered.
+
+    Shared verbatim by the fleet-wide Admission Gates section and the per-host
+    Binding Gates by Host sub-table, so a reader sees one consistent explanation
+    rather than two independently-worded (and possibly drifting) ones.
+    """
+    return [
+        "**Binding-gate counts are unavailable: no defer row in this database has "
+        "recorded `reasons` yet.** Either the column predates the additive migration on "
+        "the controller's write path (see `services/ci-controller/src/metrics.py`), or the "
+        "migration has run but the multi-gate controller has not yet deferred a job. The "
+        "corrected, masking-free view cannot be shown yet; showing the primary-reason "
+        "count in its place would understate the masking bias as zero, which is the wrong "
+        "conclusion. Historical rows keep `reasons` NULL by design (no backfill), so this "
+        "fills in as new defer events accumulate post-deploy.",
+        "",
+    ]
+
+
 def _render_gate_table(
     primary: dict[str, int], binding: dict[str, int], binding_available: bool = True
 ) -> list[str]:
@@ -516,6 +603,18 @@ def _render_gate_table(
     for gate in gates:
         binding_cell = str(binding.get(gate, 0)) if binding_available else "unavailable"
         lines.append(f"| {gate} | {primary.get(gate, 0)} | {binding_cell} |")
+    return lines
+
+
+def _render_host_binding_gates(host_gates: dict[str, dict[str, int]]) -> list[str]:
+    """Render the per-host binding-gate breakdown. Caller must have already windowed
+    `host_gates` to _binding_window()'s floor — this function only formats."""
+    if not host_gates:
+        return ["No defer events with a recorded host at or after the reasons validity floor."]
+    lines = ["| host | gate | binding-gate jobs |", "| --- | --- | ---: |"]
+    for host in sorted(host_gates):
+        for gate, n in sorted(host_gates[host].items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"| {host} | {gate} | {n} |")
     return lines
 
 
@@ -590,17 +689,7 @@ def render_report(
     )
     lines.append("")
     if reasons_floor is None:
-        lines.append(
-            "**Binding-gate counts are unavailable: no defer row in this database has "
-            "recorded `reasons` yet.** Either the column predates the additive migration on "
-            "the controller's write path (see `services/ci-controller/src/metrics.py`), or the "
-            "migration has run but the multi-gate controller has not yet deferred a job. The "
-            "corrected, masking-free view cannot be shown yet; showing the primary-reason "
-            "count in its place would understate the masking bias as zero, which is the wrong "
-            "conclusion. Historical rows keep `reasons` NULL by design (no backfill), so this "
-            "fills in as new defer events accumulate post-deploy."
-        )
-        lines.append("")
+        lines += _binding_unavailable_note()
     else:
         lines.append(
             f"**Both columns cover defers at or after {_fmt_ts(reasons_floor)}**, the earliest "
@@ -676,13 +765,29 @@ def render_report(
         lines.append("## Per-Host Breakdown")
         lines.append("")
         summary = _host_summary(conn, since=since)
-        lines.append("| host | reaped jobs | infra failures |")
-        lines.append("| --- | ---: | ---: |")
+        host_admits = _host_admits(conn, since=since)
+        lines.append("| host | reaped jobs | admits | infra failures |")
+        lines.append("| --- | ---: | ---: | ---: |")
         for host in sorted(summary):
             stats = summary[host]
             lines.append(
-                f"| {host} | {stats['jobs']} | {_fmt_infra_failures(stats['infra_failures'])} |"
+                f"| {host} | {stats['jobs']} | {host_admits.get(host, 0)} "
+                f"| {_fmt_infra_failures(stats['infra_failures'])} |"
             )
+        lines.append("")
+        lines.append("### Binding Gates by Host")
+        lines.append("")
+        # Reuse the SAME reasons-validity floor as the fleet-wide gate table — a
+        # per-host table built from pre-fix rows would reintroduce exactly the
+        # masking bias this report exists to remove.
+        host_gate_since, host_binding_available = _binding_window(conn, since)
+        if not host_binding_available:
+            lines += _binding_unavailable_note()
+        else:
+            lines += _render_host_binding_gates(
+                _host_binding_gate_counts(conn, since=host_gate_since)
+            )
+            lines.append("")
 
     return "\n".join(lines) + "\n"
 
