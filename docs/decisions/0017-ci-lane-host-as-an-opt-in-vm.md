@@ -133,10 +133,23 @@ the dev distro; the disk half of that contributed to `C:` reaching 98% full and 
 
 ## Consequences
 
-- **Capacity is now discontinuous.** The pool is 5 lanes normally and 7 when lent.
+- **Capacity is now discontinuous.** The pool is 5 lanes normally and 13 when lent
+  (the lent share was 2 as first shipped; the VM was later sized to 8 GB and its cap
+  raised to 8, since RAM is committed per running VM and not per lane — an idle VM
+  holds its whole assignment, so a small cap bought nothing back).
   `make ci-report` will show what the host actually contributed; if that is
   negligible, the honest conclusion is that opt-in capacity is not worth having
   and ADR 0012's "replace `powerserver`" is the real answer.
+
+- **The proxy's bind address is a boot-ordering dependency.** It publishes on the
+  host's *tailnet* address, which does not exist when docker starts, so docker's
+  own `restart: unless-stopped` loses the race and gives up — leaving the host
+  reachable at the tailnet layer but with nothing on 2375. It then reads
+  `UNHEALTHY`, which is also exactly what a *stopped* VM reads as, so the
+  operator's one signal cannot tell "lent, but broken" from "not lent". That
+  ambiguity, not the bind failure, is why this needed `ci-lane-proxy.service`
+  rather than a runbook note. Anything else that comes to depend on the tailnet
+  address inherits the same problem.
 
 - **Genuinely isolated now:** kernel, network namespace, RAM, disk. The
   `DOCKER-USER` restriction means what it says — ADR 0016 decision 7 had to
