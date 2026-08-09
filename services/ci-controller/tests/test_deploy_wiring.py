@@ -627,3 +627,52 @@ def test_every_controller_label_is_registered_with_actionlint() -> None:
     )
     missing = set(homelab["label_class"]) - known
     assert not missing, f"labels used by homelab jobs but unknown to actionlint: {sorted(missing)}"
+
+
+def test_ci_status_script_names_the_skew_against_an_older_controller() -> None:
+    """The script is piped from a checkout into whatever controller is deployed, so
+    between a merge and the next deploy it runs against a payload older than itself.
+
+    It must say that, not crash and not paper over it. A `state` default would report
+    every lane as busy — wrong, and indistinguishable from a genuinely busy pool, which
+    is the reading this whole booting/busy split exists to prevent.
+    """
+    import io
+    import json
+    import urllib.request
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+
+    payload = {
+        "hosts": {
+            "powerserver": {
+                "lanes": 2,
+                "max_lanes": 5,
+                "ram_mb": 1400,
+                "budget_ram_mb": 11000,
+                "healthy": True,
+            }
+        },
+        "lanes_running": 2,
+        "max_lanes": 5,
+        "ledger_ram_mb": 1400,
+        "budget_ram_mb": 11000,
+        "disk_gb": {"ssd": {"used": 10, "budget": 300}},
+        # A controller from before the busy/booting split: no `state`, no `idle_seconds`.
+        "running": [{"class": "light"}, {"class": "light"}],
+        "deferred": [],
+        "admission_mode": "reservation_plus_guard",
+    }
+    source = (REPO / "scripts" / "ci_status.py").read_text()
+    buf = io.StringIO()
+    with (
+        patch.object(urllib.request, "urlopen", return_value=io.StringIO(json.dumps(payload))),
+        redirect_stdout(buf),
+    ):
+        exec(compile(source, "ci_status.py", "exec"), {"__name__": "__main__"})
+    out = buf.getvalue()
+
+    assert "predates" in out, "the skew must be named, not silently absorbed"
+    assert "lanes:     {'light': 2}" in out, "what the old payload does support is still shown"
+    assert "busy:" not in out, "claiming a busy count the payload cannot support is the bug"
+    assert "powerserver" in out and "2/5" in out, "the rest of the report must still print"

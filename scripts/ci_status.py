@@ -24,15 +24,24 @@ for name, h in sorted(hosts.items()):
 total_max = sum(h["max_lanes"] for h in hosts.values()) if hosts else d["max_lanes"]
 print(f"TOTAL          lanes {d['lanes_running']}/{total_max}   ram {d['ledger_ram_mb']} MB")
 print("disk_gb:  ", d["disk_gb"])
-busy = [r for r in d["running"] if r["state"] == "busy"]
-booting = [r for r in d["running"] if r["state"] != "busy"]
-# "busy:", not "running:": this counts only lanes GitHub has actually given a job, while
-# TOTAL above counts every lane holding a reservation. Labelled "running" the two silently
-# failed to add up whenever a lane was booting -- and the booting line below only prints
-# when it is non-empty, so there was nothing on screen to explain the difference.
-print("busy:     ", dict(Counter(r["class"] for r in busy)))
-if booting:
-    ages = ", ".join(f"{r['class']}:{r['idle_seconds']}s" for r in booting)
-    print(f"booting:   {len(booting)} ({ages})")
+running = d["running"]
+# This script is piped from a git checkout into whatever controller is deployed, so the
+# two versions drift apart between a merge and the next deploy. Name the skew instead of
+# defaulting the missing field: a default would report every lane as busy, which is both
+# wrong and indistinguishable from the truth. Report what the old payload does support.
+if any("state" not in lane for lane in running):
+    print("lanes:    ", dict(Counter(r["class"] for r in running)))
+    print("           (deployed controller predates the busy/booting split — deploy to see it)")
+else:
+    busy = [r for r in running if r["state"] == "busy"]
+    booting = [r for r in running if r["state"] != "busy"]
+    # "busy:", not "running:": this counts only lanes GitHub has actually given a job, while
+    # TOTAL above counts every lane holding a reservation. Labelled "running" the two silently
+    # failed to add up whenever a lane was booting -- and the booting line below only prints
+    # when it is non-empty, so there was nothing on screen to explain the difference.
+    print("busy:     ", dict(Counter(r["class"] for r in busy)))
+    if booting:
+        ages = ", ".join(f"{r['class']}:{r['idle_seconds']}s" for r in booting)
+        print(f"booting:   {len(booting)} ({ages})")
 print("deferred: ", dict(Counter(x["reason"] for x in d["deferred"])))
 print(f"mode:      {d['admission_mode']}")
