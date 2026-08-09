@@ -358,6 +358,15 @@ def test_lane_agent_keeps_the_distro_running() -> None:
     )
     assert "[TimeSpan]::Zero" in script, "unlimited is the only correct limit for an agent"
 
+    # The repo checkout lives inside WSL. A task pointed at \\wsl.localhost\... cannot
+    # start the subsystem that serves that path, and fails silently (LastTaskResult=1,
+    # task "running", no distro). The registered command must reference a local copy.
+    assert "LOCALAPPDATA" in script, "the task must run from a local copy, not the repo"
+    assert "-File `\"$installed`\"" in script, (
+        "the scheduled action must point at the copy, not at $self in the repo"
+    )
+    assert "Copy-Item" in script, "-Install must make that copy"
+
     # -Install fails with a raw CIM "Access is denied" without elevation, which reads
     # as a bug in the script. It must say so itself, and the runbook must say so too.
     assert "Test-Elevated" in script, "-Install must check for elevation, not just fail"
