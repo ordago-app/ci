@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import yaml
@@ -181,6 +182,46 @@ def test_lane_host_bind_address_comes_from_tailscaled_and_stops_the_play_when_em
         )
     )
     assert tasks.index(guards[0]) < render, "the guard must precede rendering .env"
+
+
+def test_lane_host_budgets_fit_the_vm_it_actually_runs_on() -> None:
+    """A lane host must not inherit powerserver's RAM budget.
+
+    The top-level ram_budget_mb is powerserver's 11 GB; the lane VM has 6 GB, capped by
+    `--disk`/`--memory` in `make ci-lane-up`. Inheriting made `ci-status` report a budget
+    the box does not have — harmless only while max_concurrent_lanes bound first, and a
+    real over-admission trap the moment the lane cap rose. So the host must name its own
+    budget, and the worst case its gates permit must fit inside it.
+
+    Read from the Makefile rather than restated here: a VM resize that forgot this file
+    should fail loudly instead of silently over-admitting.
+    """
+    config = yaml.safe_load(CONTROLLER_CONFIG.read_text())
+    lane = config["hosts"]["powervaro-ci"]
+
+    assert "ram_budget_mb" in lane, (
+        "a lane host must state its own ram_budget_mb, not inherit powerserver's"
+    )
+    assert lane["ram_budget_mb"] < config["ram_budget_mb"], (
+        "the lane VM is smaller than powerserver; its budget must be too"
+    )
+
+    makefile = (REPO / "Makefile").read_text()
+    (vm_mem,) = re.findall(r"^CI_LANE_MEM \?= (\d+)G", makefile, re.M)
+    vm_mem_mb = int(vm_mem) * 1024
+    assert lane["ram_budget_mb"] < vm_mem_mb, (
+        f"budget {lane['ram_budget_mb']} MB does not fit the VM's {vm_mem_mb} MB"
+    )
+
+    # The lane cap must bind before RAM does — that is what makes the cap the operator's
+    # dial and keeps admissions predictable.
+    worst_case = lane["max_concurrent_lanes"] * min(
+        c["ram_mb"] for name, c in config["classes"].items() if name in lane["allowed_classes"]
+    )
+    assert worst_case <= lane["ram_budget_mb"], (
+        f"{lane['max_concurrent_lanes']} lanes reserve {worst_case} MB, over the "
+        f"{lane['ram_budget_mb']} MB budget — RAM would bind before the lane cap"
+    )
 
 
 def test_lane_host_image_tag_and_runner_image_agree() -> None:
