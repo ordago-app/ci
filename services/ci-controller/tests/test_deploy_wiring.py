@@ -416,6 +416,18 @@ def _render(template: str, **ctx: object) -> str:
     return env.from_string(template).render(**ctx)
 
 
+def test_daemon_json_template_uses_no_backslash_escapes() -> None:
+    """Ansible does not interpret a `\\n` escape inside a Jinja string literal.
+
+    It emits a literal backslash-n. That produced invalid JSON on powervaro-ci and dockerd
+    refused to start. Plain jinja2 *does* interpret the escape, so the render test below
+    passed while the real thing was broken -- this check is the one that generalises.
+    """
+    assert "\\n" not in _daemon_json_template(), (
+        "use the _newline var (a YAML double-quoted scalar) instead of a Jinja escape"
+    )
+
+
 def test_daemon_json_is_unchanged_when_no_dns_is_configured() -> None:
     """Adding conditional DNS must not reformat the file on hosts that don't set it.
 
@@ -423,7 +435,7 @@ def test_daemon_json_is_unchanged_when_no_dns_is_configured() -> None:
     every service container and kills every live CI lane, so a cosmetic whitespace or
     key-order change here is an outage, not a diff. Pin the exact bytes.
     """
-    rendered = _render(_daemon_json_template(), docker_daemon_dns=[])
+    rendered = _render(_daemon_json_template(), docker_daemon_dns=[], _newline="\n")
     assert rendered == (
         "{\n"
         '  "log-driver": "json-file",\n'
@@ -448,7 +460,9 @@ def test_daemon_json_carries_dns_when_configured() -> None:
     """
     import json as _json
 
-    rendered = _render(_daemon_json_template(), docker_daemon_dns=["8.8.8.8", "1.1.1.1"])
+    rendered = _render(
+        _daemon_json_template(), docker_daemon_dns=["8.8.8.8", "1.1.1.1"], _newline="\n"
+    )
     parsed = _json.loads(rendered)  # must still be valid JSON, or dockerd will not start
     assert parsed["dns"] == ["8.8.8.8", "1.1.1.1"]
     assert parsed["default-address-pools"] == [{"base": "172.30.0.0/16", "size": 24}], (
