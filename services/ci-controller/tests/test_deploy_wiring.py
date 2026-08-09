@@ -622,3 +622,30 @@ def test_every_controller_label_is_registered_with_actionlint() -> None:
     )
     missing = set(homelab["label_class"]) - known
     assert not missing, f"labels used by homelab jobs but unknown to actionlint: {sorted(missing)}"
+
+
+def test_windows_scripts_avoid_the_int32_hex_literal_trap() -> None:
+    """`[uint32]0x80000000` throws at runtime in Windows PowerShell 5.1.
+
+    A hex literal is typed Int32 when it fits the token width, so 0x80000000 becomes
+    -2147483648 and the cast fails with "Value was either too large or too small for a
+    UInt32". This killed the lane agent on every launch; the scheduled task reported only
+    LastTaskResult=1, so it looked like the three unrelated bugs fixed before it.
+
+    No test can execute these scripts — the API they call is Windows-only and CI is Linux
+    — so this checks the one pattern that produced a silent, total failure. Write the
+    constant in decimal: it exceeds Int32, so PowerShell types it Int64 and the cast is
+    exact.
+    """
+    import re
+
+    pattern = re.compile(r"\[uint32\]\s*0x", re.IGNORECASE)
+    for script in (LANE_AGENT_SCRIPT, DISTRO_SCRIPT):
+        # Strip comments first: the fix's own comment quotes the broken form on purpose,
+        # and that is worth keeping. Naive `#`-to-end-of-line, which is exact for these
+        # two scripts (no `#` appears inside a string in either).
+        code = "\n".join(line.split("#", 1)[0] for line in script.read_text().splitlines())
+        assert not pattern.search(code), (
+            f"{script.name} casts a hex literal to [uint32]; PowerShell 5.1 types it Int32 "
+            f"first and the cast throws. Use a decimal literal with the hex in a comment."
+        )
