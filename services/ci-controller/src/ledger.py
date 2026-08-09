@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from src.models import Reservation
 
 
@@ -16,6 +18,12 @@ class Ledger:
 
     def remove(self, lane_id: str) -> None:
         self._items.pop(lane_id, None)
+
+    def update(self, lane_id: str, **fields: object) -> None:
+        current = self._items.get(lane_id)
+        if current is None:
+            raise KeyError(f"lane '{lane_id}' not in ledger")
+        self._items[lane_id] = replace(current, **fields)  # type: ignore[arg-type]
 
     def _matching(self, host: str | None) -> list[Reservation]:
         items = self._items.values()
@@ -40,7 +48,7 @@ class Ledger:
         # gate for a GitHub job_id. A host-scoped lookup here would let the same
         # job be admitted on two hosts at once, leaving an orphan ephemeral runner
         # on whichever host loses the race.
-        return any(r.job_id == job_id for r in self._items.values())
+        return any(r.claimed_job_id == job_id for r in self._items.values())
 
     def lane_ids(self, host: str | None = None) -> set[str]:
         return {r.lane_id for r in self._matching(host)}

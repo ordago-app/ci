@@ -24,6 +24,15 @@ for name, h in sorted(hosts.items()):
 total_max = sum(h["max_lanes"] for h in hosts.values()) if hosts else d["max_lanes"]
 print(f"TOTAL          lanes {d['lanes_running']}/{total_max}   ram {d['ledger_ram_mb']} MB")
 print("disk_gb:  ", d["disk_gb"])
-print("running:  ", dict(Counter(r["class"] for r in d["running"])))
+busy = [r for r in d["running"] if r["state"] == "busy"]
+booting = [r for r in d["running"] if r["state"] != "busy"]
+# "busy:", not "running:": this counts only lanes GitHub has actually given a job, while
+# TOTAL above counts every lane holding a reservation. Labelled "running" the two silently
+# failed to add up whenever a lane was booting -- and the booting line below only prints
+# when it is non-empty, so there was nothing on screen to explain the difference.
+print("busy:     ", dict(Counter(r["class"] for r in busy)))
+if booting:
+    ages = ", ".join(f"{r['class']}:{r['idle_seconds']}s" for r in booting)
+    print(f"booting:   {len(booting)} ({ages})")
 print("deferred: ", dict(Counter(x["reason"] for x in d["deferred"])))
 print(f"mode:      {d['admission_mode']}")

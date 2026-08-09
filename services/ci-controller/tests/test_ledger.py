@@ -13,7 +13,7 @@ def _res(
 ) -> Reservation:
     return Reservation(
         lane_id=lane_id,
-        job_id=job_id,
+        spawned_for_job_id=job_id,
         repo="o/r",
         class_name="light",
         ram_mb=ram_mb,
@@ -80,12 +80,58 @@ def test_add_duplicate_lane_id_rejected() -> None:
         led.add(_res("a", 2))
 
 
+def _res2(**over) -> Reservation:
+    base = dict(
+        lane_id="powerserver-cici-1",
+        spawned_for_job_id=1,
+        repo="alvaro-francisco-gil/homelab",
+        class_name="light",
+        ram_mb=700,
+        needs_kvm=False,
+    )
+    base.update(over)
+    return Reservation(**base)
+
+
+def test_claimed_job_is_the_spawned_for_job_until_attributed() -> None:
+    assert _res2().claimed_job_id == 1
+
+
+def test_claimed_job_is_the_running_job_once_attributed() -> None:
+    assert _res2(running_job_id=2).claimed_job_id == 2
+
+
+def test_attribution_releases_the_claim_on_the_spawned_for_job() -> None:
+    """The starvation fix: job 1 was stolen by job 2, so 1 must become admissible again."""
+    ledger = Ledger()
+    ledger.add(_res2())
+    assert ledger.has_job(1)
+
+    ledger.update("powerserver-cici-1", running_job_id=2)
+
+    assert not ledger.has_job(1)
+    assert ledger.has_job(2)
+
+
+def test_update_preserves_untouched_fields() -> None:
+    ledger = Ledger()
+    ledger.add(_res2(ram_mb=5000, class_name="node"))
+    ledger.update("powerserver-cici-1", runner_id=77)
+    (res,) = ledger.reservations()
+    assert (res.runner_id, res.ram_mb, res.class_name) == (77, 5000, "node")
+
+
+def test_update_rejects_an_unknown_lane() -> None:
+    with pytest.raises(KeyError):
+        Ledger().update("nope", runner_id=1)
+
+
 def test_per_host_totals_are_separate_but_has_job_is_global() -> None:
     led = Ledger()
     led.add(
         Reservation(
             lane_id="a",
-            job_id=1,
+            spawned_for_job_id=1,
             repo="r",
             class_name="light",
             ram_mb=700,
@@ -96,7 +142,7 @@ def test_per_host_totals_are_separate_but_has_job_is_global() -> None:
     led.add(
         Reservation(
             lane_id="b",
-            job_id=2,
+            spawned_for_job_id=2,
             repo="r",
             class_name="light",
             ram_mb=700,

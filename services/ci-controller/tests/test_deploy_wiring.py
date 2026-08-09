@@ -479,7 +479,12 @@ def test_ci_status_script_reports_each_host_and_a_correct_total() -> None:
         "ledger_ram_mb": 10400,
         "budget_ram_mb": 11000,
         "disk_gb": {"ssd": {"used": 30, "budget": 300}},
-        "running": [{"class": "node"}],
+        # /status always stamps state (and idle_seconds for a lane that has not yet
+        # been handed a job) on every running entry — the script keys off both.
+        "running": [
+            {"class": "node", "state": "busy", "idle_seconds": None},
+            {"class": "light", "state": "booting", "idle_seconds": 25},
+        ],
         "deferred": [{"reason": "budget_full"}],
         "admission_mode": "reservation_plus_guard",
     }
@@ -499,6 +504,10 @@ def test_ci_status_script_reports_each_host_and_a_correct_total() -> None:
     assert "6/5" not in out, "the misleading aggregate-vs-one-ceiling line must be gone"
     # An unhealthy host receives no work, which is indistinguishable from an idle pool.
     assert "UNHEALTHY" in out, "an unhealthy host must be called out, not silently idle"
+    # A booting lane holds its full reserve but is running nothing; counting it under
+    # `running:` is what made a warm pool read as a busy one.
+    assert "busy:      {'node': 1}" in out, "only busy lanes belong under the busy label"
+    assert "booting:   1 (light:25s)" in out, "a booting lane must be reported as booting"
 
 
 def test_jobs_reaching_in_cluster_services_are_pinned_to_the_host_running_them() -> None:

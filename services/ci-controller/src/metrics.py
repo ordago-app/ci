@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS events (
     job_name TEXT,
     workflow TEXT,
     host TEXT,
-    conclusion TEXT
+    conclusion TEXT,
+    spawned_for_job_id INTEGER,
+    attributed INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
@@ -32,6 +34,12 @@ _ADDED_COLUMNS = {
     "workflow": "TEXT",
     "host": "TEXT",
     "conclusion": "TEXT",
+    # job_id holds the observed running job once attributed=1; spawned_for_job_id keeps the
+    # admission-time prediction so spawn-vs-run divergence stays measurable. Both are NULL on
+    # every row written before attribution existed — that NULL is the marker that those rows'
+    # per-job identity is a prediction, not an observation.
+    "spawned_for_job_id": "INTEGER",
+    "attributed": "INTEGER",
 }
 
 
@@ -70,12 +78,14 @@ class MetricsStore:
         workflow: str | None = None,
         host: str | None = None,
         conclusion: str | None = None,
+        spawned_for_job_id: int | None = None,
+        attributed: int | None = None,
     ) -> None:
         self.conn.execute(
             "INSERT INTO events (ts, kind, job_id, repo, class, work_disk, reason, "
             "config_version, lane_id, peak_ram_mb, peak_cpu_pct, reasons, job_name, "
-            "workflow, host, conclusion) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "workflow, host, conclusion, spawned_for_job_id, attributed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 ts,
                 kind,
@@ -93,6 +103,8 @@ class MetricsStore:
                 workflow,
                 host,
                 conclusion,
+                spawned_for_job_id,
+                attributed,
             ),
         )
         self.conn.commit()

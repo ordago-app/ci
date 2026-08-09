@@ -51,6 +51,7 @@ def create_app(controller: Controller, poll_interval: float) -> FastAPI:
             f"ci_budget_ram_mb {s['budget_ram_mb']}",
             f"ci_ledger_ram_mb {s['ledger_ram_mb']}",
             f"ci_lanes_running {s['lanes_running']}",
+            f"ci_lanes_booting {sum(1 for r in s['running'] if r['state'] == 'booting')}",
             f"ci_max_lanes {s['max_lanes']}",
             f"ci_kvm_in_use {1 if s['kvm_in_use'] else 0}",
             f"ci_jobs_deferred {len(s['deferred'])}",

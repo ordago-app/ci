@@ -109,3 +109,44 @@ def test_migrates_a_preexisting_db_without_losing_rows(tmp_path) -> None:
     )
     assert store.conn.execute("SELECT count(*) FROM events").fetchone()[0] == 2
     store.close()
+
+
+def test_migration_adds_attribution_columns_to_an_existing_db(tmp_path) -> None:
+    """The live store has 112k rows written before these columns existed."""
+    path = str(tmp_path / "metrics.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+        "kind TEXT NOT NULL, job_id INTEGER NOT NULL, repo TEXT NOT NULL, "
+        "config_version TEXT NOT NULL)"
+    )
+    old.execute(
+        "INSERT INTO events (ts, kind, job_id, repo, config_version) "
+        "VALUES (1.0,'reap',1,'o/r','v0')"
+    )
+    old.commit()
+    old.close()
+
+    store = MetricsStore(path)
+
+    row = store.conn.execute("SELECT attributed, spawned_for_job_id FROM events").fetchone()
+    assert row == (None, None)
+    store.close()
+
+
+def test_record_event_persists_attribution(tmp_path) -> None:
+    store = MetricsStore(str(tmp_path / "metrics.db"))
+
+    store.record_event(
+        kind="reap",
+        job_id=902,
+        spawned_for_job_id=7,
+        attributed=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v1",
+    )
+
+    row = store.conn.execute("SELECT job_id, spawned_for_job_id, attributed FROM events").fetchone()
+    assert row == (902, 7, 1)
+    store.close()

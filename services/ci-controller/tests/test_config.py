@@ -112,6 +112,18 @@ def test_admission_mode_defaults_and_validates(write_config) -> None:
         ControllerConfig.load(write_config(bad))
 
 
+def test_idle_reaper_defaults(write_config) -> None:
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    assert (cfg.idle_grace_seconds, cfg.idle_lane_max_seconds) == (60.0, 600.0)
+
+
+def test_grace_must_be_below_the_absolute_cap(write_config) -> None:
+    with pytest.raises(ConfigError):
+        ControllerConfig.load(
+            write_config(VALID_CONFIG + "idle_grace_seconds: 900\nidle_lane_max_seconds: 600\n")
+        )
+
+
 def test_absent_hosts_key_synthesises_one_host_from_the_top_level(write_config) -> None:
     cfg = ControllerConfig.load(write_config(VALID_CONFIG))
     hosts = cfg.resolved_hosts()

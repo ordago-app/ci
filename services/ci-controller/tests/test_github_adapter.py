@@ -3,7 +3,8 @@ import datetime as dt
 import httpx
 import pytest
 import respx
-from src.github_adapter import GitHubAdapter
+from src.github_adapter import JOBS_PAGE_SIZE, MAX_RUNNER_PAGES, GitHubAdapter, RunnerInfo
+from src.models import RunningJob
 
 # RSA test key generated for tests only (not a real secret).
 TEST_KEY = """-----BEGIN PRIVATE KEY-----
@@ -189,3 +190,272 @@ def test_job_conclusion_raises_on_a_non_2xx_response() -> None:
     gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
     with pytest.raises(httpx.HTTPStatusError):
         gh.job_conclusion("o/r", 42)
+
+
+def _token() -> None:
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+
+
+def _adapter() -> GitHubAdapter:
+    return GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+
+
+@respx.mock
+def test_list_runners_reports_busy_state() -> None:
+    _token()
+    respx.get("https://api.github.com/repos/o/r/actions/runners").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total_count": 2,
+                "runners": [
+                    {"id": 11, "name": "powerserver-cici-1", "busy": True},
+                    {"id": 12, "name": "powerserver-cici-2", "busy": False},
+                ],
+            },
+        )
+    )
+
+    listing = _adapter().list_runners("o/r")
+
+    assert listing.runners == [
+        RunnerInfo(runner_id=11, name="powerserver-cici-1", busy=True),
+        RunnerInfo(runner_id=12, name="powerserver-cici-2", busy=False),
+    ]
+    assert listing.complete is True
+
+
+def _runner_page(n: int, start: int) -> list[dict]:
+    return [
+        {"id": i, "name": f"powerserver-cici-{i}", "busy": False} for i in range(start, start + n)
+    ]
+
+
+@respx.mock
+def test_list_runners_follows_pagination_to_the_end() -> None:
+    """A single page is not the whole truth: the reaper infers a lane's ABSENCE from this
+    list, so a lane sitting on page 2 must never look gone."""
+    _token()
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        runners = _runner_page(100, 1) if page == 1 else _runner_page(50, 101)
+        return httpx.Response(200, json={"total_count": 150, "runners": runners})
+
+    respx.get("https://api.github.com/repos/o/r/actions/runners").mock(side_effect=_respond)
+
+    listing = _adapter().list_runners("o/r")
+
+    assert len(listing.runners) == 150
+    assert listing.complete is True
+    assert listing.runners[-1].name == "powerserver-cici-150"
+
+
+@respx.mock
+def test_list_runners_reports_a_truncated_listing_instead_of_pretending_it_is_complete(
+    caplog,
+) -> None:
+    """Pagination is bounded so a pathological repo cannot eat the API budget. When the
+    bound is hit the listing is flagged incomplete and warned about, never passed off as
+    evidence that a missing lane is gone."""
+    _token()
+    respx.get("https://api.github.com/repos/o/r/actions/runners").mock(
+        return_value=httpx.Response(
+            200, json={"total_count": 100_000, "runners": _runner_page(100, 1)}
+        )
+    )
+
+    with caplog.at_level("WARNING"):
+        listing = _adapter().list_runners("o/r")
+
+    assert listing.complete is False
+    assert len(listing.runners) == 100 * MAX_RUNNER_PAGES
+    assert any("truncated" in rec.message for rec in caplog.records)
+
+
+@respx.mock
+def test_delete_runner_returns_true_on_success() -> None:
+    _token()
+    respx.delete("https://api.github.com/repos/o/r/actions/runners/11").mock(
+        return_value=httpx.Response(204)
+    )
+
+    assert _adapter().delete_runner("o/r", 11) is True
+
+
+@respx.mock
+def test_delete_runner_returns_false_when_github_says_busy() -> None:
+    """422 is the race guard: the runner took a job between our poll and this call."""
+    _token()
+    respx.delete("https://api.github.com/repos/o/r/actions/runners/11").mock(
+        return_value=httpx.Response(422, json={"message": "runner is currently running a job"})
+    )
+
+    assert _adapter().delete_runner("o/r", 11) is False
+
+
+@respx.mock
+def test_delete_runner_treats_an_absent_runner_as_deregistered() -> None:
+    _token()
+    respx.delete("https://api.github.com/repos/o/r/actions/runners/11").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"})
+    )
+
+    assert _adapter().delete_runner("o/r", 11) is True
+
+
+@respx.mock
+def test_delete_runner_raises_on_a_real_error() -> None:
+    _token()
+    respx.delete("https://api.github.com/repos/o/r/actions/runners/11").mock(
+        return_value=httpx.Response(500)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _adapter().delete_runner("o/r", 11)
+
+
+@respx.mock
+def test_find_job_for_runner_matches_by_runner_name() -> None:
+    _token()
+    respx.get("https://api.github.com/repos/o/r/actions/runs").mock(
+        return_value=httpx.Response(200, json={"workflow_runs": [{"id": 500, "name": "CI"}]})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/runs/500/jobs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": 900,
+                        "name": "other",
+                        "status": "in_progress",
+                        "runner_name": "powerserver-cici-99",
+                    },
+                    {
+                        "id": 901,
+                        "name": "e2e",
+                        "status": "in_progress",
+                        "runner_name": "powerserver-cici-1",
+                    },
+                ]
+            },
+        )
+    )
+
+    found = _adapter().find_job_for_runner("o/r", "powerserver-cici-1")
+
+    assert found.job == RunningJob(job_id=901, workflow="CI", job_name="e2e")
+    assert found.complete is True
+
+
+@respx.mock
+def test_find_job_for_runner_returns_none_when_no_job_matches() -> None:
+    _token()
+    respx.get("https://api.github.com/repos/o/r/actions/runs").mock(
+        return_value=httpx.Response(200, json={"workflow_runs": [{"id": 500, "name": "CI"}]})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/runs/500/jobs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": 900,
+                        "name": "other",
+                        "status": "in_progress",
+                        "runner_name": "powerserver-cici-99",
+                    }
+                ]
+            },
+        )
+    )
+
+    found = _adapter().find_job_for_runner("o/r", "powerserver-cici-1")
+
+    # A clean miss: every job list was read to its end and none named this runner.
+    assert found.job is None
+    assert found.complete is True
+
+
+@respx.mock
+def test_find_job_for_runner_only_queries_in_progress_runs() -> None:
+    _token()
+    runs = respx.get("https://api.github.com/repos/o/r/actions/runs").mock(
+        return_value=httpx.Response(200, json={"workflow_runs": []})
+    )
+
+    assert _adapter().find_job_for_runner("o/r", "powerserver-cici-1").job is None
+    assert runs.calls.last.request.url.params["status"] == "in_progress"
+
+
+@respx.mock
+def test_find_job_for_runner_reads_past_the_first_jobs_page() -> None:
+    """GitHub paginates /runs/{id}/jobs at 30 by default. Requesting it without per_page
+    or pagination meant a lane whose job sat on page 2 never attributed: it stayed
+    `booting`, kept its spawned-for claim, and eventually reaped unattributed."""
+    _token()
+    respx.get("https://api.github.com/repos/o/r/actions/runs").mock(
+        return_value=httpx.Response(200, json={"workflow_runs": [{"id": 500, "name": "CI"}]})
+    )
+    page_one = [
+        {
+            "id": 800 + i,
+            "name": f"filler-{i}",
+            "status": "in_progress",
+            "runner_name": f"powerserver-cici-{i}",
+        }
+        for i in range(JOBS_PAGE_SIZE)
+    ]
+    page_two = [
+        {
+            "id": 901,
+            "name": "e2e",
+            "status": "in_progress",
+            "runner_name": "powerserver-cici-target",
+        }
+    ]
+
+    def _jobs(request):
+        page = int(request.url.params.get("page", 1))
+        return httpx.Response(200, json={"jobs": page_one if page == 1 else page_two})
+
+    respx.get("https://api.github.com/repos/o/r/actions/runs/500/jobs").mock(side_effect=_jobs)
+
+    found = _adapter().find_job_for_runner("o/r", "powerserver-cici-target")
+
+    assert found.job == RunningJob(job_id=901, workflow="CI", job_name="e2e")
+    assert found.complete is True
+
+
+@respx.mock
+def test_a_truncated_jobs_scan_is_not_reported_as_not_running() -> None:
+    """ "We stopped looking" must be distinguishable from "this runner has no job".
+
+    Returning a bare None for both is what made the pagination bug invisible: the
+    controller counted a truncated scan as a normal not-yet-visible run and retried
+    forever without ever saying the scan itself was incomplete.
+    """
+    _token()
+    respx.get("https://api.github.com/repos/o/r/actions/runs").mock(
+        return_value=httpx.Response(200, json={"workflow_runs": [{"id": 500, "name": "CI"}]})
+    )
+    full_page = [
+        {
+            "id": 800 + i,
+            "name": f"filler-{i}",
+            "status": "in_progress",
+            "runner_name": f"powerserver-cici-{i}",
+        }
+        for i in range(JOBS_PAGE_SIZE)
+    ]
+    respx.get("https://api.github.com/repos/o/r/actions/runs/500/jobs").mock(
+        return_value=httpx.Response(200, json={"jobs": full_page})
+    )
+
+    found = _adapter().find_job_for_runner("o/r", "powerserver-cici-nowhere")
+
+    assert found.job is None
+    assert found.complete is False, "a scan cut short at the page bound is not a clean miss"

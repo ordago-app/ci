@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 
 class ConfigError(ValueError):
@@ -115,6 +115,11 @@ class ControllerConfig(BaseModel):
     lane_env: dict[str, str] = {}
     classes: dict[str, JobClass]
     repos: list[RepoConfig]
+    # A lane that boots into an empty queue (its job was cancelled during the 20-30s boot)
+    # holds its full reserve until some later job happens to match it. Reaping it trades
+    # warm capacity for budget, so it is only worth doing when something is actually waiting.
+    idle_grace_seconds: float = Field(default=60.0, gt=0)  # may just be booting below this
+    idle_lane_max_seconds: float = Field(default=600.0, gt=0)  # absolute ceiling, no pressure req'd
     hosts: dict[str, HostConfig] = {}
 
     @model_validator(mode="before")
@@ -151,6 +156,8 @@ class ControllerConfig(BaseModel):
                 f"admission_mode '{self.admission_mode}' must be "
                 "'reservation' or 'reservation_plus_guard'"
             )
+        if self.idle_grace_seconds > self.idle_lane_max_seconds:
+            raise ValueError("idle_grace_seconds must not exceed idle_lane_max_seconds")
         for host in self.hosts.values():
             if host.allowed_classes is not None:
                 for class_name in host.allowed_classes:

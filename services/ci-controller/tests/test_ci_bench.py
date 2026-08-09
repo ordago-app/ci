@@ -4,11 +4,14 @@ import time
 from src.ci_bench import (
     ELIGIBILITY_REASONS,
     PAGE_CACHE_FIX_TS,
+    _host_summary,
     available_columns,
     binding_gate_counts,
     class_peaks,
     gate_counts,
+    idle_reaps,
     infra_failures,
+    lanes_lost_unattributed,
     lookup_failures,
     main,
     open_readonly,
@@ -16,6 +19,7 @@ from src.ci_bench import (
     queue_waits,
     render_comparison,
     render_report,
+    spawn_divergence,
 )
 from src.metrics import MetricsStore
 
@@ -54,6 +58,42 @@ def _old_schema_db(tmp_path, rows: list[tuple]) -> sqlite3.Connection:
         )
     old.commit()
     old.close()
+    return open_readonly(str(db))
+
+
+def _conclusion_but_not_attributed_db(tmp_path, rows: list[tuple]) -> sqlite3.Connection:
+    """Build a DB with `conclusion` (Task 2) but NOT `spawned_for_job_id`/`attributed`
+    (Task 5) — the exact state ci-bench will be pointed at until the controller running
+    this task's change is redeployed. Every `_old_schema_db` fixture in this file lacks
+    both `conclusion` and `attributed` and so short-circuits on the `conclusion` guard
+    before `_attribution_validity_floor`'s own `attributed` column guard ever runs —
+    leaving that guard, the thing standing between a report and `sqlite3.OperationalError:
+    no such column: attributed`, entirely untested.
+
+    `rows` are (job_id, kind, conclusion, ts, config_version, class_name) tuples.
+    """
+    db = tmp_path / "conclusion_only.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL, kind TEXT NOT NULL, job_id INTEGER NOT NULL,
+            repo TEXT NOT NULL, class TEXT, work_disk TEXT, reason TEXT,
+            config_version TEXT NOT NULL, lane_id TEXT,
+            peak_ram_mb INTEGER, peak_cpu_pct REAL,
+            reasons TEXT, job_name TEXT, workflow TEXT, host TEXT, conclusion TEXT
+        );
+        """
+    )
+    for job_id, kind, conclusion, ts, config_version, class_name in rows:
+        conn.execute(
+            "INSERT INTO events (ts, kind, job_id, repo, conclusion, config_version, class) "
+            "VALUES (?, ?, ?, 'o/r', ?, ?, ?)",
+            (ts, kind, job_id, conclusion, config_version, class_name),
+        )
+    conn.commit()
+    conn.close()
     return open_readonly(str(db))
 
 
@@ -275,6 +315,8 @@ def test_infra_failure_is_a_reap_without_a_conclusion(tmp_path) -> None:
         config_version="v",
         class_name="light",
         conclusion="success",
+        attributed=1,
+        spawned_for_job_id=1,
     )
     store.record_event(
         kind="reap",
@@ -284,6 +326,8 @@ def test_infra_failure_is_a_reap_without_a_conclusion(tmp_path) -> None:
         config_version="v",
         class_name="light",
         conclusion=None,
+        attributed=1,
+        spawned_for_job_id=2,
     )
     assert infra_failures(store.conn) == 1
     store.close()
@@ -319,6 +363,8 @@ def test_infra_failures_excludes_reap_rows_from_before_the_conclusion_column_exi
         config_version="v",
         class_name="light",
         conclusion="success",
+        attributed=1,
+        spawned_for_job_id=4,
     )
     store.record_event(
         kind="reap",
@@ -328,8 +374,27 @@ def test_infra_failures_excludes_reap_rows_from_before_the_conclusion_column_exi
         config_version="v",
         class_name="light",
         conclusion=None,
+        attributed=1,
+        spawned_for_job_id=5,
     )
-    # Naive counting (no floor) would give 4 (jobs 1, 2, 3, 5). Only job 5 is real.
+    # An attributed row with a NULL conclusion, but positioned BEFORE the conclusion
+    # floor (ts=50 < job 4's ts=100). Pins two things at once: the `ts >= ?` clause is
+    # genuinely load-bearing (dropping it would count job 6 alongside job 5, since
+    # `attributed = 1` alone does not exclude it), and floor = max(conclusion_floor,
+    # attribution_floor) — using attribution_floor alone (MIN(ts) where attributed=1,
+    # which this row would drag down to 50) would also wrongly admit it.
+    store.record_event(
+        kind="reap",
+        job_id=6,
+        repo="o/r",
+        ts=50.0,
+        config_version="v",
+        class_name="light",
+        conclusion=None,
+        attributed=1,
+        spawned_for_job_id=6,
+    )
+    # Naive counting (no floor) would give 5 (jobs 1, 2, 3, 5, 6). Only job 5 is real.
     assert infra_failures(store.conn) == 1
     store.close()
 
@@ -358,6 +423,8 @@ def test_lookup_failures_are_counted_separately_from_infra_failures(tmp_path) ->
         config_version="v",
         class_name="light",
         conclusion="lookup_failed",
+        attributed=1,
+        spawned_for_job_id=1,
     )
     store.record_event(
         kind="reap",
@@ -367,6 +434,8 @@ def test_lookup_failures_are_counted_separately_from_infra_failures(tmp_path) ->
         config_version="v",
         class_name="light",
         conclusion=None,
+        attributed=1,
+        spawned_for_job_id=2,
     )
     assert lookup_failures(store.conn) == 1
     assert infra_failures(store.conn) == 1  # only job 2; lookup_failed must not count here
@@ -385,6 +454,8 @@ def test_adopted_lanes_are_not_counted_as_infra_failures(tmp_path) -> None:
         config_version="v",
         class_name="light",
         conclusion="adopted",
+        attributed=1,
+        spawned_for_job_id=1,
     )
     store.record_event(
         kind="reap",
@@ -394,6 +465,8 @@ def test_adopted_lanes_are_not_counted_as_infra_failures(tmp_path) -> None:
         config_version="v",
         class_name="light",
         conclusion=None,
+        attributed=1,
+        spawned_for_job_id=2,
     )
     assert infra_failures(store.conn) == 1
     store.close()
@@ -402,7 +475,12 @@ def test_adopted_lanes_are_not_counted_as_infra_failures(tmp_path) -> None:
 def test_infra_failures_counts_the_explicit_sentinel_too(tmp_path) -> None:
     """Task 13 emits conclusion='infra_failure' when a lane's host disappears mid-job.
     infra_failures() must count that sentinel alongside a NULL conclusion, or the exact
-    events this section exists to surface stay invisible in the report."""
+    events this section exists to surface stay invisible in the report.
+
+    The NULL row here is marked attributed: an unattributed NULL is a lane whose job was
+    never observed, which this module counts as unknown rather than as a failure (see
+    test_infra_failures_ignores_unattributed_reaps). The sentinel row needs no such
+    marking — it is a positive statement about the lane, not an inference from a gap."""
     store = _store(tmp_path)
     store.record_event(
         kind="reap",
@@ -421,6 +499,7 @@ def test_infra_failures_counts_the_explicit_sentinel_too(tmp_path) -> None:
         config_version="v",
         class_name="light",
         conclusion=None,
+        attributed=1,
     )
     store.record_event(
         kind="reap",
@@ -465,6 +544,7 @@ def test_infra_failure_sentinel_still_respects_the_conclusion_validity_floor(tmp
         config_version="v",
         class_name="light",
         conclusion="infra_failure",
+        attributed=1,
     )
     # Naive counting (no floor) would give 3 (jobs 1, 2, 5). Only job 5 is real.
     assert infra_failures(store.conn) == 1
@@ -501,6 +581,7 @@ def test_infra_failure_sentinel_does_not_pull_in_adopted_or_lookup_failed(tmp_pa
         config_version="v",
         class_name="light",
         conclusion="infra_failure",
+        attributed=1,
     )
     assert infra_failures(store.conn) == 1  # only job 3
     store.close()
@@ -534,6 +615,8 @@ def test_report_states_the_conclusion_validity_window(tmp_path) -> None:
         config_version="v",
         class_name="light",
         conclusion="success",
+        attributed=1,
+        spawned_for_job_id=1,
     )
     report = render_report(store.conn)
     assert "2024-08-08" in report  # datetime.fromtimestamp(1723100000, UTC) formatted date
@@ -551,10 +634,13 @@ def test_report_shows_lookup_failed_separately_from_infra_failures(tmp_path) -> 
         config_version="v",
         class_name="light",
         conclusion="lookup_failed",
+        attributed=1,
+        spawned_for_job_id=1,
     )
     report = render_report(store.conn)
     infra_line, _, lookup_line = report.partition("Reaps where the conclusion lookup itself")
-    assert "Reaps with no resolvable conclusion: 0." in infra_line
+    assert "Reaps with no resolvable conclusion" in infra_line
+    assert infra_line.rstrip().endswith("0.")
     assert "1." in lookup_line.splitlines()[0]
     store.close()
 
@@ -770,6 +856,91 @@ def test_host_section_counts_the_infra_failure_sentinel_per_host(tmp_path) -> No
     report = render_report(store.conn)
     assert "| second-host | 1 | 0 | 1 |" in report
     assert "| powerserver | 1 | 0 | 0 |" in report
+    store.close()
+
+
+def test_the_headline_and_per_host_infra_counts_agree_on_the_same_rows(tmp_path) -> None:
+    """One rendered report must not state two different infra-failure totals.
+
+    The headline number and the per-host table are read side by side. They used to
+    derive their own validity windows — the headline gated on
+    max(conclusion_floor, attribution_floor), the per-host table on the conclusion
+    floor alone — so this exact fixture rendered "unavailable" above a table saying 1.
+    """
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=100.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        host="powerserver",
+    )
+    store.record_event(
+        kind="reap",
+        job_id=2,
+        repo="o/r",
+        ts=101.0,
+        config_version="v",
+        class_name="light",
+        conclusion="infra_failure",
+        host="desktop",
+    )
+
+    per_host = _host_summary(store.conn, None)
+    total = sum(row["infra_failures"] or 0 for row in per_host.values())
+
+    assert infra_failures(store.conn) == total
+    assert infra_failures(store.conn) == 1
+    store.close()
+
+
+def test_a_lost_host_is_counted_even_though_no_lane_was_ever_attributed(tmp_path) -> None:
+    """The fresh-deploy case, and the case where a host disappears before any lane goes
+    busy. The sentinel is a positive statement about the lane, so the attribution floor —
+    which speaks only to rows whose outcome is INFERRED from a missing conclusion — must
+    not suppress it."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="infra_failure",
+    )
+
+    assert infra_failures(store.conn) == 1
+    store.close()
+
+
+def test_an_unattributed_null_stays_uncounted_while_a_sentinel_beside_it_counts(
+    tmp_path,
+) -> None:
+    """The two branches keep their own burdens of proof in the same query: the sentinel
+    needs no attribution, the NULL-conclusion inference still does."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        attributed=1,
+    )
+    store.record_event(
+        kind="reap", job_id=2, repo="o/r", ts=2.0, config_version="v", conclusion=None
+    )  # unattributed NULL: the lane's job was never observed, not a known failure
+    store.record_event(
+        kind="reap", job_id=3, repo="o/r", ts=3.0, config_version="v", conclusion="infra_failure"
+    )
+
+    assert infra_failures(store.conn) == 1  # job 3 only
     store.close()
 
 
@@ -1121,7 +1292,9 @@ def test_report_marks_binding_gate_column_unavailable_on_an_old_schema_db(tmp_pa
 def test_report_marks_infra_failures_unavailable_on_an_old_schema_db(tmp_path) -> None:
     conn = _old_schema_db(tmp_path, rows=[(1, "reap", None, 1.0, "v", "node")])
     report = render_report(conn)
-    assert "Reaps with no resolvable conclusion: unavailable" in report
+    infra_line, _, _ = report.partition("Reaps where the conclusion lookup itself")
+    assert "Reaps with no resolvable conclusion" in infra_line
+    assert "unavailable" in infra_line
     conn.close()
 
 
@@ -1271,3 +1444,393 @@ def test_comparison_still_renders_metrics_that_do_not_depend_on_reasons(tmp_path
     assert "4242" in out
     assert "Queue Wait" in out
     store.close()
+
+
+def test_infra_failures_ignores_unattributed_reaps(tmp_path) -> None:
+    """A lane spawned for a job it never ran leaves that job queued with a NULL conclusion."""
+    path = str(tmp_path / "metrics.db")
+    store = MetricsStore(path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=100.0,
+        config_version="v1",
+        conclusion="success",
+        attributed=1,
+        spawned_for_job_id=1,
+    )
+    store.record_event(  # pre-fix row: identity is a prediction, conclusion NULL
+        kind="reap",
+        job_id=2,
+        repo="o/r",
+        ts=101.0,
+        config_version="v1",
+    )
+    store.record_event(  # attributed, genuinely no terminal conclusion
+        kind="reap",
+        job_id=3,
+        repo="o/r",
+        ts=102.0,
+        config_version="v1",
+        attributed=1,
+        spawned_for_job_id=3,
+    )
+    store.close()
+
+    conn = open_readonly(path)
+
+    assert infra_failures(conn) == 1  # job 3 only; job 2 is unattributed, not a failure
+
+
+def test_the_null_branch_contributes_nothing_before_any_attributed_reap(tmp_path) -> None:
+    """Before attribution lands, a NULL conclusion cannot be read as a failure — but that
+    suppresses the NULL branch alone, not the whole answer.
+
+    This test previously asserted None for the entire function. That global guard was
+    wrong in composition: the same floor also suppressed the 'infra_failure' sentinel,
+    which needs no attribution, so a host that died before any lane went busy vanished
+    from the headline while still appearing in the per-host table. The sentinel is now
+    gated only by the conclusion floor (see _infra_failure_terms), and what remains
+    unknowable — an unattributed NULL — is simply not counted.
+    """
+    path = str(tmp_path / "metrics.db")
+    store = MetricsStore(path)
+    store.record_event(
+        kind="reap", job_id=1, repo="o/r", ts=100.0, config_version="v1", conclusion="success"
+    )
+    store.record_event(
+        kind="reap", job_id=2, repo="o/r", ts=101.0, config_version="v1", conclusion=None
+    )
+    store.close()
+
+    # Job 2's NULL is unattributed, so it is not counted; nothing else qualifies.
+    assert infra_failures(open_readonly(path)) == 0
+
+
+def test_infra_failures_is_unknown_when_the_attributed_column_is_absent(tmp_path) -> None:
+    """Without the column the NULL branch cannot state its burden of proof at all, so the
+    honest answer is "cannot tell", not a count built from bare NULLs."""
+    db = tmp_path / "half-migrated.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL, kind TEXT NOT NULL, job_id INTEGER NOT NULL,
+            repo TEXT NOT NULL, config_version TEXT NOT NULL, conclusion TEXT
+        );
+        INSERT INTO events (ts, kind, job_id, repo, config_version, conclusion)
+        VALUES (100.0, 'reap', 1, 'o/r', 'v1', 'success'),
+               (101.0, 'reap', 2, 'o/r', 'v1', NULL);
+        """
+    )
+    conn.commit()
+
+    assert infra_failures(conn) is None
+    conn.close()
+
+
+def test_idle_reaps_counts_reclaimed_idle_lanes(tmp_path) -> None:
+    """An idle_reap row means a lane was reclaimed without ever running a job — wasted
+    capacity, not a job outcome, so it must be counted separately from infra_failures and
+    must never be conflated with `kind='reap'` (ci_bench's other queries already filter on
+    `kind='reap'` and so ignore idle_reap rows entirely)."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="idle_reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        reason="idle",
+        lane_id="lane-1",
+        spawned_for_job_id=1,
+    )
+    store.record_event(
+        kind="reap", job_id=2, repo="o/r", ts=2.0, config_version="v", conclusion="success"
+    )
+    assert idle_reaps(store.conn) == 1
+    store.close()
+
+
+def test_idle_reaps_counts_repeated_idle_boots_of_the_same_job(tmp_path) -> None:
+    """The realistic pathology this counter exists to surface: job 7 is handed a lane,
+    the lane goes idle and is reclaimed, and job 7 is later handed ANOTHER lane that
+    also goes idle. These two rows carry the historical lane-id shape, derived from the
+    job id, so they are identical in every column but `ts` — the worst case for dedup:
+    DISTINCT job_id and DISTINCT lane_id both collapse it to 1. Only counting rows (each
+    idle_reap row is one lane that booted, ran nothing, and was reclaimed — see
+    _reap_idle_lane's emit-then-ledger-remove ordering) gets 2."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="idle_reap",
+        job_id=7,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        reason="idle",
+        lane_id="powerserver-cici-7",
+        spawned_for_job_id=7,
+    )
+    store.record_event(
+        kind="idle_reap",
+        job_id=7,
+        repo="o/r",
+        ts=2.0,
+        config_version="v",
+        reason="idle",
+        lane_id="powerserver-cici-7",
+        spawned_for_job_id=7,
+    )
+    assert idle_reaps(store.conn) == 2
+    store.close()
+
+
+def test_idle_reaps_combines_since_and_config_version_filters(tmp_path) -> None:
+    """since and config_version must AND together, not override one another — same
+    contract as the other counters in this module."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="idle_reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v1",
+        reason="idle",
+        lane_id="lane-1",
+    )
+    store.record_event(
+        kind="idle_reap",
+        job_id=2,
+        repo="o/r",
+        ts=100.0,
+        config_version="v1",
+        reason="idle",
+        lane_id="lane-2",
+    )
+    store.record_event(
+        kind="idle_reap",
+        job_id=3,
+        repo="o/r",
+        ts=100.0,
+        config_version="v2",
+        reason="idle",
+        lane_id="lane-3",
+    )
+    conn = store.conn
+    assert idle_reaps(conn, since=50.0, config_version="v1") == 1
+    store.close()
+
+
+def test_idle_reaps_is_zero_on_a_database_that_predates_the_idle_reaper(tmp_path) -> None:
+    """Unlike infra_failures, no validity floor is needed here: a pre-idle-reaper database
+    simply has no `kind='idle_reap'` rows at all, so 0 is the true count, not a NULL
+    masquerading as a failure that never happened."""
+    conn = _old_schema_db(tmp_path, rows=[(1, "reap", None, 1.0, "v", "node")])
+    assert idle_reaps(conn) == 0
+    conn.close()
+
+
+def test_report_includes_an_idle_reaps_line(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.record_event(
+        kind="idle_reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        reason="idle",
+        lane_id="lane-1",
+    )
+    report = render_report(store.conn)
+    _, _, after = report.partition("Lanes reclaimed idle")
+    assert after, "report is missing the idle-reaps line"
+    assert "1." in after.splitlines()[0]
+    store.close()
+
+
+def test_report_notes_that_a_zero_idle_reap_count_can_mean_not_yet_deployed(tmp_path) -> None:
+    """0 is ambiguous the same way it would be for infra_failures, just without a column
+    to guard on: it can genuinely mean no lane ever sat idle, or it can mean the idle
+    reaper wasn't running for this window at all. The report must say so rather than
+    stating a bare 0 as if it were unqualified good news."""
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap", job_id=1, repo="o/r", ts=1.0, config_version="v", conclusion="success"
+    )
+    report = render_report(store.conn)
+    _, _, after = report.partition("Lanes reclaimed idle")
+    assert after, "report is missing the idle-reaps line"
+    line = after.splitlines()[0]
+    assert "0." in line
+    assert "also mean" in line.lower()
+    store.close()
+
+
+def test_infra_failures_is_none_when_attributed_column_is_absent_but_conclusion_exists(
+    tmp_path,
+) -> None:
+    """The state ci-bench will actually be pointed at until the controller is redeployed
+    with this task's change: `conclusion` exists (Task 2) but `attributed` doesn't yet
+    (Task 5). Every `_old_schema_db` fixture in this file lacks both columns and
+    short-circuits on the `conclusion` guard before `_attribution_validity_floor`'s own
+    `attributed` column guard ever runs — this is the one test that actually reaches it."""
+    conn = _conclusion_but_not_attributed_db(
+        tmp_path, rows=[(1, "reap", "success", 1.0, "v", "node")]
+    )
+    assert infra_failures(conn) is None
+    conn.close()
+
+
+def test_report_renders_without_raising_when_attributed_column_is_absent(tmp_path) -> None:
+    """Guards the exact regression Finding 6/fold-in-3 called out: without the column
+    guard in _attribution_validity_floor, this raises sqlite3.OperationalError('no such
+    column: attributed') instead of degrading to 'unavailable'."""
+    conn = _conclusion_but_not_attributed_db(
+        tmp_path, rows=[(1, "reap", "success", 1.0, "v", "node")]
+    )
+    report = render_report(conn)
+    assert "unavailable" in report.lower()
+    conn.close()
+
+
+def _attach(store, *, job_id, spawned_for, ts=1.0, config_version="v") -> None:
+    store.record_event(
+        kind="attach",
+        job_id=job_id,
+        spawned_for_job_id=spawned_for,
+        attributed=1,
+        repo="o/r",
+        ts=ts,
+        config_version=config_version,
+        lane_id=f"powerserver-cici-{spawned_for}-aaaaaa",
+    )
+
+
+def test_spawn_divergence_counts_lanes_given_a_different_job(tmp_path) -> None:
+    """The number this whole attribution effort exists to expose: how often GitHub hands a
+    registering runner a job other than the one the lane was spawned for."""
+    store = _store(tmp_path)
+    _attach(store, job_id=901, spawned_for=7)
+    _attach(store, job_id=902, spawned_for=8)
+    _attach(store, job_id=9, spawned_for=9)
+
+    assert spawn_divergence(store.conn) == (2, 3)
+    store.close()
+
+
+def test_spawn_divergence_is_unavailable_without_the_spawned_for_column(tmp_path) -> None:
+    """A snapshot from a controller that predates the column cannot answer the question;
+    reporting 0 divergence would read as "attribution is always right"."""
+    conn = _old_schema_db(tmp_path, rows=[(1, "reap", None, 1.0, "v", "node")])
+
+    assert spawn_divergence(conn) is None
+    conn.close()
+
+
+def test_spawn_divergence_combines_since_and_config_version_filters(tmp_path) -> None:
+    store = _store(tmp_path)
+    _attach(store, job_id=901, spawned_for=7, ts=1.0, config_version="v1")
+    _attach(store, job_id=902, spawned_for=8, ts=100.0, config_version="v1")
+    _attach(store, job_id=903, spawned_for=9, ts=100.0, config_version="v2")
+
+    assert spawn_divergence(store.conn, since=50.0, config_version="v1") == (1, 1)
+    store.close()
+
+
+def test_report_includes_a_spawn_divergence_line(tmp_path) -> None:
+    store = _store(tmp_path)
+    _attach(store, job_id=901, spawned_for=7)
+    _attach(store, job_id=8, spawned_for=8)
+
+    report = render_report(store.conn)
+
+    _, _, after = report.partition("Lanes handed a job other than the one they were spawned for")
+    assert after, "report is missing the spawn-divergence line"
+    assert "1 of 2" in after.splitlines()[0]
+    store.close()
+
+
+def test_report_says_spawn_divergence_is_unavailable_on_an_old_snapshot(tmp_path) -> None:
+    conn = _old_schema_db(tmp_path, rows=[(1, "reap", None, 1.0, "v", "node")])
+
+    report = render_report(conn)
+
+    _, _, after = report.partition("Lanes handed a job other than the one they were spawned for")
+    assert "unavailable" in after.splitlines()[0]
+    conn.close()
+
+
+def _lost_lane_db(tmp_path):
+    store = _store(tmp_path)
+    store.record_event(
+        kind="reap",
+        job_id=1,
+        repo="o/r",
+        ts=1.0,
+        config_version="v",
+        class_name="light",
+        conclusion="success",
+        attributed=1,
+        host="powerserver",
+    )
+    store.record_event(  # attributed lane on a lost host: a real job-level failure
+        kind="reap",
+        job_id=2,
+        repo="o/r",
+        ts=2.0,
+        config_version="v",
+        class_name="light",
+        conclusion="infra_failure",
+        attributed=1,
+        host="desktop",
+    )
+    store.record_event(  # booting lane on the same lost host: no observed job
+        kind="reap",
+        job_id=3,
+        repo="o/r",
+        ts=3.0,
+        config_version="v",
+        class_name="light",
+        conclusion="lane_lost_unattributed",
+        host="desktop",
+    )
+    return store
+
+
+def test_a_lane_lost_before_attribution_is_not_a_job_infra_failure(tmp_path) -> None:
+    """job_id on such a row is spawned_for_job_id — a prediction. Counting it would blame
+    a job that may never have run on that lane."""
+    store = _lost_lane_db(tmp_path)
+
+    assert infra_failures(store.conn) == 1  # job 2 only
+    store.close()
+
+
+def test_lanes_lost_unattributed_are_counted_on_their_own(tmp_path) -> None:
+    """The lane really was lost with its host — a lane-level fact worth surfacing, just
+    not as a job outcome. Silently dropping it would trade one wrong number for a blind
+    spot."""
+    store = _lost_lane_db(tmp_path)
+
+    assert lanes_lost_unattributed(store.conn) == 1
+    store.close()
+
+
+def test_the_report_separates_lost_lanes_from_job_infra_failures(tmp_path) -> None:
+    store = _lost_lane_db(tmp_path)
+
+    report = render_report(store.conn)
+
+    assert "lost with their host before" in report
+    store.close()
+
+
+def test_lanes_lost_unattributed_is_zero_on_a_database_without_the_sentinel(tmp_path) -> None:
+    """Absence of the sentinel is a true zero, not "cannot tell": a database written
+    before it existed has no such rows, and no pre-existing NULL to mistake for one."""
+    conn = _old_schema_db(tmp_path, rows=[(1, "reap", None, 1.0, "v", "light")])
+
+    assert lanes_lost_unattributed(conn) == 0
+    conn.close()

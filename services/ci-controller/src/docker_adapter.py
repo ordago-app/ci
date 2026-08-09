@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -19,6 +20,15 @@ CLASS_LABEL = "com.homelab.ci-controller.class"
 # The lane's host, for the same reason: with more than one host the ledger must know
 # WHICH host's budget a re-adopted lane spends.
 HOST_LABEL = "com.homelab.ci-controller.host"
+
+
+def _random_suffix() -> str:
+    """Six hex chars, drawn per spawn. Lane identity must not be derived from the job id:
+    GitHub can hand a lane a different job than the one it was spawned for, which frees
+    the spawned-for job for re-admission while the first lane is still running. Two lanes
+    for the same job then coexist, and they need distinct container names, runner names
+    and work dirs."""
+    return uuid.uuid4().hex[:6]
 
 
 def _cpu_percent(stats: dict) -> float:
@@ -52,6 +62,7 @@ class DockerAdapter:
         host: str,
         host_config: HostConfig,
         client_factory: Callable[[str], docker.DockerClient] | None = None,
+        suffix_factory: Callable[[], str] = _random_suffix,
     ) -> None:
         # Either a ready client (tests, and the single-host callers) or a factory that
         # builds one on demand. NEVER build it eagerly in __init__: docker.DockerClient
@@ -63,6 +74,7 @@ class DockerAdapter:
         self._config = config
         self._host = host
         self._host_config = host_config
+        self._suffix_factory = suffix_factory
 
     @property
     def _client(self) -> docker.DockerClient:
@@ -74,9 +86,11 @@ class DockerAdapter:
             self._client_or_none = self._client_factory(self._host_config.docker_endpoint)
         return self._client_or_none
 
-    def spawn(self, decision: AdmitDecision, registration_token: str) -> str:
+    def spawn(self, decision: AdmitDecision, registration_token: str) -> tuple[str, str]:
         job = decision.job
-        lane_id = f"{self._host}-cici-{job.job_id}"
+        # `{host}-cici-{job_id}` keeps a lane greppable back to the job that motivated it;
+        # the suffix is what makes the identity the lane's own rather than the job's.
+        lane_id = f"{self._host}-cici-{job.job_id}-{self._suffix_factory()}"
         job_class = self._config.classes[decision.class_name]
 
         # Bind the work_dir BASE (pre-created by ansible, owned by the runner uid) rather
@@ -132,8 +146,8 @@ class DockerAdapter:
         if self._host_config.cpu_shares is not None:
             run_kwargs["cpu_shares"] = self._host_config.cpu_shares
 
-        self._client.containers.run(self._config.runner_image, **run_kwargs)
-        return lane_id
+        container = self._client.containers.run(self._config.runner_image, **run_kwargs)
+        return lane_id, container.id
 
     def list_lanes(self) -> list[LaneInfo]:
         containers = self._client.containers.list(filters={"label": LANE_LABEL})

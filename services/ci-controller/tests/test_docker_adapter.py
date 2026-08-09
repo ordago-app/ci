@@ -1,3 +1,5 @@
+import itertools
+import re
 from collections import defaultdict
 from unittest.mock import MagicMock
 
@@ -16,11 +18,24 @@ from src.models import AdmitDecision, QueuedJob
 from tests.conftest import VALID_CONFIG
 
 
-def _adapter(write_config, host="powerserver", host_config=None):
+def _adapter(write_config, host="powerserver", host_config=None, suffix_factory=None):
+    """Adapter with a deterministic lane-id suffix, so tests can assert exact ids.
+
+    Production takes the adapter's own random suffix; the tests that care about it
+    build a DockerAdapter directly instead of going through here.
+    """
     cfg = ControllerConfig.load(write_config(VALID_CONFIG))
     client = MagicMock()
     resolved = host_config or cfg.resolved_hosts()[host]
-    return DockerAdapter(client=client, config=cfg, host=host, host_config=resolved), client, cfg
+    counter = itertools.count(1)
+    adapter = DockerAdapter(
+        client=client,
+        config=cfg,
+        host=host,
+        host_config=resolved,
+        suffix_factory=suffix_factory or (lambda: f"{next(counter):06x}"),
+    )
+    return adapter, client, cfg
 
 
 def test_spawn_light_lane(write_config) -> None:
@@ -30,15 +45,15 @@ def test_spawn_light_lane(write_config) -> None:
     )
     decision = AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False)
 
-    lane_id = adapter.spawn(decision, registration_token="ARRT")
+    lane_id, _container_id = adapter.spawn(decision, registration_token="ARRT")
 
-    assert lane_id == "powerserver-cici-42"
+    assert lane_id == "powerserver-cici-42-000001"
     _, kwargs = client.containers.run.call_args
-    assert kwargs["name"] == "github-runner-powerserver-cici-42"
+    assert kwargs["name"] == "github-runner-powerserver-cici-42-000001"
     assert kwargs["network"] == "homelab"
     assert kwargs["auto_remove"] is True
     assert kwargs["labels"] == {
-        LANE_LABEL: "powerserver-cici-42",
+        LANE_LABEL: "powerserver-cici-42-000001",
         JOB_LABEL: "42",
         CLASS_LABEL: "light",
         HOST_LABEL: "powerserver",
@@ -55,7 +70,8 @@ def test_spawn_light_lane(write_config) -> None:
     # work dir: bind the SSD base (owned by uid 1000) and let the runner create its own
     # per-lane subdir inside it — avoids docker auto-creating a root-owned per-lane dir.
     assert kwargs["volumes"]["/mnt/ci-ssd/ci-controller"] == {"bind": "/runner-base", "mode": "rw"}
-    assert kwargs["environment"]["RUNNER_WORKDIR"] == "/runner-base/powerserver-cici-42-work"
+    assert kwargs["environment"]["RUNNER_WORKDIR"] == "/runner-base/powerserver-cici-42-000001-work"
+    assert kwargs["environment"]["RUNNER_NAME"] == "powerserver-cici-42-000001"
 
 
 def test_spawn_emulator_lane_gets_kvm(write_config) -> None:
@@ -76,7 +92,7 @@ def test_spawn_emulator_lane_gets_kvm(write_config) -> None:
         "bind": "/runner-base",
         "mode": "rw",
     }
-    assert kwargs["environment"]["RUNNER_WORKDIR"] == "/runner-base/powerserver-cici-7-work"
+    assert kwargs["environment"]["RUNNER_WORKDIR"] == "/runner-base/powerserver-cici-7-000001-work"
 
 
 def test_list_lanes(write_config) -> None:
@@ -97,6 +113,74 @@ def test_list_lanes(write_config) -> None:
     assert lanes[0].class_name is None
     _, kwargs = client.containers.list.call_args
     assert kwargs["filters"] == {"label": LANE_LABEL}
+
+
+def test_spawn_stamps_lane_identity_on_the_container(write_config) -> None:
+    adapter, client, _ = _adapter(write_config)
+    client.containers.run.return_value = MagicMock(id="deadbeef")
+    job = QueuedJob(
+        job_id=7,
+        repo="alvaro-francisco-gil/homelab",
+        labels=["self-hosted", "homelab"],
+        workflow="CI",
+        job_name="pytest",
+    )
+    decision = AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False)
+
+    lane_id, container_id = adapter.spawn(decision, registration_token="ARRT")
+
+    labels = client.containers.run.call_args.kwargs["labels"]
+    assert (lane_id, container_id) == ("powerserver-cici-7-000001", "deadbeef")
+    assert labels[CLASS_LABEL] == "light"
+    assert labels[HOST_LABEL] == "powerserver"
+
+
+def test_two_lanes_for_the_same_job_get_distinct_identities(write_config) -> None:
+    """A job whose lane was stolen is re-admitted while the first lane still runs. Both
+    lanes must be able to coexist: same ledger, same Docker daemon, same runner names."""
+    adapter, client, _ = _adapter(write_config)
+    job = QueuedJob(job_id=7, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    decision = AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False)
+
+    first, _ = adapter.spawn(decision, registration_token="ARRT")
+    second, _ = adapter.spawn(decision, registration_token="ARRT")
+
+    calls = client.containers.run.call_args_list
+    names = [c.kwargs["name"] for c in calls]
+    workdirs = [c.kwargs["environment"]["RUNNER_WORKDIR"] for c in calls]
+    assert first != second
+    assert len(set(names)) == 2
+    assert len(set(workdirs)) == 2
+
+
+def test_lane_id_keeps_the_host_and_job_prefix(write_config) -> None:
+    """The prefix is what makes a lane greppable back to the job that motivated it."""
+    adapter, _client, _ = _adapter(write_config)
+    job = QueuedJob(job_id=7, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    decision = AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False)
+
+    lane_id, _ = adapter.spawn(decision, registration_token="ARRT")
+
+    assert lane_id.startswith("powerserver-cici-7-")
+
+
+def test_the_default_suffix_is_unique_per_spawn(write_config) -> None:
+    """Production injects no suffix_factory, so the built-in one must not repeat."""
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    client = MagicMock()
+    adapter = DockerAdapter(
+        client=client,
+        config=cfg,
+        host="powerserver",
+        host_config=cfg.resolved_hosts()["powerserver"],
+    )
+    job = QueuedJob(job_id=7, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    decision = AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False)
+
+    ids = {adapter.spawn(decision, registration_token="ARRT")[0] for _ in range(50)}
+
+    assert len(ids) == 50
+    assert all(re.fullmatch(r"powerserver-cici-7-[0-9a-f]{6}", lane_id) for lane_id in ids)
 
 
 def test_list_lanes_reads_the_class_label(write_config) -> None:

@@ -5,6 +5,12 @@ module produces feeds config decisions, so correctness beats elegance —
 in particular, every count below is COUNT(DISTINCT job_id), never a row
 count. A queued job re-defers on every poll tick, so counting rows instead of
 distinct jobs overstates demand by roughly 17x on this dataset.
+
+The one exception is idle_reaps(), which counts rows (COUNT(*)) — see its docstring
+for why the row, not any column on it, is the unit of wasted capacity.
+
+The statistics below take two optional filters, `since` and `config_version` (gate_counts
+takes only `since`). They are independent: passing both applies both (AND), not either-or.
 """
 
 from __future__ import annotations
@@ -16,6 +22,8 @@ import sys
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
+
+from src.models import LANE_LOST_UNATTRIBUTED
 
 # already_running means "this job already has a lane" — it is not a capacity
 # gate and must never appear in gate statistics.
@@ -304,6 +312,69 @@ def _conclusion_validity_floor(conn: sqlite3.Connection) -> float | None:
     return row["floor_ts"]
 
 
+def _attribution_validity_floor(conn: sqlite3.Connection) -> float | None:
+    """Earliest ts at which reap rows started carrying an observed job identity.
+
+    Before this point `job_id` on a reap row is the job the lane was *spawned for*, which
+    GitHub frequently did not give it. Any conclusion looked up against that id describes
+    the wrong job, so those rows can neither confirm nor deny an infra failure.
+
+    Mirrors _conclusion_validity_floor: None means "cannot tell yet", not "none found".
+    """
+    if "attributed" not in available_columns(conn):
+        return None
+    row = _rows(
+        conn,
+        "SELECT MIN(ts) AS floor_ts FROM events WHERE kind='reap' AND attributed = 1",
+        [],
+    ).fetchone()
+    return row["floor_ts"]
+
+
+def _infra_failure_terms(conn: sqlite3.Connection) -> tuple[str, list[float]] | None:
+    """The one definition of "this job never reached a terminal outcome": SQL predicate
+    plus its bound floors, or None when the database cannot support the question yet.
+
+    Shared by the headline count and its per-host breakdown. Sharing a predicate alone is
+    not enough — the two must also share the *floors*, or they contradict each other in
+    the same rendered report (headline "unavailable" above a table reading 1).
+
+    Two row shapes count, each held to the floor that actually speaks to it:
+
+    - `conclusion = 'infra_failure'`, from the conclusion floor. The controller writes
+      this sentinel when it reaps a lane whose host had already disappeared mid-job. It
+      is a positive statement about the lane, not an inference from a gap, so attribution
+      has no bearing on it: a host that dies before any of its lanes goes busy produces
+      nothing but unattributed sentinels, and gating those on the attribution floor would
+      make the whole failure mode invisible in exactly the case it matters most.
+    - a NULL conclusion where `attributed = 1`, from the later of the two floors. Here
+      the outcome IS inferred from a gap, and the inference is only sound once the row's
+      job id is the job the lane actually ran. An unattributed reap carries the job the
+      lane was *spawned for*; if that lane was stolen, the spawned-for job is still
+      queued with no conclusion, which looks identical to an infra failure without being
+      one. On first deploy, counting bare NULLs reported ~4,000 false positives from
+      history alone.
+
+    When no reap has ever been attributed the second term is dropped rather than given an
+    unsatisfiable floor: with nothing attributed it could not match a row anyway, and
+    omitting it keeps the emitted SQL honest about what is being asked.
+
+    Returns None when `conclusion` is missing or has never been written (nothing is
+    assessable at all), or when `attributed` is missing entirely — without that column
+    the NULL branch cannot express its burden of proof.
+    """
+    conclusion_floor = _conclusion_validity_floor(conn)
+    if conclusion_floor is None or "attributed" not in available_columns(conn):
+        return None
+    terms = ["conclusion = 'infra_failure' AND ts >= ?"]
+    params: list[float] = [conclusion_floor]
+    attribution_floor = _attribution_validity_floor(conn)
+    if attribution_floor is not None:
+        terms.append("conclusion IS NULL AND attributed = 1 AND ts >= ?")
+        params.append(max(conclusion_floor, attribution_floor))
+    return " OR ".join(f"({term})" for term in terms), params
+
+
 def infra_failures(
     conn: sqlite3.Connection,
     since: float | None = None,
@@ -311,40 +382,31 @@ def infra_failures(
 ) -> int | None:
     """Reap events that never reached a terminal GitHub conclusion.
 
-    Two shapes count: a NULL conclusion (the controller looked up the job and
-    GitHub reported nothing terminal) and the explicit `'infra_failure'` sentinel
-    (Task 13 — the controller reaped the lane without even attempting a lookup,
-    because the lane's host had already disappeared mid-job). Counting only NULL
-    would make Task 13's whole reason for existing invisible in this report.
+    Which rows count, and the floor each is held to, is defined once in
+    `_infra_failure_terms()`; `_host_summary()` breaks this same number down per host
+    using the same definition, so one report can never state two different totals.
 
-    Counted only at or after `_conclusion_validity_floor()`: rows older than
-    that are NULL because the `conclusion` column did not exist yet, not
-    because anything failed, so they must never be counted as infra
-    failures. See the module-level note in the plan: on first deploy this
-    would otherwise report ~4,000 false infra failures from history alone.
+    "lookup_failed" (exception swallowed), "adopted" (lookup skipped, no repo to query)
+    and "unattributed" (the lane's job identity was never observed, so there was no
+    right job to look up) are written as distinct sentinel strings by the controller —
+    see lookup_failures() — so this predicate must not match them: only NULL and the
+    'infra_failure' sentinel mean "genuinely no terminal conclusion", never "we don't
+    know" or "this lane was adopted, not reaped". No query in this module needs to match
+    "unattributed" specifically: those rows already fail the `attributed = 1` filter.
 
-    "Lookup failed" (exception swallowed) and "adopted" (lookup skipped, no
-    repo to query) are written as distinct sentinel strings by the
-    controller — see lookup_failures() — so this predicate must not match them:
-    only NULL and the 'infra_failure' sentinel mean "genuinely no terminal
-    conclusion", never "we don't know" or "this lane was adopted, not reaped".
-
-    Returns None if the validity floor cannot be derived (see
-    _conclusion_validity_floor) — reporting 0 would misrepresent "cannot
-    tell yet" as "no failures observed", which is a real, wrong finding.
+    Returns None when the database cannot support the question at all (see
+    _infra_failure_terms) — reporting 0 would misrepresent "cannot tell yet" as "no
+    failures observed", which is a real, wrong finding.
 
     `since` and `config_version` are independently combinable filters —
     passing both applies both (AND), not either-or.
     """
-    floor = _conclusion_validity_floor(conn)
-    if floor is None:
+    terms = _infra_failure_terms(conn)
+    if terms is None:
         return None
-    sql = (
-        "SELECT COUNT(DISTINCT job_id) AS n FROM events "
-        "WHERE kind='reap' AND (conclusion IS NULL OR conclusion = 'infra_failure') "
-        "AND ts >= ?"
-    )
-    params: list[float | str] = [floor]
+    predicate, floor_params = terms
+    sql = f"SELECT COUNT(DISTINCT job_id) AS n FROM events WHERE kind='reap' AND ({predicate})"
+    params: list[float | str] = list(floor_params)
     if since is not None:
         sql += " AND ts > ?"
         params.append(since)
@@ -391,10 +453,136 @@ def lookup_failures(
     return int(row["n"])
 
 
+def spawn_divergence(
+    conn: sqlite3.Connection,
+    since: float | None = None,
+    config_version: str | None = None,
+) -> tuple[int, int] | None:
+    """(lanes given a job other than their spawned-for one, lanes attributed at all).
+
+    GitHub hands a registering runner whichever queued job matches its labels, so the job
+    a lane runs is often not the one it was spawned for. Each `kind='attach'` row is one
+    lane whose running job was observed; the ones where `job_id != spawned_for_job_id` are
+    the divergences. Rows, not distinct ids: attribution happens at most once per lane
+    (runners are ephemeral), so one row is one lane.
+
+    Returns None when the `spawned_for_job_id` column is absent — the question cannot be
+    answered from such a snapshot, and 0 would read as "the prediction was always right".
+    No validity floor is needed beyond that: `kind='attach'` rows only exist at all in a
+    database written by a controller that records both ids.
+    """
+    if "spawned_for_job_id" not in available_columns(conn):
+        return None
+    sql = (
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN job_id != spawned_for_job_id THEN 1 ELSE 0 END) AS diverged "
+        "FROM events WHERE kind='attach' AND spawned_for_job_id IS NOT NULL"
+    )
+    params: list[float | str] = []
+    if since is not None:
+        sql += " AND ts > ?"
+        params.append(since)
+    if config_version is not None:
+        sql += " AND config_version = ?"
+        params.append(config_version)
+    row = _rows(conn, sql, params).fetchone()
+    return int(row["diverged"] or 0), int(row["total"])
+
+
+def idle_reaps(
+    conn: sqlite3.Connection,
+    since: float | None = None,
+    config_version: str | None = None,
+) -> int:
+    """Reclaimed-idle-lane instances — wasted capacity, not a job outcome, so it is kept
+    separate from infra_failures/lookup_failures rather than folded into either.
+
+    Deliberately COUNT(*), not COUNT(DISTINCT <anything>), unlike every other counter in
+    this module. Every other counter dedups by job_id because a job can generate several
+    rows for the same underlying event (e.g. a re-defer on every poll tick); an idle_reap
+    row has no such duplication to guard against, and dedup would actively hide the
+    pathology this counter exists to surface — a job repeatedly handed lanes that go idle
+    is exactly the waste being measured, and COUNT(DISTINCT job_id) collapses it to 1.
+
+    Deduping on `lane_id` instead would not hide that (since 2026-08 a lane id carries a
+    per-spawn random suffix, so it is an independent identity), but it would still be the
+    wrong instrument: every row written before that change has a lane id derived from the
+    job id (`f"{host}-cici-{job_id}"`), so a DISTINCT lane_id count would silently apply
+    job-level dedup to history and lane-level dedup to new rows.
+
+    COUNT(*) is correct for both eras because the controller emits exactly one idle_reap
+    row per reclaimed lane and removes that lane's ledger entry immediately afterward
+    (`_reap_idle_lane` in src/controller.py: `self._emit(kind="idle_reap", ...)` is
+    followed by `self.ledger.remove(res.lane_id)`, with no loop or retry between them) —
+    there is one row per wasted lane instance and no double-count to deduplicate away.
+
+    Unlike infra_failures, no validity floor is needed: `kind='idle_reap'` rows simply do
+    not exist at all in a database written before the idle-reaper shipped, so an older
+    snapshot has a true zero of them — there is no pre-existing NULL to mistake for a
+    failure that never happened.
+
+    `kind='reap'` (used throughout this module) never matches these rows, so no other
+    function here double-counts them.
+    """
+    sql = "SELECT COUNT(*) AS n FROM events WHERE kind='idle_reap'"
+    params: list[float | str] = []
+    if since is not None:
+        sql += " AND ts > ?"
+        params.append(since)
+    if config_version is not None:
+        sql += " AND config_version = ?"
+        params.append(config_version)
+    row = _rows(conn, sql, params).fetchone()
+    return int(row["n"])
+
+
+def lanes_lost_unattributed(
+    conn: sqlite3.Connection,
+    since: float | None = None,
+    config_version: str | None = None,
+) -> int:
+    """Lanes reaped because their HOST disappeared before the lane was ever attributed.
+
+    A lane-level fact, deliberately not a job outcome. The host loss is observed, but the
+    row's job_id is spawned_for_job_id — the job the lane was *predicted* to run, which
+    GitHub frequently did not hand it. infra_failures() therefore excludes these, and the
+    exclusion costs nothing to remember because controller.reconcile() writes this
+    sentinel instead of `infra_failure` precisely when attribution is missing.
+
+    Counted rather than dropped: "the desktop slept and took three lanes with it" is
+    worth seeing, and the alternative to a slightly-wrong job number is not silence.
+
+    COUNT(*), for the same reason as idle_reaps: one row per lost lane, no per-tick
+    duplication to dedup, and job-level dedup would collapse several lanes lost together
+    on one host into 1 — which is exactly the shape this counter exists to show.
+
+    No validity floor, and a missing `conclusion` column returns 0 rather than None: a
+    database written before this sentinel existed simply has no such rows, so its zero is
+    true rather than unknown. That is the opposite of infra_failures(), where a missing
+    column means every row's NULL is uninterpretable.
+
+    `since` and `config_version` are independently combinable filters —
+    passing both applies both (AND), not either-or.
+    """
+    if "conclusion" not in available_columns(conn):
+        return 0
+    sql = "SELECT COUNT(*) AS n FROM events WHERE kind='reap' AND conclusion = ?"
+    params: list[float | str] = [LANE_LOST_UNATTRIBUTED]
+    if since is not None:
+        sql += " AND ts > ?"
+        params.append(since)
+    if config_version is not None:
+        sql += " AND config_version = ?"
+        params.append(config_version)
+    row = _rows(conn, sql, params).fetchone()
+    return int(row["n"])
+
+
 # --------------------------------------------------------------------------
 # Rendering: everything below formats what the functions above compute. No
 # function past this point invents a new statistic — it only reshapes
-# gate_counts/binding_gate_counts/class_peaks/queue_waits/infra_failures
+# gate_counts/binding_gate_counts/class_peaks/queue_waits/infra_failures/
+# spawn_divergence/idle_reaps/lanes_lost_unattributed
 # output into markdown, filtered by `since` and/or `config_version` as those
 # functions already support. The per-host helpers are the one exception:
 # `host` isn't a parameter of the Task 5 functions, so a small amount of
@@ -441,30 +629,21 @@ def _host_summary(
 ) -> dict[str, dict[str, int | None]]:
     """Distinct reaped jobs and infra failures per host, for the per-host section.
 
-    Only called once _distinct_hosts() has confirmed `host` exists. An infra
-    failure here uses the same two-shape predicate as infra_failures() — a NULL
-    conclusion OR the explicit 'infra_failure' sentinel (Task 13, emitted when a
-    lane's host disappears mid-job) — and is gated behind the same
-    _conclusion_validity_floor(). Without that floor, the ~4,000 pre-migration
-    reap rows (conclusion NULL because the column didn't exist yet, not because
-    anything failed) would all read as infra failures the first time a second
-    host makes this table render at all.
+    Only called once _distinct_hosts() has confirmed `host` exists. Rows are selected by
+    `_infra_failure_terms()` — the same predicate AND the same floors infra_failures()
+    uses, which is what makes these rows a breakdown of that number rather than a second,
+    disagreeing answer printed beside it. When that returns None (nothing assessable yet)
+    infra_failures per host is reported as None rather than a wrong 0.
 
-    If `conclusion` is missing entirely (an unlikely partial-migration state,
-    since metrics.py adds both columns in the same pass) or the floor cannot
-    yet be derived (deployed, but no reap has landed since), infra_failures
-    per host is reported as None rather than a wrong 0 — same reasoning as
-    infra_failures() above.
+    `since` narrows the window further, and applies to both the per-host counts and the
+    infra-failure subset within them.
     """
-    has_conclusion = "conclusion" in available_columns(conn)
-    floor = _conclusion_validity_floor(conn) if has_conclusion else None
+    terms = _infra_failure_terms(conn)
     params: list[float] = []
-    if floor is not None:
-        infra_expr = (
-            "COUNT(DISTINCT CASE WHEN (conclusion IS NULL OR conclusion = 'infra_failure') "
-            "AND ts >= ? THEN job_id END)"
-        )
-        params.append(floor)
+    if terms is not None:
+        predicate, floor_params = terms
+        infra_expr = f"COUNT(DISTINCT CASE WHEN ({predicate}) THEN job_id END)"
+        params.extend(floor_params)
     else:
         infra_expr = "NULL"
     sql = (
@@ -556,10 +735,31 @@ def _render_peaks_table(peaks: dict[str, dict[str, int]]) -> list[str]:
     return lines
 
 
-def _fmt_infra_failures(n: int | None) -> str:
+def _fmt_optional_count(n: int | None, unavailable_reason: str) -> str:
+    """Render a count that degrades to None instead of a number — see the None-handling
+    note on infra_failures()/lookup_failures()/etc. `unavailable_reason` names exactly
+    what THIS caller's None means, since different counters go unavailable for different
+    reasons (missing `conclusion` vs. missing `attributed`) and a shared generic message
+    would misname the cause for whichever caller it doesn't actually apply to.
+    """
     if n is None:
-        return "unavailable — requires the `conclusion` column (controller redeploy pending)"
+        return f"unavailable — {unavailable_reason} (controller redeploy pending)"
     return str(n)
+
+
+def _fmt_infra_failures(n: int | None) -> str:
+    return _fmt_optional_count(n, "requires the `conclusion` and `attributed` columns")
+
+
+def _fmt_spawn_divergence(counts: tuple[int, int] | None) -> str:
+    if counts is None:
+        return _fmt_optional_count(None, "requires the `spawned_for_job_id` column")
+    diverged, total = counts
+    return f"{diverged} of {total} attributed lanes"
+
+
+def _fmt_lookup_failures(n: int | None) -> str:
+    return _fmt_optional_count(n, "requires the `conclusion` column")
 
 
 def _split_by_eligibility(counts: dict[str, int]) -> tuple[dict[str, int], dict[str, int]]:
@@ -742,21 +942,52 @@ def render_report(
     lines.append("## Infra Failures")
     lines.append("")
     conclusion_floor = _conclusion_validity_floor(conn)
-    if conclusion_floor is not None:
+    attribution_floor = _attribution_validity_floor(conn)
+    if conclusion_floor is not None and attribution_floor is not None:
+        effective_floor = max(conclusion_floor, attribution_floor)
+        moved_note = (
+            " (later than the earliest `conclusion` value, because this database didn't "
+            "start recording an observed job identity via `attributed` until after it "
+            "started recording `conclusion`)"
+            if attribution_floor > conclusion_floor
+            else ""
+        )
         lines.append(
-            f"Counted only for reaps at or after {_fmt_ts(conclusion_floor)}, the earliest "
-            "point this database recorded a `conclusion` value — rows before that are NULL "
-            "because the column did not exist yet, not because anything failed."
+            f"Counted only for reaps at or after {_fmt_ts(effective_floor)}, the later of "
+            "the earliest `conclusion` value and the earliest `attributed` reap this "
+            f"database has recorded{moved_note}. Rows before that are either NULL because "
+            "a column did not exist yet, or carry the job a lane was spawned for rather "
+            "than the job GitHub actually ran — neither is a real infra failure."
         )
         lines.append("")
     lines.append(
-        "Reaps with no resolvable conclusion: "
+        "Reaps with no resolvable conclusion, counted over attributed reaps only "
+        "(a genuine infra failure on an unattributed lane is not counted here — see "
+        "the infra_failures() docstring): "
         f"{_fmt_infra_failures(infra_failures(conn, since=since))}."
     )
     lines.append(
         "Reaps where the conclusion lookup itself failed (exception swallowed, e.g. a "
         'missing GitHub App permission) — kept separate because it means "unknown", not '
-        f'"failed": {_fmt_infra_failures(lookup_failures(conn, since=since))}.'
+        f'"failed": {_fmt_lookup_failures(lookup_failures(conn, since=since))}.'
+    )
+    lines.append(
+        "Lanes handed a job other than the one they were spawned for — GitHub matches a "
+        "registering runner to any queued job carrying its labels, and the spawned-for job "
+        "is released back for admission when that happens: "
+        f"{_fmt_spawn_divergence(spawn_divergence(conn, since=since))}."
+    )
+    lines.append(
+        "Lanes lost with their host before they were ever attributed — the host went away "
+        "(a sleeping desktop, a stopped WSL distro) while the lane was still booting, so "
+        "there is no observed job to blame and these are NOT counted as infra failures "
+        f"above: {lanes_lost_unattributed(conn, since=since)}."
+    )
+    lines.append(
+        "Lanes reclaimed idle without ever running a job — wasted capacity, not a job "
+        "outcome, so it is kept separate from both figures above: "
+        f"{idle_reaps(conn, since=since)}. (0 can also mean the idle reaper wasn't deployed "
+        "or wasn't running for all of this window, not that no lane ever sat idle.)"
     )
 
     hosts = _distinct_hosts(conn, since=since)
@@ -866,13 +1097,13 @@ def render_comparison(conn: sqlite3.Connection, version_a: str, version_b: str) 
         lines.append("### Infra Failures")
         lines.append("")
         lines.append(
-            "Reaps with no resolvable conclusion: "
+            "Reaps with no resolvable conclusion, counted over attributed reaps only: "
             f"{_fmt_infra_failures(infra_failures(conn, config_version=version))}."
         )
         lines.append(
             "Reaps where the conclusion lookup itself failed (kept separate — see the "
             "Infra Failures note in the main capacity report): "
-            f"{_fmt_infra_failures(lookup_failures(conn, config_version=version))}."
+            f"{_fmt_lookup_failures(lookup_failures(conn, config_version=version))}."
         )
         lines.append("")
 

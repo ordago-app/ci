@@ -345,7 +345,7 @@ def test_defer_records_every_binding_gate_not_just_the_first(write_config) -> No
     ledger.add(
         Reservation(
             lane_id="lane-1",
-            job_id=1,
+            spawned_for_job_id=1,
             repo="alvaro-francisco-gil/homelab",
             class_name="light",
             ram_mb=900,
@@ -393,7 +393,7 @@ def test_a_job_deferred_by_the_primary_lands_on_the_second_host(write_config) ->
     ledger.add(
         Reservation(
             lane_id="lane-1",
-            job_id=1,
+            spawned_for_job_id=1,
             repo="alvaro-francisco-gil/homelab",
             class_name="light",
             ram_mb=700,
@@ -420,7 +420,7 @@ def test_the_emulator_class_is_never_scheduled_off_its_allowed_host(write_config
     ledger.add(
         Reservation(
             lane_id="lane-1",
-            job_id=1,
+            spawned_for_job_id=1,
             repo="alvaro-francisco-gil/homelab",
             class_name="light",
             ram_mb=700,
@@ -452,7 +452,7 @@ def test_an_unhealthy_host_is_skipped_for_admission(write_config) -> None:
     ledger.add(
         Reservation(
             lane_id="lane-1",
-            job_id=1,
+            spawned_for_job_id=1,
             repo="alvaro-francisco-gil/homelab",
             class_name="light",
             ram_mb=700,
@@ -487,7 +487,7 @@ def test_reasons_match_the_closest_host_not_the_first(write_config) -> None:
     ledger.add(
         Reservation(
             lane_id="lane-ps",
-            job_id=1,
+            spawned_for_job_id=1,
             repo="alvaro-francisco-gil/homelab",
             class_name="light",
             ram_mb=3500,
@@ -500,7 +500,7 @@ def test_reasons_match_the_closest_host_not_the_first(write_config) -> None:
         ledger.add(
             Reservation(
                 lane_id=f"lane-pv-{index}",
-                job_id=index,
+                spawned_for_job_id=index,
                 repo="alvaro-francisco-gil/homelab",
                 class_name="light",
                 ram_mb=700,
@@ -647,7 +647,7 @@ def test_a_disabled_host_is_never_scheduled_on(write_config) -> None:
     ledger.add(
         Reservation(
             lane_id="lane-1",
-            job_id=1,
+            spawned_for_job_id=1,
             repo="alvaro-francisco-gil/homelab",
             class_name="light",
             ram_mb=700,

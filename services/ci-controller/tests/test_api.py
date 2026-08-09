@@ -45,6 +45,30 @@ def test_metrics_prometheus_text() -> None:
     assert "ci_kvm_in_use 0" in body
 
 
+def test_metrics_exposes_ci_lanes_booting_gauge() -> None:
+    """status() only ever produces busy/booting — a lane 20 s into its boot is not idle
+    capacity, so the gauge, the /status field and the CLI label all say booting."""
+    payload = {
+        "budget_ram_mb": 9000,
+        "ledger_ram_mb": 1400,
+        "lanes_running": 2,
+        "max_lanes": 4,
+        "kvm_in_use": False,
+        "running": [
+            {"lane_id": "powerserver-cici-7", "job_id": None, "state": "booting"},
+            {"lane_id": "powerserver-cici-8", "job_id": 901, "state": "busy"},
+        ],
+        "deferred": [],
+        "config_version": "abc123",
+        "admission_mode": "reservation",
+        "disk_gb": {},
+    }
+    client = _client(payload)
+    body = client.get("/metrics").text
+    assert "ci_lanes_booting 1" in body
+    assert "ci_lanes_idle" not in body
+
+
 def test_metrics_exposes_info_and_disk_gauges() -> None:
     payload = {
         "budget_ram_mb": 9000,
