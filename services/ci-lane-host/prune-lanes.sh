@@ -22,13 +22,25 @@ set -euo pipefail
 
 WORK_DIR="${CI_LANE_WORK_DIR:?CI_LANE_WORK_DIR must be set}"
 
+# Must equal LANE_LABEL in services/ci-controller/src/docker_adapter.py; a test
+# asserts the two agree, because a rename there would silently turn this script
+# into "delete every work dir".
+LANE_LABEL="com.homelab.ci-controller.lane"
+
 before="$(df -BM --output=avail "$WORK_DIR" | tail -1 | tr -dc '0-9')"
 
 # Lanes docker still knows about, running or not — `docker ps -a`, because a lane
 # that exited seconds ago may not have been reaped yet and its dir is not ours to
 # delete. An empty/failed listing means we cannot prove anything is dead, so we
 # delete nothing rather than guess.
-if ! live="$(docker ps -a --format '{{.Names}}' 2>/dev/null)"; then
+#
+# Keyed on the lane LABEL, not the container name. The container is named
+# `github-runner-<lane_id>` (docker_adapter.py) while the work dir is
+# `<lane_id>-work`, so comparing against names matches nothing and deletes the
+# work dirs of RUNNING lanes — far worse than the full disk this script exists to
+# prevent. The label carries the bare lane id and cannot drift with naming.
+if ! live="$(docker ps -a --filter "label=${LANE_LABEL}" \
+             --format "{{.Label \"${LANE_LABEL}\"}}" 2>/dev/null)"; then
   echo "docker unreachable; skipping work-dir prune" >&2
   live=""
   skip_workdirs=1
