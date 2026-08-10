@@ -77,9 +77,7 @@ def test_spawn_light_lane(write_config) -> None:
 def _volume_mode_kwargs(write_config):
     """Spawn one lane on a host configured work_dir_mode=volume."""
     cfg = ControllerConfig.load(write_config(VALID_CONFIG))
-    resolved = cfg.resolved_hosts()["powerserver"].model_copy(
-        update={"work_dir_mode": "volume"}
-    )
+    resolved = cfg.resolved_hosts()["powerserver"].model_copy(update={"work_dir_mode": "volume"})
     adapter, client, _ = _adapter(write_config, host_config=resolved)
     decision = AdmitDecision(
         job=QueuedJob(job_id=42, repo="alvaro-francisco-gil/homelab", labels=["self-hosted"]),
