@@ -39,6 +39,11 @@ class ReviewWorker:
     def reviewer_bot(self) -> str:
         return self._reviewer_bot
 
+    @property
+    def store(self) -> ReviewJobStore:
+        """Read-only access for /status. Public so the API doesn't reach into _store."""
+        return self._store
+
     def tick(self) -> None:
         ReviewPoller(
             self._config, self._store, self._github, reviewer_bot=self._reviewer_bot

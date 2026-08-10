@@ -107,6 +107,27 @@ class ReviewJobStore:
             ).fetchall()
         return [self._from_row(row) for row in rows]
 
+    def counts_by_status(self) -> dict[str, int]:
+        """Job totals keyed by status. Every JobStatus is present, zero-filled, so a
+        consumer can render a full row without special-casing the empty store."""
+        counts = {s.value: 0 for s in JobStatus}
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM review_jobs GROUP BY status"
+            ).fetchall()
+        for row in rows:
+            counts[str(row["status"])] = int(row["n"])
+        return counts
+
+    def list_active(self) -> list[ReviewJob]:
+        """Jobs still in flight (queued or running), newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM review_jobs WHERE status IN (?, ?) ORDER BY queued_at DESC, id DESC",
+                (JobStatus.QUEUED, JobStatus.RUNNING),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
     def list_retryable(self, max_attempts: int) -> list[ReviewJob]:
         # Queued jobs plus failed jobs that haven't exhausted their attempts, so
         # a transient failure self-heals on a later tick (ticks are the backoff).

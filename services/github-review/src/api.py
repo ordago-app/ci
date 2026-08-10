@@ -55,6 +55,27 @@ def create_app(worker: ReviewWorker, poll_interval: int = 0) -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/status")
+    async def status() -> dict[str, object]:
+        """Queue state for the dashboard. Read-only; takes no lock, so a long
+        in-flight review never blocks the glance page."""
+        store = worker.store
+        return {
+            "counts": store.counts_by_status(),
+            "active": [
+                {
+                    "id": job.id,
+                    "repo": job.repo,
+                    "pr_number": job.pr_number,
+                    "status": str(job.status),
+                    "attempts": job.attempts,
+                    "queued_at": job.queued_at,
+                    "last_error": job.last_error,
+                }
+                for job in store.list_active()
+            ],
+        }
+
     @app.post("/reviews")
     async def reviews(req: ReviewRequest) -> dict[str, object]:
         async with lock:
