@@ -168,6 +168,66 @@ class FailingProvider:
         pass
 
 
+def test_a_failed_job_is_logged_not_just_recorded_in_the_db(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Regression: `_run_job` caught every exception and put it in the job row's
+    # last_error, and nowhere else. github-review failed 15/15 reviews on
+    # ordago-apps from 2026-06-21 with a `git worktree add … Permission denied`
+    # and posted zero reviews — and nobody noticed for seven weeks, because the
+    # only record was a column in a SQLite file on the host. `docker logs
+    # github-review` was clean.
+    #
+    # A failure that is written only where nobody looks is a silent fallback.
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=FakeGitHub(),
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": FailingProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+    )
+    worker.tick()
+
+    assert store.list_by_status(JobStatus.FAILED), "precondition: the job must have failed"
+    err = capsys.readouterr().err
+    assert "codex boom" in err, "the cause must reach the container log, not just last_error"
+    assert "alvaro/homelab" in err, "the log must name the repo so a broken repo is greppable"
+    assert "#1" in err, "the log must name the PR"
+
+
+def test_a_repo_failing_over_and_over_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # One failure is normal (a force-push mid-review, a flaky container). A repo
+    # that fails every single time is a broken deployment, and the two must not
+    # look identical in the log — that is exactly how ordago-apps stayed broken
+    # for seven weeks. Carry the consecutive-failure count so the second kind is
+    # greppable on its own.
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=FakeGitHub(),
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": FailingProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+        max_attempts=10,
+    )
+    for _ in range(3):
+        worker.tick()
+
+    err = capsys.readouterr().err
+    assert "3 consecutive failures" in err, (
+        "a chronically failing repo must be distinguishable from a one-off failure"
+    )
+
+
 def test_run_pr_review_raises_when_review_fails(tmp_path: Path) -> None:
     store = ReviewJobStore(tmp_path / "jobs.db")
     store.init()

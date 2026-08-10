@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,11 +91,34 @@ class ReviewWorker:
             self._store.mark_posted(job.id, verdict=result.event)
         except Exception as exc:
             self._store.mark_failed(job.id, str(exc))
+            self._report_failure(job, exc)
         finally:
             if session is not None:
                 self._providers[job.provider].cleanup(session)
             if worktree is not None:
                 self._worktrees.cleanup(worktree)
+
+    def _report_failure(self, job: ReviewJob, exc: Exception) -> None:
+        """Put the failure somewhere a human actually looks.
+
+        Recording it in last_error alone is a silent fallback: the reviewer failed
+        every ordago-apps job from 2026-06-21 on a `git worktree add … Permission
+        denied` and posted nothing, and `docker logs github-review` stayed clean
+        the whole time. Nobody saw it for seven weeks.
+        """
+        streak = self._store.consecutive_failures(job.repo)
+        detail = f"{job.repo}#{job.pr_number}@{job.head_sha[:12]} (job {job.id}): {exc}"
+        if streak > 1:
+            # Distinct wording so a chronically broken repo is greppable on its
+            # own — the one-off case must not drown it.
+            print(
+                f"[github-review] review FAILED — {detail}; "
+                f"{streak} consecutive failures for {job.repo} with no review posted since",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(f"[github-review] review FAILED — {detail}", file=sys.stderr, flush=True)
 
     def _project_for_repo(self, repo: str) -> str:
         for repo_policy in self._config.enabled_repos():

@@ -164,6 +164,27 @@ class ReviewJobStore:
             ).fetchone()
         return int(row[0])
 
+    def consecutive_failures(self, repo: str) -> int:
+        """Failed attempts for `repo` since it last posted a review.
+
+        One failure is noise — a force-push mid-review, a flaky container. A repo
+        that has never recovered is a broken deployment, and only the count tells
+        them apart. github-review failed every ordago-apps review for seven weeks
+        without that distinction ever being drawn anywhere.
+
+        Counts `attempts`, not rows: one job retried three times and three jobs
+        failing once each are both "three failures in a row" to an operator, and
+        the retry case is the one a row count would hide.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(attempts), 0) FROM review_jobs "
+                "WHERE repo = ? AND status = ? AND id > "
+                "COALESCE((SELECT MAX(id) FROM review_jobs WHERE repo = ? AND status = ?), 0)",
+                (repo, JobStatus.FAILED, repo, JobStatus.POSTED),
+            ).fetchone()
+        return int(row[0])
+
     def _finish(self, job_id: int, status: JobStatus, message: str | None) -> None:
         with self._connect() as conn:
             conn.execute(
