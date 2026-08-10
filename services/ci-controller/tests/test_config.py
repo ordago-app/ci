@@ -211,6 +211,30 @@ def test_default_host_must_be_in_the_hosts_map(write_config) -> None:
         ControllerConfig.load(write_config(bad))
 
 
+def test_unknown_work_dir_mode_is_rejected(write_config) -> None:
+    """Only 'bind' and 'volume' exist, and a typo must not fall back to either.
+
+    Silently defaulting an unrecognised value to `bind` would put a REMOTE host back on
+    host work dirs the controller cannot delete — the leak of ADR 0023, reintroduced by a
+    misspelling. Defaulting it to `volume` would be worse on powerserver, moving lanes off
+    the NVMe. Neither guess is safe, so the config must refuse to load.
+    """
+    bad = HOSTS_CONFIG.replace(
+        "    allowed_classes: [light]", "    work_dir_mode: tmpfs\n    allowed_classes: [light]"
+    )
+    with pytest.raises(ConfigError, match="work_dir_mode"):
+        ControllerConfig.load(write_config(bad))
+
+
+def test_work_dir_mode_defaults_to_bind(write_config) -> None:
+    """Absent means bind, so a config written before this option behaves exactly as it did.
+
+    powerserver relies on this default rather than stating it.
+    """
+    cfg = ControllerConfig.load(write_config(HOSTS_CONFIG))
+    assert cfg.resolved_hosts()["powerserver"].work_dir_mode == "bind"
+
+
 OPERATOR_CONFIG = Path(__file__).resolve().parents[3] / "personal" / "ci-controller.yml"
 
 
