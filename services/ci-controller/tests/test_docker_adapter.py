@@ -74,6 +74,83 @@ def test_spawn_light_lane(write_config) -> None:
     assert kwargs["environment"]["RUNNER_NAME"] == "powerserver-cici-42-000001"
 
 
+def _volume_mode_kwargs(write_config):
+    """Spawn one lane on a host configured work_dir_mode=volume."""
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    resolved = cfg.resolved_hosts()["powerserver"].model_copy(
+        update={"work_dir_mode": "volume"}
+    )
+    adapter, client, _ = _adapter(write_config, host_config=resolved)
+    decision = AdmitDecision(
+        job=QueuedJob(job_id=42, repo="alvaro-francisco-gil/homelab", labels=["self-hosted"]),
+        class_name="light",
+        ram_mb=700,
+        needs_kvm=False,
+    )
+    adapter.spawn(decision, registration_token="ARRT")
+    _, kwargs = client.containers.run.call_args
+    return kwargs
+
+
+def test_volume_mode_gives_the_lane_an_anonymous_volume_docker_can_reclaim(
+    write_config,
+) -> None:
+    """Source=None is the entire point: it is what makes the volume per-container.
+
+    A NAMED volume would survive the lane and need an explicit delete through the
+    VOLUMES capability, which the lane-host socket proxy denies — so it would leak
+    exactly like the bind mount this mode replaces, only less visibly.
+    """
+    kwargs = _volume_mode_kwargs(write_config)
+
+    mounts = kwargs["mounts"]
+    assert len(mounts) == 1, f"expected exactly one lane volume, got {mounts}"
+    spec = dict(mounts[0])
+    assert spec["Type"] == "volume"
+    assert spec["Source"] is None, (
+        f"a named volume outlives its lane and the proxy denies VOLUMES: {spec}"
+    )
+    assert spec["Target"] == "/runner-work"
+    # auto_remove is what actually drops the anonymous volume with the container.
+    assert kwargs["auto_remove"] is True
+
+
+def test_volume_mode_does_not_bind_a_host_work_dir(write_config) -> None:
+    """The leak was the host path itself, so the mode must remove it, not add beside it.
+
+    Caches are a separate concern (shared_mounts) and must survive the switch: a
+    volume-mode lane still needs its pnpm/gradle stores or every job refetches.
+    """
+    kwargs = _volume_mode_kwargs(write_config)
+
+    binds = kwargs["volumes"]
+    assert "/runner-base" not in [v["bind"] for v in binds.values()], (
+        f"volume mode must not bind a host work dir: {binds}"
+    )
+    assert kwargs["environment"]["RUNNER_WORKDIR"].startswith("/runner-work/"), (
+        "the workspace must live inside the volume, not beside it"
+    )
+    # ...and the caches are still there.
+    assert binds["/mnt/ci-ssd/pnpm-store"] == {"bind": "/cache/pnpm", "mode": "rw"}
+
+
+def test_bind_mode_sends_no_mounts_at_all(write_config) -> None:
+    """powerserver's containers must stay byte-identical to before this option existed."""
+    adapter, client, _ = _adapter(write_config)
+    decision = AdmitDecision(
+        job=QueuedJob(job_id=42, repo="alvaro-francisco-gil/homelab", labels=["self-hosted"]),
+        class_name="light",
+        ram_mb=700,
+        needs_kvm=False,
+    )
+    adapter.spawn(decision, registration_token="ARRT")
+    _, kwargs = client.containers.run.call_args
+
+    assert "mounts" not in kwargs, (
+        "an empty Mounts list is still a payload change on the host that does not need it"
+    )
+
+
 def test_spawn_uses_the_hosts_own_runner_image(write_config) -> None:
     """A lane host's image is not powerserver's, so spawn must not hardcode the latter.
 

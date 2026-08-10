@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import docker
 import docker.errors
 from docker.errors import DockerException
+from docker.types import Mount as DockerMount
 
 from src.config import ControllerConfig, HostConfig
 from src.models import AdmitDecision
@@ -93,15 +94,38 @@ class DockerAdapter:
         lane_id = f"{self._host}-cici-{job.job_id}-{self._suffix_factory()}"
         job_class = self._config.classes[decision.class_name]
 
-        # Bind the work_dir BASE (pre-created by ansible, owned by the runner uid) rather
-        # than a per-lane subdir: if we bind a non-existent per-lane path, docker creates
-        # it root-owned and the uid-1000 runner can't write its workspace ("Set up job"
-        # fails). Binding the 1000-owned base lets the entrypoint's `mkdir -p` create the
-        # per-lane subdir as the runner user.
-        work_dirs = self._host_config.work_dirs or {}
-        work_base = work_dirs[job_class.work_disk]
-        work_dir = f"/runner-base/{lane_id}-work"
-        volumes: dict[str, dict[str, str]] = {work_base: {"bind": "/runner-base", "mode": "rw"}}
+        # Where the workspace lives decides who reclaims it -- see work_dir_mode in
+        # config.py and ADR 0023. Both modes keep the `<lane_id>-work` subdir naming so
+        # a workspace path stays greppable back to its lane, and so the entrypoint's EXIT
+        # trap always has a removable subdir to `rm -rf` rather than a mount point.
+        volumes: dict[str, dict[str, str]] = {}
+        mounts: list[DockerMount] = []
+        if self._host_config.work_dir_mode == "volume":
+            # An ANONYMOUS volume: Source=None is what makes it per-container, so dockerd
+            # deletes it alongside the container that auto_remove already removes. Do not
+            # give it a name -- a named volume outlives the lane and needs the VOLUMES
+            # capability to delete, which the lane-host socket proxy denies.
+            #
+            # Mounted at /runner-work because the runner image pre-creates that path owned
+            # by 1000:1000 (Dockerfile `install -d -o 1000`). That ownership is the whole
+            # reason this mode works: a volume inherits the image path's uid, whereas a
+            # bind mount to a missing path is created root-owned and locks the uid-1000
+            # runner out of its own workspace. Mounting at a path absent from the image
+            # would reintroduce exactly that failure, so /runner-work is not arbitrary.
+            work_dir = f"/runner-work/{lane_id}-work"
+            mounts.append(DockerMount(target="/runner-work", source=None, type="volume"))
+        else:
+            # Bind the work_dir BASE (pre-created by ansible, owned by the runner uid)
+            # rather than a per-lane subdir: if we bind a non-existent per-lane path,
+            # docker creates it root-owned and the uid-1000 runner can't write its
+            # workspace ("Set up job" fails). Binding the 1000-owned base lets the
+            # entrypoint's `mkdir -p` create the per-lane subdir as the runner user.
+            work_dirs = self._host_config.work_dirs or {}
+            work_base = work_dirs[job_class.work_disk]
+            work_dir = f"/runner-base/{lane_id}-work"
+            volumes[work_base] = {"bind": "/runner-base", "mode": "rw"}
+        # Caches are shared_mounts, NOT work_dirs, so they are unaffected by the mode: a
+        # volume-mode lane still gets the same pnpm/gradle/android caches bound in.
         for mount in self._host_config.shared_mounts or []:
             volumes[mount.host] = {"bind": mount.container, "mode": "rw"}
 
@@ -136,6 +160,10 @@ class DockerAdapter:
                 HOST_LABEL: self._host,
             },
         }
+        # Omitted entirely in bind mode, so powerserver's containers stay byte-identical
+        # to before this option existed: docker-py sends an empty Mounts list otherwise.
+        if mounts:
+            run_kwargs["mounts"] = mounts
         if decision.needs_kvm:
             run_kwargs["devices"] = ["/dev/kvm:/dev/kvm:rwm"]
         if job_class.group_add:

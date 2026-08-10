@@ -339,9 +339,12 @@ class Controller:
                 )
                 if res.host == self._host:
                     self._reap_work_dir(lane_id, res.work_disk)
-                # else: a remote host's own work dir is owned by that host's
-                # stale-work-dir prune systemd unit (Task 15) — the controller can only
-                # see its OWN filesystem, never a remote host's.
+                # else: nothing to do, and deliberately so. The controller can only
+                # unlink paths on its OWN filesystem, so a remote host must not depend on
+                # it: those hosts run work_dir_mode=volume and dockerd drops the lane's
+                # anonymous volume with the container (ADR 0023). A remote host left in
+                # bind mode would leak a workspace per killed lane, which is why
+                # test_deploy_wiring asserts none is.
             self.ledger.remove(lane_id)
         # Re-adopt running lanes the ledger doesn't know about (post-restart). Identity is
         # lane_id, not job_id: an attributed lane's claimed_job_id no longer matches the
@@ -606,7 +609,7 @@ class Controller:
         if res.host == self._host:
             self._reap_work_dir(res.lane_id, res.work_disk)
         # else: same as reconcile() — the controller can only see its OWN filesystem, so
-        # a remote host's work dir is that host's stale-work-dir prune unit to clean.
+        # a remote host reclaims its own workspaces via work_dir_mode=volume (ADR 0023).
         self.ledger.remove(res.lane_id)
         self._peaks.pop(res.lane_id, None)
         log.info("reaped idle lane %s (%s)", res.lane_id, res.class_name)

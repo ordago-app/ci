@@ -63,6 +63,32 @@ class HostConfig(BaseModel):
     # and BUILD, so whatever is named here must already exist on that host or every
     # admission 404s.
     runner_image: str | None = None
+    # Where a lane's workspace lives, and therefore WHO reclaims it. See ADR 0023.
+    #
+    # "bind" binds work_dirs[class.work_disk] and the lane writes a <lane_id>-work
+    # subdir inside it. That is the only mode that can place a workspace on a CHOSEN
+    # filesystem, which powerserver needs: work_disk routes ssd -> /mnt/ci-ssd (NVMe)
+    # while the docker root is on the 7200rpm LVM, and pnpm only hardlinks out of its
+    # store when the store and the workspace share a filesystem. Reclamation is the
+    # entrypoint's EXIT trap, backed by the controller deleting the dir on reap.
+    #
+    # "volume" gives the lane an anonymous docker volume instead, which dockerd
+    # deletes with the container. It cannot honour work_disk (every volume lands
+    # under the docker root), so it is only correct where placement is meaningless.
+    # In exchange it is the one mode whose cleanup survives SIGKILL, an OOM kill and
+    # a dockerd crash, none of which run an EXIT trap — and it needs no filesystem
+    # access from the controller, which is exactly what a REMOTE host cannot give it.
+    # `_reap_work_dir` can only unlink paths on the controller's own box, so on a
+    # remote host in bind mode the trap is the sole cleanup and a killed lane leaks
+    # its workspace forever. That leak filled powervaro-ci on 2026-08-09.
+    work_dir_mode: str = "bind"
+
+    @field_validator("work_dir_mode")
+    @classmethod
+    def work_dir_mode_known(cls, value: str) -> str:
+        if value not in ("bind", "volume"):
+            raise ValueError("work_dir_mode must be 'bind' or 'volume'")
+        return value
 
     def _resolve(self, top: ControllerConfig) -> HostConfig:
         return self.model_copy(

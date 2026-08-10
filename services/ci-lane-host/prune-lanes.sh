@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Reclaim disk on a remote CI lane host.
+# Reclaim disk on a remote CI lane host. A BACKSTOP, no longer the primary cleanup.
 #
-# The controller deletes a lane's work dir when it reaps the lane, but only on its
-# OWN filesystem — it cannot see a remote host's disk, so this is the only cleanup
-# a lane host gets. The previous version of this ran `find -mtime +1`, which meant
-# a work dir had to be a full day old before it was eligible. On 2026-08-09 four
-# PRs each fanned out to seven services across two workflows; the resulting burst
-# of ~2 GB work dirs filled the 40 GB VM inside that 24 h window, and every job on
-# powervaro-ci failed with ENOSPC until the VM lost networking entirely.
+# History, because it explains both the shape of this script and why it was demoted.
+# The controller deletes a lane's work dir when it reaps the lane, but only on its OWN
+# filesystem — it cannot see a remote host's disk. This script was therefore the only
+# cleanup a lane host got. Its first version ran `find -mtime +1`, so a work dir had to
+# be a full day old before it was eligible; on 2026-08-09 four PRs each fanned out to
+# seven services across two workflows and the burst filled the 40 GB VM well inside that
+# window, ENOSPC-ing every job until the VM lost networking. Eligibility then became
+# LIVENESS, not age: a work dir whose lane container no longer exists is finished,
+# whatever its mtime. That is the logic below, and it still runs.
 #
-# So eligibility is by LIVENESS, not age: a work dir whose lane container no
-# longer exists is finished, whatever its mtime.
+# What changed is that lane hosts now set work_dir_mode=volume (ADR 0023), so a lane's
+# workspace is an anonymous docker volume that dockerd drops together with the container
+# — no host path, no timer, and cleanup that survives SIGKILL, an OOM kill and a dockerd
+# crash, none of which run the entrypoint's EXIT trap. Nothing routine is left for this
+# script to find. Keep it anyway: it reclaims volumes orphaned by a daemon crash (where
+# auto_remove never fires), it clears anything left by a host still in bind mode, and it
+# costs nothing when there is nothing to do. Do NOT let it become load-bearing again —
+# a silent failure here should no longer be able to fill a disk.
 #
 # THE TRAP, do not remove: the socket proxy on this host denies IMAGES and BUILD
 # (see ansible/playbooks/ci-lane-host.yml), so the controller can neither pull nor
@@ -63,6 +71,17 @@ fi
 docker container prune -f >/dev/null 2>&1 || true
 docker image prune -f >/dev/null 2>&1 || true
 docker builder prune -af >/dev/null 2>&1 || true
+
+# Lane workspaces under work_dir_mode=volume. auto_remove drops a lane's anonymous
+# volume with its container, so this finds nothing in the normal case — it exists for
+# the one path that skips auto_remove entirely: dockerd dying mid-lane.
+#
+# Deliberately NOT -a, for the same reason `image prune` is not: without -a, docker
+# removes only ANONYMOUS volumes (verified on the 29.x daemon these hosts run), which is
+# exactly the set lanes create. With -a it would also take unused NAMED volumes, and a
+# lane host that later runs anything with a named volume would find it deleted between
+# jobs. The narrow form cannot make that mistake.
+docker volume prune -f >/dev/null 2>&1 || true
 
 after="$(df -BM --output=avail "$WORK_DIR" | tail -1 | tr -dc '0-9')"
 echo "avail ${before}M -> ${after}M on $WORK_DIR"
