@@ -59,6 +59,10 @@ choice for the second host.
 - Health: `docker exec ci-controller python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"`
   (the slim image ships Python, not curl).
 - Live state: `curl http://ci-controller:8000/status` from another homelab container
-  (shows the ledger, running lanes, and **why** queued jobs are deferred).
+  (shows the ledger, running lanes, and **why** queued jobs are deferred). Both lists
+  carry the job's `class`, `host`, `workflow` and `job_name`, so a reader can answer
+  "which *kind* of job is running/waiting, and where" without re-deriving it — that is
+  what the dashboard's per-class breakdown is built from. `deferred[].class` is null
+  only for `already_running` and `not_allowlisted`, which have no class to name.
 - Onboard a repo: `make ci-onboard REPO=owner/name`.
 - Deploy: from the main checkout, `... services.yml --tags ci-controller --diff`.

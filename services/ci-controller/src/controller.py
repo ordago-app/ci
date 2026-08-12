@@ -469,6 +469,10 @@ class Controller:
                     job_id=decision.job.job_id,
                     repo=decision.job.repo,
                     reason=decision.reason,
+                    # NULL before #157, so no historical defer row can be grouped by class.
+                    # Rows from here on can: "what was the queue made of" is a question the
+                    # capacity report should be able to answer, not just "how long was it".
+                    class_name=decision.class_name,
                     reasons=",".join(decision.reasons),
                     ts=_now(),
                     job_name=decision.job.job_name,
@@ -699,13 +703,33 @@ class Controller:
                     "repo": r.repo,
                     "class": r.class_name,
                     "ram_mb": r.ram_mb,
+                    # Which box is actually running it. Derivable from the lane_id prefix,
+                    # but only by string-splitting a field that is an opaque id by contract;
+                    # a reader that wants per-host breakdowns should be given the field.
+                    "host": r.host,
+                    "workflow": r.workflow,
+                    "job_name": r.job_name,
                     "state": "busy" if r.running_job_id is not None else "booting",
                     "idle_seconds": (None if r.idle_since is None else int(_now() - r.idle_since)),
                 }
                 for r in self.ledger.reservations()
             ],
             "deferred": [
-                {"job_id": d.job.job_id, "repo": d.job.repo, "reason": d.reason} for d in deferred
+                {
+                    "job_id": d.job.job_id,
+                    "repo": d.job.repo,
+                    "reason": d.reason,
+                    # Every binding gate, not just the first. `reason` stays the primary one
+                    # so existing readers are unaffected.
+                    "reasons": list(d.reasons),
+                    "class": d.class_name,
+                    "workflow": d.job.workflow,
+                    "job_name": d.job.job_name,
+                    # The closest host, i.e. whose gates `reasons` describes. None for the
+                    # non-capacity defers, which belong to no host — same rule as the event.
+                    "host": d.host,
+                }
+                for d in deferred
             ],
             "hosts": hosts,
         }

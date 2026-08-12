@@ -667,3 +667,50 @@ def _shape(decision) -> tuple[str, tuple[str, ...]]:
     if isinstance(decision, AdmitDecision):
         return ("admit", (decision.class_name,))
     return ("defer", decision.reasons)
+
+
+def test_a_capacity_defer_names_the_class_the_job_would_have_run_as(write_config) -> None:
+    """Without this the queue is a list of opaque job ids: six waiting node_heavy jobs
+    look exactly like six light ones an idle light-only host could have absorbed."""
+    config = ControllerConfig.load(write_config(CROWDED_CONFIG))
+    ledger = Ledger()
+    ledger.add(
+        Reservation(
+            lane_id="lane-1",
+            spawned_for_job_id=1,
+            repo="alvaro-francisco-gil/homelab",
+            class_name="light",
+            ram_mb=900,
+            needs_kvm=False,
+        )
+    )
+
+    (decision,) = evaluate([_homelab_job(2)], ledger, config)
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reasons == (LANE_CEILING, BUDGET_FULL)  # CROWDED_CONFIG binds both
+    assert decision.class_name == "light"
+
+
+def test_no_eligible_host_still_names_the_class(write_config) -> None:
+    """The defer that most needs its class: 'nothing will run this kind of job' is only
+    actionable if you know which kind."""
+    config = ControllerConfig.load(write_config(NO_EMULATOR_HOST_CONFIG))
+
+    (decision,) = evaluate([_homelab_job(1, "android-e2e")], Ledger(), config)
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.class_name == "emulator"
+
+
+def test_a_job_with_no_class_to_name_reports_none(write_config) -> None:
+    """not_allowlisted has no mapped label, so there is no class — the field must stay
+    None rather than being filled with the default class, which would be a fiction."""
+    config = ControllerConfig.load(write_config(CROWDED_CONFIG))
+    job = QueuedJob(job_id=4, repo="someone/else", labels=["homelab"])
+
+    (decision,) = evaluate([job], Ledger(), config)
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reasons == (NOT_ALLOWLISTED,)
+    assert decision.class_name is None

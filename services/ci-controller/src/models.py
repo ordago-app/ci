@@ -105,6 +105,13 @@ class DeferDecision:
     # no host. Recording it is what makes ci_bench's per-host binding-gate table work;
     # with it always NULL that report section could never contain a real controller row.
     host: str | None = None
+    # The class this job would run as. None only for already_running (the class belongs to
+    # the lane, not to this decision) and not_allowlisted (no mapped label, so there is no
+    # class to name). Every capacity defer carries it, which is what lets /status and the
+    # `defer` event answer "which KIND of job is waiting" — without it a queue is a list of
+    # opaque job ids, and six waiting node_heavy jobs read the same as six light ones that
+    # an idle second host could have absorbed.
+    class_name: str | None = None
 
     @property
     def reason(self) -> str:

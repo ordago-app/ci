@@ -1496,3 +1496,95 @@ def test_an_incomplete_attribution_scan_is_reported_on_the_first_poll(write_conf
     assert "INCOMPLETE scan" in caplog.text
     (res,) = ctrl.ledger.reservations()
     assert res.running_job_id is None, "an incomplete scan must not invent an attribution"
+
+
+def _fill_lanes(ctrl, docker):
+    """Occupy every lane slot with reservations that reconcile() will believe.
+
+    A reservation alone is not enough: tick() reconciles before it admits, and a lane
+    with no container behind it is treated as vanished and released — so a ledger
+    seeded directly would be empty by the time admission ran.
+    """
+    lanes = []
+    for slot in range(ctrl.config.max_concurrent_lanes):
+        lane_id = f"powerserver-cici-{slot}"
+        ctrl.ledger.add(Reservation(lane_id, slot, HOMELAB, "light", 700, False))
+        lanes.append(LaneInfo(lane_id, slot, f"cid-{slot}", class_name="light", host="powerserver"))
+    docker.list_lanes.return_value = lanes
+
+
+def test_status_reports_the_class_mix_behind_each_host(write_config) -> None:
+    """The lane list has to say WHICH host and WHICH kind, or a reader cannot split a
+    host's totals by class without string-splitting the lane id."""
+    ctrl, _github, adapters, _pool = _multi_host_controller(write_config, [])
+    ctrl.ledger.add(
+        Reservation(
+            "powerserver-cici-9",
+            9,
+            HOMELAB,
+            "light",
+            700,
+            False,
+            workflow="CI",
+            job_name="ruff",
+            host="powerserver",
+        )
+    )
+    ctrl.ledger.add(Reservation("desktop-cici-3", 3, HOMELAB, "light", 700, False, host="desktop"))
+    adapters["powerserver"].list_lanes.return_value = [
+        LaneInfo("powerserver-cici-9", 9, "cid-a", host="powerserver")
+    ]
+    adapters["desktop"].list_lanes.return_value = [
+        LaneInfo("desktop-cici-3", 3, "cid-b", host="desktop")
+    ]
+    ctrl.reconcile()
+
+    running = {r["lane_id"]: r for r in ctrl.status()["running"]}
+
+    assert running["powerserver-cici-9"]["host"] == "powerserver"
+    assert running["powerserver-cici-9"]["class"] == "light"
+    assert running["powerserver-cici-9"]["job_name"] == "ruff"
+    assert running["powerserver-cici-9"]["workflow"] == "CI"
+    assert running["desktop-cici-3"]["host"] == "desktop"
+
+
+def test_status_says_what_kind_of_job_is_queued_and_every_gate_holding_it(
+    write_config, monkeypatch
+) -> None:
+    """A queue of opaque ids cannot answer 'is the idle host even allowed to take these'."""
+    monkeypatch.setattr("src.controller._now", lambda: 10_000.0)
+    # 700, not 7: _fill_lanes occupies job ids 0..max_lanes, and a collision would
+    # defer this job as already_running — a different verdict, with no class to report.
+    job = QueuedJob(job_id=700, repo=HOMELAB, labels=["homelab"], workflow="CI", job_name="pytest")
+    ctrl, _github, _docker = _controller(write_config, [job])
+    # Fill the lane ceiling so the job defers on capacity rather than on allowlisting.
+    # The lanes must exist in docker too: tick() reconciles first, and a reservation
+    # with no container behind it is reaped before admission ever runs.
+    _fill_lanes(ctrl, _docker)
+
+    ctrl.tick()
+    (queued,) = ctrl.status()["deferred"]
+
+    assert queued["job_id"] == 700
+    assert queued["class"] == "light"
+    assert queued["job_name"] == "pytest"
+    assert queued["workflow"] == "CI"
+    assert queued["reason"] in queued["reasons"]  # primary stays the first of the list
+    assert queued["host"] == "powerserver"
+
+
+def test_a_defer_event_records_the_class_so_the_queue_can_be_grouped_later(
+    write_config, monkeypatch
+) -> None:
+    """The column was NULL for every defer row before this, so no capacity report could
+    ever answer 'what was the queue made of'."""
+    monkeypatch.setattr("src.controller._now", lambda: 10_000.0)
+    metrics = MagicMock()
+    job = QueuedJob(job_id=700, repo=HOMELAB, labels=["homelab"])  # see the id note above
+    ctrl, _github, _docker = _controller(write_config, [job], metrics=metrics)
+    _fill_lanes(ctrl, _docker)
+
+    ctrl.tick()
+
+    (defer,) = _events(metrics, "defer")
+    assert defer["class_name"] == "light"

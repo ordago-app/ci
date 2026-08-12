@@ -173,7 +173,7 @@ def evaluate(
         ]
         if not eligible:
             # Not a capacity verdict: no host would take this class however empty the fleet.
-            decisions.append(DeferDecision(job, (NO_ELIGIBLE_HOST,)))
+            decisions.append(DeferDecision(job, (NO_ELIGIBLE_HOST,), class_name=class_name))
             continue
 
         evaluated = [
@@ -187,7 +187,9 @@ def evaluate(
                 evaluated,
                 key=lambda item: (len(item[1]), -item[0].headroom_mb, item[0].policy.name),
             )
-            decisions.append(DeferDecision(job, reasons, host=closest.policy.name))
+            decisions.append(
+                DeferDecision(job, reasons, host=closest.policy.name, class_name=class_name)
+            )
             continue
 
         chosen = min(passing, key=lambda state: (-state.headroom_mb, state.policy.name))
