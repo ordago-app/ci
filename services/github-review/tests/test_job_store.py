@@ -135,3 +135,46 @@ def test_init_migrates_legacy_db_without_verdict_column(tmp_path: Path) -> None:
     assert job.verdict is None  # legacy row reads back cleanly
     store.mark_posted(1, verdict="APPROVE")
     assert store.get(1).verdict == "APPROVE"
+
+
+def test_count_stuck_counts_only_failures_with_no_retries_left(tmp_path: Path) -> None:
+    """The exact complement of list_retryable: a job is either going to be picked up
+    again, or it needs a human. Counting a retryable failure as stuck would flag
+    something that is already self-healing."""
+    store = make_store(tmp_path)
+    store.enqueue("alvaro/homelab", "homelab", "codex", 1, "q", "base")  # queued
+
+    under = store.enqueue("alvaro/homelab", "homelab", "codex", 2, "u", "base")
+    store.mark_running(under.id)  # attempts -> 1
+    store.mark_failed(under.id, "boom")
+
+    exhausted = store.enqueue("alvaro/homelab", "homelab", "codex", 3, "x", "base")
+    for _ in range(3):  # attempts -> 3
+        store.mark_running(exhausted.id)
+        store.mark_failed(exhausted.id, "boom")
+
+    assert store.count_stuck(max_attempts=3) == 1
+    retryable = {job.id for job in store.list_retryable(max_attempts=3)}
+    assert exhausted.id not in retryable, "stuck and retryable must not overlap"
+
+
+def test_count_stuck_is_zero_on_a_store_that_has_never_failed(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    store.enqueue("alvaro/homelab", "homelab", "codex", 1, "q", "base")
+    assert store.count_stuck(max_attempts=3) == 0
+
+
+def test_count_stuck_falls_back_to_zero_while_the_lifetime_total_does_not(
+    tmp_path: Path,
+) -> None:
+    """Why the badge reads this and not counts["failed"]: once a failure is retried and
+    succeeds, nothing needs attention any more — but the lifetime total still says 1."""
+    store = make_store(tmp_path)
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "q", "base")
+    store.mark_running(job.id)
+    store.mark_failed(job.id, "transient")
+    store.mark_running(job.id)
+    store.mark_posted(job.id)
+
+    assert store.count_stuck(max_attempts=3) == 0
+    assert store.counts_by_status()["failed"] == 0  # it moved to posted

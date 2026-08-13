@@ -20,6 +20,9 @@ def store(tmp_path: Path) -> ReviewJobStore:
 def status_client(store: ReviewJobStore) -> TestClient:
     worker = MagicMock()
     worker.store = store
+    # A real int, not the MagicMock the attribute would otherwise be: /status passes it
+    # into a SQL comparison, and a mock binds as an unsupported type.
+    worker.max_attempts = 3
     return TestClient(create_app(worker))
 
 
@@ -117,3 +120,29 @@ def test_worker_exposes_its_store_publicly() -> None:
         reviewer_bot="bot",
     )
     assert worker.store is store
+
+
+def test_status_reports_stuck_reviews_separately_from_the_lifetime_total(
+    status_client, store
+) -> None:
+    """The dashboard's attention badge reads `stuck`. counts["failed"] cannot serve that
+    role: it is a lifetime total, so it never falls back to zero once anything has ever
+    failed, and a badge that is permanently lit is one nobody reads."""
+    retryable = store.enqueue("o/r", "r", "codex", 1, "a" * 40, "b" * 40)
+    store.mark_running(retryable.id)  # attempts -> 1, still under the limit
+    store.mark_failed(retryable.id, "transient")
+
+    exhausted = store.enqueue("o/r", "r", "codex", 2, "c" * 40, "d" * 40)
+    for _ in range(3):
+        store.mark_running(exhausted.id)
+        store.mark_failed(exhausted.id, "boom")
+
+    body = status_client.get("/status").json()
+
+    assert body["counts"]["failed"] == 2  # both, for all time
+    assert body["stuck"] == 1  # only the one nothing will retry
+
+
+def test_status_reports_no_stuck_reviews_on_a_healthy_store(status_client, store) -> None:
+    store.enqueue("o/r", "r", "codex", 3, "e" * 40, "f" * 40)
+    assert status_client.get("/status").json()["stuck"] == 0

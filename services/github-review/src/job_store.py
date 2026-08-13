@@ -119,6 +119,22 @@ class ReviewJobStore:
             counts[str(row["status"])] = int(row["n"])
         return counts
 
+    def count_stuck(self, max_attempts: int) -> int:
+        """Failed jobs with no retries left — the ones that need a human.
+
+        Distinct from `counts_by_status()["failed"]`, which is a lifetime total over
+        every row ever written and therefore only ever grows. A failed job that still
+        has attempts left is not stuck: the worker picks it up again on a later tick
+        (see `list_retryable`, whose predicate this is the exact complement of), so
+        counting it as needing attention would flag something already self-healing.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM review_jobs WHERE status = ? AND attempts >= ?",
+                (JobStatus.FAILED, max_attempts),
+            ).fetchone()
+        return int(row["n"])
+
     def list_active(self) -> list[ReviewJob]:
         """Jobs still in flight (queued or running), newest first."""
         with self._connect() as conn:

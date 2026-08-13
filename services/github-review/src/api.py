@@ -62,6 +62,10 @@ def create_app(worker: ReviewWorker, poll_interval: int = 0) -> FastAPI:
         store = worker.store
         return {
             "counts": store.counts_by_status(),
+            # `counts` are lifetime totals, so counts["failed"] only ever grows and says
+            # nothing about now. This is the live figure: failed AND out of retries, i.e.
+            # what actually needs a human. The dashboard's attention badge reads this.
+            "stuck": store.count_stuck(worker.max_attempts),
             "active": [
                 {
                     "id": job.id,

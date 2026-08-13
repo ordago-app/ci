@@ -40,6 +40,11 @@ class ReviewWorker:
         return self._reviewer_bot
 
     @property
+    def max_attempts(self) -> int:
+        """Read by /status to tell a retryable failure from one that is out of retries."""
+        return self._max_attempts
+
+    @property
     def store(self) -> ReviewJobStore:
         """Read-only access for /status. Public so the API doesn't reach into _store."""
         return self._store
