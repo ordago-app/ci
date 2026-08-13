@@ -64,5 +64,12 @@ choice for the second host.
   "which *kind* of job is running/waiting, and where" without re-deriving it — that is
   what the dashboard's per-class breakdown is built from. `deferred[].class` is null
   only for `already_running` and `not_allowlisted`, which have no class to name.
+  `running[].running_seconds` is the lane's container age, read from the **daemon**
+  each reconcile rather than stamped at spawn, so a controller restart does not reset
+  the age of a lane that never stopped. `deferred[].waiting_seconds` is measured from
+  the first tick that deferred the job and *is* in-memory, so it does reset on a
+  restart — the durable version of that history is the `defer` events in `metrics.db`,
+  and querying those behind a page that polls every 5s is not a trade worth making.
+  Both are null rather than zero when unknown.
 - Onboard a repo: `make ci-onboard REPO=owner/name`.
 - Deploy: from the main checkout, `... services.yml --tags ci-controller --diff`.

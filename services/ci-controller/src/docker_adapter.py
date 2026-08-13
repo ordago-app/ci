@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 import docker
 import docker.errors
@@ -53,6 +54,33 @@ class LaneInfo:
     class_name: str | None = None
     # None for lanes spawned before HOST_LABEL existed — same tolerance as class_name.
     host: str | None = None
+    # Epoch seconds the container started, read from the daemon rather than recorded
+    # when we spawned it: a controller restart loses in-memory state, and "how long has
+    # this been running" answered from process memory would reset to zero on every
+    # restart while the lane kept running. None when the daemon's timestamp is missing
+    # or unparseable — the caller renders "unknown", never a fabricated zero.
+    started_at: float | None = None
+
+
+def _docker_time(value: object) -> float | None:
+    """RFC3339 from the daemon -> epoch seconds. None on anything unexpected.
+
+    Docker stamps nanoseconds, which `fromisoformat` rejects, so the fractional part is
+    truncated to microseconds. A zero-value timestamp ("0001-01-01T00:00:00Z") means the
+    container never started and is reported as unknown rather than as a 2000-year age.
+    """
+    if not isinstance(value, str) or value.startswith("0001-01-01"):
+        return None
+    text = value.replace("Z", "+00:00")
+    if "." in text:
+        head, _, tail = text.partition(".")
+        digits = "".join(c for c in tail if c.isdigit())[:6]
+        offset = tail[len(digits) :].lstrip("0123456789")
+        text = f"{head}.{digits}{offset}" if digits else head + offset
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
 
 
 class DockerAdapter:
@@ -189,6 +217,7 @@ class DockerAdapter:
         lanes: list[LaneInfo] = []
         for container in containers:
             labels = container.labels
+            state = container.attrs.get("State") or {}
             lanes.append(
                 LaneInfo(
                     lane_id=labels[LANE_LABEL],
@@ -196,6 +225,12 @@ class DockerAdapter:
                     container_id=container.id,
                     class_name=labels.get(CLASS_LABEL),
                     host=labels.get(HOST_LABEL),
+                    # StartedAt is when the lane actually began work; Created is the
+                    # fallback for a container the daemon has not filled State for yet.
+                    started_at=(
+                        _docker_time(state.get("StartedAt"))
+                        or _docker_time(container.attrs.get("Created"))
+                    ),
                 )
             )
         return lanes

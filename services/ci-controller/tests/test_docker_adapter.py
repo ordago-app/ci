@@ -1,6 +1,7 @@
 import itertools
 import re
 from collections import defaultdict
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import docker.errors
@@ -703,3 +704,48 @@ def test_a_host_that_wakes_up_rejoins_the_pool_on_a_later_tick(write_config) -> 
 
     assert "powervaro-ci" in healthy, "a woken host must rejoin without a controller restart"
     assert lanes["powervaro-ci"] == []
+
+
+def _lane_container(attrs):
+    container = MagicMock()
+    container.id = "abc123"
+    container.labels = {LANE_LABEL: "powerserver-cici-7", JOB_LABEL: "7"}
+    container.attrs = attrs
+    return container
+
+
+def test_lane_info_carries_the_container_start_time(write_config) -> None:
+    """Sourced from the daemon, not stamped at spawn: a controller restart must not reset
+    the age of a lane that never stopped running."""
+    adapter, client, _ = _adapter(write_config)
+    client.containers.list.return_value = [
+        _lane_container({"State": {"StartedAt": "2026-08-12T15:34:28.228618094Z"}})
+    ]
+
+    (lane,) = adapter.list_lanes()
+
+    # Nanosecond precision is truncated to micros; fromisoformat rejects 9 digits.
+    expected = datetime(2026, 8, 12, 15, 34, 28, 228618, tzinfo=UTC).timestamp()
+    assert lane.started_at == expected
+
+
+def test_lane_start_time_falls_back_to_created_when_state_has_none(write_config) -> None:
+    adapter, client, _ = _adapter(write_config)
+    client.containers.list.return_value = [_lane_container({"Created": "2026-08-12T15:34:26Z"})]
+
+    (lane,) = adapter.list_lanes()
+
+    assert lane.started_at == datetime(2026, 8, 12, 15, 34, 26, tzinfo=UTC).timestamp()
+
+
+def test_an_unusable_start_time_is_unknown_rather_than_zero(write_config) -> None:
+    """Docker's zero value means the container never started. Parsing it as a real date
+    would render the lane as ~2000 years old; None renders as unknown."""
+    adapter, client, _ = _adapter(write_config)
+    client.containers.list.return_value = [
+        _lane_container({"State": {"StartedAt": "0001-01-01T00:00:00Z"}, "Created": "not a date"})
+    ]
+
+    (lane,) = adapter.list_lanes()
+
+    assert lane.started_at is None

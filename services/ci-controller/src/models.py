@@ -71,6 +71,11 @@ class Reservation:
     host: str = "powerserver"
     # Observation state. GitHub hands a registering runner whichever queued job matches its
     # labels, so the job a lane runs is frequently not the one it was spawned for.
+    # Epoch seconds the lane's container started, sourced from the daemon on every
+    # reconcile rather than stamped at spawn — a controller restart must not reset the
+    # age of a lane that never stopped running. None when the daemon gave no usable
+    # timestamp; readers render "unknown" rather than a fabricated zero.
+    started_at: float | None = None
     running_job_id: int | None = None
     # Set at spawn, cleared permanently on attribution. Runners are ephemeral (one job, then
     # exit), so a lane is idle only before its first job — there is no busy->idle transition.

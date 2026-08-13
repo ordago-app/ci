@@ -1588,3 +1588,101 @@ def test_a_defer_event_records_the_class_so_the_queue_can_be_grouped_later(
 
     (defer,) = _events(metrics, "defer")
     assert defer["class_name"] == "light"
+
+
+def test_status_reports_how_long_each_lane_has_been_running(write_config, monkeypatch) -> None:
+    monkeypatch.setattr("src.controller._now", lambda: 10_000.0)
+    ctrl, _github, docker = _controller(write_config, [])
+    ctrl.ledger.add(Reservation("powerserver-cici-7", 7, HOMELAB, "light", 700, False))
+    docker.list_lanes.return_value = [
+        LaneInfo(
+            "powerserver-cici-7",
+            7,
+            "cid-a",
+            class_name="light",
+            host="powerserver",
+            started_at=9_400.0,
+        )
+    ]
+
+    ctrl.reconcile()
+    (lane,) = ctrl.status()["running"]
+
+    assert lane["running_seconds"] == 600
+
+
+def test_a_restart_does_not_reset_a_running_lanes_age(write_config, monkeypatch) -> None:
+    """The whole reason the start time comes from the daemon rather than from a stamp we
+    write at spawn: a fresh controller re-adopts a lane that has been up for an hour and
+    must say so, not report it as brand new."""
+    monkeypatch.setattr("src.controller._now", lambda: 10_000.0)
+    ctrl, _github, docker = _controller(write_config, [])  # empty ledger == post-restart
+    docker.list_lanes.return_value = [
+        LaneInfo(
+            "powerserver-cici-7",
+            7,
+            "cid-a",
+            class_name="light",
+            host="powerserver",
+            started_at=6_400.0,
+        )
+    ]
+
+    ctrl.reconcile()
+    (lane,) = ctrl.status()["running"]
+
+    assert lane["running_seconds"] == 3600
+
+
+def test_a_lane_with_no_usable_start_time_reports_unknown(write_config, monkeypatch) -> None:
+    """Never zero: "0s" on a lane that has been up for an hour is a worse answer than
+    admitting the timestamp is missing."""
+    monkeypatch.setattr("src.controller._now", lambda: 10_000.0)
+    ctrl, _github, docker = _controller(write_config, [])
+    docker.list_lanes.return_value = [
+        LaneInfo("powerserver-cici-7", 7, "cid-a", class_name="light", host="powerserver")
+    ]
+
+    ctrl.reconcile()
+    (lane,) = ctrl.status()["running"]
+
+    assert lane["running_seconds"] is None
+
+
+def test_queue_wait_is_measured_from_the_first_tick_that_deferred_the_job(
+    write_config, monkeypatch
+) -> None:
+    """First-seen wins. Measuring from the latest tick would peg every wait at ~0s no
+    matter how long the job had actually been stuck."""
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr("src.controller._now", lambda: clock["t"])
+    job = QueuedJob(job_id=700, repo=HOMELAB, labels=["homelab"])
+    ctrl, _github, docker = _controller(write_config, [job])
+    _fill_lanes(ctrl, docker)
+
+    ctrl.tick()
+    clock["t"] = 10_180.0
+    ctrl.tick()
+
+    (queued,) = ctrl.status()["deferred"]
+    assert queued["waiting_seconds"] == 180
+
+
+def test_a_job_that_stops_being_queued_is_dropped_from_the_wait_ledger(
+    write_config, monkeypatch
+) -> None:
+    """The dict is rebuilt from each tick's defers, which is what keeps it from growing
+    without bound as jobs come and go."""
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr("src.controller._now", lambda: clock["t"])
+    job = QueuedJob(job_id=700, repo=HOMELAB, labels=["homelab"])
+    ctrl, github, docker = _controller(write_config, [job])
+    _fill_lanes(ctrl, docker)
+    ctrl.tick()
+    assert 700 in ctrl._queued_since
+
+    github.list_queued_jobs.side_effect = lambda repo: []  # job left GitHub's queue
+    clock["t"] = 10_060.0
+    ctrl.tick()
+
+    assert ctrl._queued_since == {}

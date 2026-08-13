@@ -69,6 +69,12 @@ class Controller:
         self.docker = docker
         self.ledger = ledger
         self._last_decisions: list[Decision] = []
+        # job_id -> the epoch second we FIRST saw it deferred, so /status can say how long
+        # a job has been waiting. Deliberately in-memory and therefore reset by a restart:
+        # the durable answer lives in the metrics DB's defer events, and reading that on
+        # every /status would put a SQL query behind a page that polls every 5s. Pruned
+        # each tick to the jobs still queued, so it cannot grow without bound.
+        self._queued_since: dict[int, float] = {}
         self.metrics = metrics
         self._host_stats_reader = host_stats_reader
         self._config_version = config.config_version()
@@ -352,9 +358,22 @@ class Controller:
         known_lane_ids = self.ledger.lane_ids()
         for lane in running.values():
             if lane.lane_id in known_lane_ids:
+                # Refresh the start time from the daemon every tick rather than stamping
+                # it once at spawn. The daemon is the only source that survives a
+                # controller restart, so "how long has this been running" stays true
+                # across one instead of resetting to zero under a lane that never stopped.
+                if lane.started_at is not None:
+                    self.ledger.update(lane.lane_id, started_at=lane.started_at)
                 continue
             host = lane.host or listed_on[lane.lane_id]
-            self._readopt(lane.lane_id, lane.job_id, host, lane.class_name, lane.container_id)
+            self._readopt(
+                lane.lane_id,
+                lane.job_id,
+                host,
+                lane.class_name,
+                lane.container_id,
+                lane.started_at,
+            )
 
     def _reap_work_dir(self, lane_id: str, work_disk: str) -> None:
         # The ephemeral runner auto-removes its container but leaves the per-lane
@@ -388,6 +407,7 @@ class Controller:
         host: str,
         class_name: str | None,
         container_id: str,
+        started_at: float | None = None,
     ) -> None:
         # The repo is unrecoverable from the label set, so it stays the "(adopted)"
         # sentinel (reap skips the conclusion lookup for it). The class and the host ARE
@@ -425,6 +445,7 @@ class Controller:
                 # container to remove if it never takes a job.
                 idle_since=_now(),
                 container_id=container_id,
+                started_at=started_at,
             )
         )
 
@@ -483,8 +504,20 @@ class Controller:
                     host=decision.host,
                 )
         self._last_decisions = decisions
+        self._track_queue_age(decisions)
         self._reap_idle_lanes(decisions)
         return decisions
+
+    def _track_queue_age(self, decisions: list[Decision]) -> None:
+        # First-seen wins: a job deferred on five consecutive ticks has been waiting since
+        # the first, not the last. Rebuilding the dict from this tick's defers is also what
+        # prunes it — a job that got admitted or vanished from GitHub's queue drops out.
+        now = _now()
+        self._queued_since = {
+            d.job.job_id: self._queued_since.get(d.job.job_id, now)
+            for d in decisions
+            if isinstance(d, DeferDecision)
+        }
 
     def _reap_idle_lanes(self, decisions: list[Decision]) -> None:
         """Reclaim reserves held by lanes that never got a job.
@@ -711,6 +744,12 @@ class Controller:
                     "job_name": r.job_name,
                     "state": "busy" if r.running_job_id is not None else "booting",
                     "idle_seconds": (None if r.idle_since is None else int(_now() - r.idle_since)),
+                    # Wall-clock age of the lane's container. None when the daemon gave no
+                    # usable timestamp — the reader shows "unknown", never a zero that
+                    # would read as "just started".
+                    "running_seconds": (
+                        None if r.started_at is None else max(0, int(_now() - r.started_at))
+                    ),
                 }
                 for r in self.ledger.reservations()
             ],
@@ -728,6 +767,13 @@ class Controller:
                     # The closest host, i.e. whose gates `reasons` describes. None for the
                     # non-capacity defers, which belong to no host — same rule as the event.
                     "host": d.host,
+                    # Since this controller first saw the job deferred, so it resets on a
+                    # restart rather than pretending to know a history it no longer holds.
+                    "waiting_seconds": (
+                        None
+                        if d.job.job_id not in self._queued_since
+                        else max(0, int(_now() - self._queued_since[d.job.job_id]))
+                    ),
                 }
                 for d in deferred
             ],
