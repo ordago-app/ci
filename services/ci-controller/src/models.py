@@ -82,6 +82,13 @@ class Reservation:
     idle_since: float | None = None
     runner_id: int | None = None
     container_id: str | None = None
+    # Why the idle reaper last declined to tear this lane down, and how many consecutive
+    # ticks it has declined for. Every bail-out in _reap_idle_lane is a *deferral*, not a
+    # decision -- it returns and retries next tick -- so without this a lane can sit past
+    # idle_lane_max_seconds indefinitely while /status still calls it "booting". On
+    # 2026-08-20 one held 7500 MB for 2153 s that way. Cleared on a successful reap.
+    reap_blocked_reason: str | None = None
+    reap_block_count: int = 0
 
     @property
     def claimed_job_id(self) -> int:

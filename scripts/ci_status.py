@@ -34,7 +34,10 @@ if any("state" not in lane for lane in running):
     print("           (deployed controller predates the busy/booting split — deploy to see it)")
 else:
     busy = [r for r in running if r["state"] == "busy"]
-    booting = [r for r in running if r["state"] != "busy"]
+    # A controller predating the stuck split reports every unattributed lane as "booting",
+    # so this stays empty there rather than fabricating a state the payload never carried.
+    stuck = [r for r in running if r["state"] == "stuck"]
+    booting = [r for r in running if r["state"] == "booting"]
     # "busy:", not "running:": this counts only lanes GitHub has actually given a job, while
     # TOTAL above counts every lane holding a reservation. Labelled "running" the two silently
     # failed to add up whenever a lane was booting -- and the booting line below only prints
@@ -43,5 +46,16 @@ else:
     if booting:
         ages = ", ".join(f"{r['class']}:{r['idle_seconds']}s" for r in booting)
         print(f"booting:   {len(booting)} ({ages})")
+    # Printed last and per-lane, not aggregated: a stuck lane is the thing you act on, and
+    # on 2026-08-20 exactly one of them held 7500 MB and head-of-line-blocked 7 deferred
+    # jobs for 36 minutes while rendering here as an ordinary "booting" entry.
+    for r in stuck:
+        why = r.get("reap_blocked_reason") or "past idle cap, no reap attempt recorded"
+        n = r.get("reap_block_count") or 0
+        streak = f" x{n}" if n else ""
+        print(
+            f"STUCK:     {r['lane_id']} ({r['class']}, {r['ram_mb']} MB) "
+            f"idle {r['idle_seconds']}s — {why}{streak}"
+        )
 print("deferred: ", dict(Counter(x["reason"] for x in d["deferred"])))
 print(f"mode:      {d['admission_mode']}")

@@ -1686,3 +1686,58 @@ def test_a_job_that_stops_being_queued_is_dropped_from_the_wait_ledger(
     ctrl.tick()
 
     assert ctrl._queued_since == {}
+
+
+def test_a_lane_whose_reap_is_refused_is_not_reported_as_booting(write_config, monkeypatch) -> None:
+    """A lane past idle_lane_max_seconds whose teardown GitHub keeps refusing must be
+    distinguishable in /status from a lane that is genuinely still coming up.
+
+    2026-08-20: lane powerserver-cici-96380840900-658a75 held a 7500 MB node_heavy
+    reserve for 2153 s — 3.6x the 600 s "absolute ceiling" — while `make ci-status`
+    rendered it as `booting`, identical to a 20-second-old healthy lane. Its job
+    (96380840900) was still `queued` with `runner_name: ""` the whole time, so the lane
+    was provably jobless. Reading it as "booting" is what cost 40 minutes of forensics:
+    the one field that would have named the problem was the one being overwritten.
+    """
+    ctrl, github, docker, _lanes = _reaper_controller(write_config, [], monkeypatch, idle_for=2153)
+    github.delete_runner.return_value = False  # 422: GitHub calls the runner busy
+
+    ctrl.tick()
+
+    docker.remove.assert_not_called()  # the refusal is respected — that part is correct
+    lane = next(r for r in ctrl.status()["running"] if r["lane_id"] == "powerserver-cici-7")
+    assert lane["state"] != "booting", (
+        "a lane 3.6x past the idle cap whose reap was refused is reported as 'booting', "
+        "indistinguishable from a healthy lane that started 20 seconds ago"
+    )
+    assert lane["reap_blocked_reason"] == "deregistration_refused"
+
+
+def test_a_blocked_idle_reap_is_recorded_in_the_metrics_db(write_config, monkeypatch) -> None:
+    """The refusal must land in the events table, not only in an INFO log line.
+
+    The 2026-08-20 lane leak was invisible to `make ci-report` precisely because every
+    bail-out path in _reap_idle_lane returns after logging and emits nothing: the DB
+    showed an `admit` at 09:35:35 and the next event for that lane 2153 s later, with
+    no record of the 200-odd reap attempts in between.
+    """
+    metrics = MagicMock()
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    ctrl, github, _docker, _lanes = _reaper_controller(write_config, [], monkeypatch, idle_for=2153)
+    ctrl.metrics = metrics
+    github.delete_runner.return_value = False
+
+    ctrl.tick()
+
+    kinds = [c.kwargs.get("kind") for c in metrics.record_event.call_args_list]
+    assert "idle_reap_blocked" in kinds, (
+        f"a blocked reap emitted no event (got {kinds}); the leak is unqueryable in ci_bench"
+    )
+    blocked = next(
+        c.kwargs
+        for c in metrics.record_event.call_args_list
+        if c.kwargs.get("kind") == "idle_reap_blocked"
+    )
+    assert blocked["reason"] == "deregistration_refused"
+    assert blocked["lane_id"] == "powerserver-cici-7"
+    assert cfg.idle_lane_max_seconds == 600  # the ceiling this lane blew through

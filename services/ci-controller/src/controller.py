@@ -35,6 +35,10 @@ log = logging.getLogger("ci-controller")
 # in_progress list, and short enough to still be in the log while the lane exists.
 ATTRIBUTION_WARN_AFTER = 20
 
+# A stuck lane re-blocks every tick; emit the 1st and then every Nth so the streak is
+# visible in the events table without one row per tick per lane.
+_REAP_BLOCK_EMIT_EVERY = 20
+
 _PRESSURE_GATES = frozenset({BUDGET_FULL, DISK_FULL, LANE_CEILING})
 # A defer binding one of these cannot be relieved by reaping a lane: freeing RAM or a
 # lane slot does not free the KVM device. Counting it as pressure would make the
@@ -45,6 +49,22 @@ _UNRELIEVABLE_GATES = frozenset({KVM_BUSY})
 
 def _now() -> float:
     return time.time()
+
+
+def _lane_state(res: Reservation, idle_cap: float) -> str:
+    """busy | stuck | booting.
+
+    "stuck" is any unattributed lane the reaper has actually declined to remove, or one
+    that is past the idle cap and so should have been removed by now. Both mean the same
+    thing to a reader: this lane is holding RAM and a slot and is not going to give them
+    back on its own."""
+    if res.running_job_id is not None:
+        return "busy"
+    if res.reap_blocked_reason is not None:
+        return "stuck"
+    if res.idle_since is not None and _now() - res.idle_since >= idle_cap:
+        return "stuck"
+    return "booting"
 
 
 def _idle_for(res: Reservation, now: float) -> float:
@@ -170,6 +190,8 @@ class Controller:
                     workflow=running.workflow,
                     job_name=running.job_name,
                     idle_since=None,
+                    reap_blocked_reason=None,
+                    reap_block_count=0,
                 )
                 log.info(
                     "lane %s spawned for job %s is running job %s",
@@ -578,6 +600,52 @@ class Controller:
             return False
         return res.lane_id not in self._seen_runner_names
 
+    def _block_reap(self, res: Reservation, reason: str, now: float) -> None:
+        """Record that this tick declined to tear `res` down, and why.
+
+        Every early return in _reap_idle_lane is a deferral to some other authority --
+        GitHub's 422, a failed API call, an absent positive-absence signal, a Docker
+        remove that raised. Each is individually correct: none of them is evidence the
+        lane is safe to destroy. What was missing is that they are also unbounded. The
+        lane keeps its full reservation and its slot while the same refusal repeats every
+        tick, and nothing outside the log ever says so.
+
+        Recording the reason on the reservation is what lets status() stop calling such a
+        lane "booting", and the event is what lets ci_bench count it. Neither changes the
+        refusal itself -- inferring "gone" from a refusal is the exact mistake the guards
+        exist to prevent."""
+        first = res.reap_blocked_reason != reason
+        count = 1 if first else res.reap_block_count + 1
+        self.ledger.update(res.lane_id, reap_blocked_reason=reason, reap_block_count=count)
+        # Emit on the first block and then sparsely: one row per tick per stuck lane would
+        # be ~200 rows for the 2026-08-20 leak alone, and the signal is the streak, not
+        # each repetition.
+        if first or count % _REAP_BLOCK_EMIT_EVERY == 0:
+            self._emit(
+                kind="idle_reap_blocked",
+                job_id=res.spawned_for_job_id,
+                spawned_for_job_id=res.spawned_for_job_id,
+                attributed=None,
+                repo=res.repo,
+                class_name=res.class_name,
+                lane_id=res.lane_id,
+                ts=now,
+                reason=reason,
+                host=res.host,
+            )
+        log.warning(
+            "idle lane %s (%s, %s MB) is %.0fs idle -- past the %.0fs cap -- and its "
+            "teardown has been declined %s consecutive tick(s): %s. It is holding its "
+            "full reservation while blocked.",
+            res.lane_id,
+            res.class_name,
+            res.ram_mb,
+            _idle_for(res, now),
+            self.config.idle_lane_max_seconds,
+            count,
+            reason,
+        )
+
     def _reap_idle_lane(self, res: Reservation, now: float) -> None:
         if res.runner_id is not None and res.repo != "(adopted)":
             try:
@@ -586,13 +654,11 @@ class Controller:
                     # took a job in the race window, or it has been running one all
                     # along and we just haven't attributed it yet — either way GitHub,
                     # not our idle clock, gets the final say on whether it's safe.
-                    log.info(
-                        "lane %s refused deregistration (GitHub reports it busy); keeping it",
-                        res.lane_id,
-                    )
+                    self._block_reap(res, "deregistration_refused", now)
                     return
             except Exception as exc:  # a reap failure must never break the loop
                 log.warning("deregister failed for lane %s: %s", res.lane_id, exc)
+                self._block_reap(res, "deregister_error", now)
                 return
         else:
             if _idle_for(res, now) < self.config.idle_lane_max_seconds:
@@ -607,6 +673,7 @@ class Controller:
                     "tear it down without a positive absence signal",
                     res.lane_id,
                 )
+                self._block_reap(res, "absence_unconfirmed", now)
                 return
             # Degraded path: no GitHub deregistration confirmed this teardown, we are
             # acting on inferred absence instead.
@@ -630,6 +697,7 @@ class Controller:
                 self.docker.for_host(res.host).remove(res.container_id)
             except Exception as exc:
                 log.warning("failed to remove idle lane %s: %s", res.lane_id, exc)
+                self._block_reap(res, "container_remove_failed", now)
                 return
         self._emit(
             kind="idle_reap",
@@ -742,7 +810,13 @@ class Controller:
                     "host": r.host,
                     "workflow": r.workflow,
                     "job_name": r.job_name,
-                    "state": "busy" if r.running_job_id is not None else "booting",
+                    # Three states, not two. "booting" used to absorb every unattributed
+                    # lane, including one that had blown through idle_lane_max_seconds and
+                    # was stuck holding its reserve -- which is how the 2026-08-20 node_heavy
+                    # leak read as a healthy lane in `make ci-status` for 36 minutes.
+                    "state": _lane_state(r, self.config.idle_lane_max_seconds),
+                    "reap_blocked_reason": r.reap_blocked_reason,
+                    "reap_block_count": r.reap_block_count,
                     "idle_seconds": (None if r.idle_since is None else int(_now() - r.idle_since)),
                     # Wall-clock age of the lane's container. None when the daemon gave no
                     # usable timestamp — the reader shows "unknown", never a zero that
