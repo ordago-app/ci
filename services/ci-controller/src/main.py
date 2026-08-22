@@ -39,7 +39,6 @@ def main() -> None:
     private_key = base64.b64decode(_require("GITHUB_RUNNER_APP_PRIVATE_KEY_B64")).decode()
     github = GitHubAdapter(
         app_id=_require("GITHUB_RUNNER_APP_ID"),
-        installation_id=_require("GITHUB_RUNNER_APP_INSTALLATION_ID"),
         private_key_pem=private_key,
     )
     # One DockerAdapter per configured host, each dialing its own docker_endpoint

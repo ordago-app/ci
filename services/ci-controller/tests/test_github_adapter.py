@@ -3,7 +3,13 @@ import datetime as dt
 import httpx
 import pytest
 import respx
-from src.github_adapter import JOBS_PAGE_SIZE, MAX_RUNNER_PAGES, GitHubAdapter, RunnerInfo
+from src.github_adapter import (
+    JOBS_PAGE_SIZE,
+    MAX_RUNNER_PAGES,
+    AppNotInstalled,
+    GitHubAdapter,
+    RunnerInfo,
+)
 from src.models import RunningJob
 
 # RSA test key generated for tests only (not a real secret).
@@ -41,8 +47,16 @@ def _future_iso() -> str:
     return (dt.datetime(2099, 1, 1, tzinfo=dt.UTC)).isoformat().replace("+00:00", "Z")
 
 
+def _mock_installation(repo: str = "o/r", inst: int = 123) -> respx.Route:
+    """Answer the per-repo installation lookup every token exchange now begins with."""
+    return respx.get(f"https://api.github.com/repos/{repo}/installation").mock(
+        return_value=httpx.Response(200, json={"id": inst})
+    )
+
+
 @respx.mock
 def test_mint_registration_token() -> None:
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
@@ -50,7 +64,7 @@ def test_mint_registration_token() -> None:
         return_value=httpx.Response(201, json={"token": "ARRT", "expires_at": _future_iso()})
     )
 
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
     token = gh.mint_registration_token("o/r")
 
     assert token == "ARRT"
@@ -59,17 +73,19 @@ def test_mint_registration_token() -> None:
 
 @respx.mock
 def test_installation_token_is_cached() -> None:
+    _mock_installation()
     inst = respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
-    assert gh.installation_token() == "ghs_inst"
-    assert gh.installation_token() == "ghs_inst"
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
+    assert gh.installation_token("o/r") == "ghs_inst"
+    assert gh.installation_token("o/r") == "ghs_inst"
     assert inst.call_count == 1  # second call served from cache
 
 
 @respx.mock
 def test_list_queued_jobs() -> None:
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
@@ -89,7 +105,7 @@ def test_list_queued_jobs() -> None:
         )
     )
 
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
     jobs = gh.list_queued_jobs("o/r")
 
     assert len(jobs) == 1
@@ -100,6 +116,7 @@ def test_list_queued_jobs() -> None:
 
 @respx.mock
 def test_queued_jobs_carry_workflow_and_job_name() -> None:
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
@@ -128,7 +145,7 @@ def test_queued_jobs_carry_workflow_and_job_name() -> None:
         )
     )
 
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
     (job,) = gh.list_queued_jobs("o/r")
 
     assert job.job_id == 77
@@ -138,6 +155,7 @@ def test_queued_jobs_carry_workflow_and_job_name() -> None:
 
 @respx.mock
 def test_job_conclusion_returns_the_terminal_value_when_present() -> None:
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
@@ -146,25 +164,27 @@ def test_job_conclusion_returns_the_terminal_value_when_present() -> None:
             200, json={"id": 42, "status": "completed", "conclusion": "success"}
         )
     )
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
     assert gh.job_conclusion("o/r", 42) == "success"
 
 
 @respx.mock
 def test_job_conclusion_is_none_when_the_conclusion_key_is_missing_entirely() -> None:
     """A job payload with no `conclusion` key at all (some in-progress responses omit it)."""
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
     respx.get("https://api.github.com/repos/o/r/actions/jobs/42").mock(
         return_value=httpx.Response(200, json={"id": 42, "status": "in_progress"})
     )
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
     assert gh.job_conclusion("o/r", 42) is None
 
 
 @respx.mock
 def test_job_conclusion_is_none_for_an_explicit_null_conclusion_on_an_in_progress_job() -> None:
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
@@ -173,7 +193,7 @@ def test_job_conclusion_is_none_for_an_explicit_null_conclusion_on_an_in_progres
             200, json={"id": 42, "status": "in_progress", "conclusion": None}
         )
     )
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
     assert gh.job_conclusion("o/r", 42) is None
 
 
@@ -181,25 +201,27 @@ def test_job_conclusion_is_none_for_an_explicit_null_conclusion_on_an_in_progres
 def test_job_conclusion_raises_on_a_non_2xx_response() -> None:
     """The caller (controller.reconcile) is responsible for catching this and writing the
     'lookup_failed' sentinel — job_conclusion itself must not swallow it."""
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
     respx.get("https://api.github.com/repos/o/r/actions/jobs/42").mock(
         return_value=httpx.Response(403, json={"message": "Resource not accessible by integration"})
     )
-    gh = GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
     with pytest.raises(httpx.HTTPStatusError):
         gh.job_conclusion("o/r", 42)
 
 
 def _token() -> None:
+    _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
 
 
 def _adapter() -> GitHubAdapter:
-    return GitHubAdapter(app_id="9", installation_id="123", private_key_pem=TEST_KEY)
+    return GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
 
 
 @respx.mock
@@ -459,3 +481,141 @@ def test_a_truncated_jobs_scan_is_not_reported_as_not_running() -> None:
 
     assert found.job is None
     assert found.complete is False, "a scan cut short at the page bound is not a clean miss"
+
+
+# ── Per-repo installation resolution ──
+# One App installed on two accounts has a different installation id under each.
+# These pin the behaviour that lets one controller serve a personal repo and an
+# org repo at the same time.
+
+
+@respx.mock
+def test_repos_under_different_owners_use_their_own_installation() -> None:
+    _mock_installation("personal/homelab", 111)
+    _mock_installation("acme/ordago-apps", 222)
+    personal = respx.post("https://api.github.com/app/installations/111/access_tokens").mock(
+        return_value=httpx.Response(
+            201, json={"token": "ghs_personal", "expires_at": _future_iso()}
+        )
+    )
+    org = respx.post("https://api.github.com/app/installations/222/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_org", "expires_at": _future_iso()})
+    )
+    for repo in ("personal/homelab", "acme/ordago-apps"):
+        respx.post(f"https://api.github.com/repos/{repo}/actions/runners/registration-token").mock(
+            return_value=httpx.Response(201, json={"token": "ARRT"})
+        )
+
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
+    gh.mint_registration_token("personal/homelab")
+    gh.mint_registration_token("acme/ordago-apps")
+
+    assert personal.called and org.called
+    assert gh.installation_id("personal/homelab") == 111
+    assert gh.installation_id("acme/ordago-apps") == 222
+
+
+@respx.mock
+def test_installation_id_is_resolved_once_per_repo() -> None:
+    lookup = _mock_installation()
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
+    gh.installation_token("o/r")
+    gh.installation_token("o/r")
+
+    assert lookup.call_count == 1
+
+
+@respx.mock
+def test_missing_installation_names_the_operator_action() -> None:
+    respx.get("https://api.github.com/repos/o/r/installation").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"})
+    )
+
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
+    with pytest.raises(AppNotInstalled) as excinfo:
+        gh.mint_registration_token("o/r")
+
+    assert "not installed on the account owning" in str(excinfo.value)
+
+
+@respx.mock
+def test_stale_installation_id_is_re_resolved_not_fatal() -> None:
+    """Transferring a repo between accounts invalidates the cached installation id.
+
+    Without the retry the controller serves 404s until someone restarts it — during
+    exactly the window where the operator is watching for runners to come back."""
+    lookup = respx.get("https://api.github.com/repos/o/r/installation").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": 123}),
+            httpx.Response(200, json={"id": 456}),
+        ]
+    )
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"})
+    )
+    respx.post("https://api.github.com/app/installations/456/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_new", "expires_at": _future_iso()})
+    )
+
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
+
+    assert gh.installation_token("o/r") == "ghs_new"
+    assert lookup.call_count == 2
+
+
+@respx.mock
+def test_cached_token_is_re_resolved_when_the_installation_behind_it_dies() -> None:
+    """The stale-id retry above only fires when no token is cached.
+
+    An installation token is cached for its full hour, so the common shape of a
+    transfer is: token minted, repo moves, cached token now revoked. Nothing
+    re-enters the exchange to notice — the 401 on the repo call is the only signal.
+    """
+    lookup = respx.get("https://api.github.com/repos/o/r/installation").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": 111}),
+            httpx.Response(200, json={"id": 222}),
+        ]
+    )
+    respx.post("https://api.github.com/app/installations/111/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_old", "expires_at": _future_iso()})
+    )
+    respx.post("https://api.github.com/app/installations/222/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_new", "expires_at": _future_iso()})
+    )
+    reg = respx.post("https://api.github.com/repos/o/r/actions/runners/registration-token").mock(
+        side_effect=[
+            httpx.Response(201, json={"token": "ARRT1"}),
+            httpx.Response(401, json={"message": "Bad credentials"}),
+            httpx.Response(201, json={"token": "ARRT2"}),
+        ]
+    )
+
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
+    assert gh.mint_registration_token("o/r") == "ARRT1"
+    # The App is reinstalled under a new account; the cached token is now revoked.
+    assert gh.mint_registration_token("o/r") == "ARRT2"
+
+    assert lookup.call_count == 2, "the 401 must invalidate the cached installation"
+    assert reg.calls[-1].request.headers["Authorization"] == "Bearer ghs_new"
+
+
+@respx.mock
+def test_a_persistent_401_is_raised_not_retried_forever() -> None:
+    _mock_installation()
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    reg = respx.post("https://api.github.com/repos/o/r/actions/runners/registration-token").mock(
+        return_value=httpx.Response(401, json={"message": "Bad credentials"})
+    )
+
+    gh = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY)
+    with pytest.raises(httpx.HTTPStatusError):
+        gh.mint_registration_token("o/r")
+
+    assert reg.call_count == 2, "exactly one retry, then surface it"

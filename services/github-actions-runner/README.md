@@ -124,8 +124,11 @@ These directories are persistent caches, not source of truth.
 2. Disable webhooks; this service only uses outbound REST API calls.
 3. Grant repository `Administration: Read and Write`; this is required to mint
    self-hosted runner registration/remove tokens.
-4. Install the App only on repositories listed in `personal/github-runners.yml`.
-5. Store `app_id`, `installation_id`, and the downloaded PEM private key in
+4. Install the App on every **account** owning a repository listed in
+   `personal/github-runners.yml` or `personal/ci-controller.yml` — personal and
+   org alike. The installation id is never configured: both the entrypoint and
+   `ci-controller` resolve it per repo, so one App serves repos across owners.
+5. Store `app_id` and the downloaded PEM private key in
    `secrets/secrets.prod.yml` under `github_actions_runner_app`.
 6. Confirm root disk has enough headroom for Android SDK and AVD caches:
 

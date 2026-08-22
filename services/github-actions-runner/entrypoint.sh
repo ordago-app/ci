@@ -16,7 +16,6 @@ require_env RUNNER_WORKDIR
 
 require_app_creds() {
   require_env GITHUB_RUNNER_APP_ID
-  require_env GITHUB_RUNNER_APP_INSTALLATION_ID
   require_env GITHUB_RUNNER_APP_PRIVATE_KEY_B64
 }
 
@@ -28,12 +27,11 @@ if [ -z "${RUNNER_REGISTRATION_TOKEN:-}" ]; then
 fi
 
 app_id="${GITHUB_RUNNER_APP_ID:-}"
-app_installation_id="${GITHUB_RUNNER_APP_INSTALLATION_ID:-}"
 app_private_key_b64="${GITHUB_RUNNER_APP_PRIVATE_KEY_B64:-}"
-unset GITHUB_RUNNER_APP_ID GITHUB_RUNNER_APP_INSTALLATION_ID GITHUB_RUNNER_APP_PRIVATE_KEY_B64
+unset GITHUB_RUNNER_APP_ID GITHUB_RUNNER_APP_PRIVATE_KEY_B64
 
 github_api="https://api.github.com/repos/${RUNNER_REPOSITORY}/actions/runners"
-github_app_installation_api="https://api.github.com/app/installations/${app_installation_id}/access_tokens"
+github_repo_installation_api="https://api.github.com/repos/${RUNNER_REPOSITORY}/installation"
 github_url="https://github.com/${RUNNER_REPOSITORY}"
 
 base64url() {
@@ -68,16 +66,54 @@ mint_app_jwt() {
   printf '%s.%s\n' "${signing_input}" "${signature}"
 }
 
+# Resolved from RUNNER_REPOSITORY rather than configured: the same App installed
+# on a personal account and on an org has a different installation id under each,
+# so a configured id pins the whole runner pool to one owner.
+#
+# Fails by return status, never `exit`: this runs two command substitutions deep
+# (mint_token, then its caller) and `set -e` does not propagate out of nested
+# substitutions — an `exit` here prints its error and is then discarded, leaving
+# the caller to register with an empty token. Every call site checks explicitly.
 mint_installation_token() {
-  local app_jwt
+  local app_jwt lookup http_code installation_id
 
   app_jwt="$(mint_app_jwt)"
+  # Deliberately not `-f`: the status code is the diagnosis. A missing
+  # installation (404) names an operator action; a 401 from a bad App id or
+  # revoked key, a rate limit, or a GitHub 5xx name entirely different ones, and
+  # collapsing them into "not installed" sends the operator to the wrong page
+  # during the one migration this guard exists to make legible.
+  lookup="$(
+    curl -sSL -w '\n%{http_code}' \
+      -H "Accept: application/vnd.github+json" \
+      -H "Authorization: Bearer ${app_jwt}" \
+      -H "X-GitHub-Api-Version: 2026-03-10" \
+      "${github_repo_installation_api}"
+  )" || {
+    echo "::error::could not reach GitHub to look up the installation for ${RUNNER_REPOSITORY}" >&2
+    return 1
+  }
+  http_code="${lookup##*$'\n'}"
+  case "${http_code}" in
+    200) ;;
+    404)
+      echo "::error::the GitHub App is not installed on the account owning ${RUNNER_REPOSITORY}" >&2
+      return 1
+      ;;
+    *)
+      echo "::error::installation lookup for ${RUNNER_REPOSITORY} failed with HTTP ${http_code}." \
+           "This is NOT a missing installation — check GITHUB_RUNNER_APP_ID and the App private" \
+           "key first, then GitHub status." >&2
+      return 1
+      ;;
+  esac
+  installation_id="$(printf '%s' "${lookup%$'\n'*}" | jq -r '.id')"
   curl -fsSL \
     -X POST \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${app_jwt}" \
     -H "X-GitHub-Api-Version: 2026-03-10" \
-    "${github_app_installation_api}" \
+    "https://api.github.com/app/installations/${installation_id}/access_tokens" \
     | jq -r '.token'
 }
 
@@ -85,7 +121,7 @@ mint_token() {
   local endpoint="$1"
   local installation_token
 
-  installation_token="$(mint_installation_token)"
+  installation_token="$(mint_installation_token)" || return 1
   curl -fsSL \
     -X POST \
     -H "Accept: application/vnd.github+json" \
@@ -99,10 +135,15 @@ cleanup() {
   set +e
   # Ephemeral runners auto-deregister after one job, and have no App creds to
   # mint a remove-token. Only the static pool path removes explicitly.
+  #
+  # Reachable only before `exec ./run.sh` replaces this shell and takes the trap
+  # with it — i.e. a failure during configure, or a signal caught while setting
+  # up. Once run.sh is exec'd, deregistration is its business, not ours.
   if [ "${RUNNER_EPHEMERAL:-0}" != "1" ] && [ -f .runner ]; then
     echo "Removing GitHub Actions runner ${RUNNER_NAME}..."
-    remove_token="$(mint_token remove-token)"
-    ./config.sh remove --unattended --token "${remove_token}"
+    if remove_token="$(mint_token remove-token)"; then
+      ./config.sh remove --unattended --token "${remove_token}"
+    fi
   fi
   # The ci-controller binds a shared work-dir base and each ephemeral lane creates
   # its own per-lane subdir (RUNNER_WORKDIR) inside it. The container auto-removes,
@@ -156,7 +197,7 @@ if [ ! -f .runner ]; then
   if [ -n "${RUNNER_REGISTRATION_TOKEN:-}" ]; then
     registration_token="${RUNNER_REGISTRATION_TOKEN}"
   else
-    registration_token="$(mint_token registration-token)"
+    registration_token="$(mint_token registration-token)" || exit 1
   fi
   config_args=(
     --unattended
