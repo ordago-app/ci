@@ -15,6 +15,8 @@ from src.github_adapter import GitHubAdapter
 from src.host_stats import read_host_stats
 from src.ledger import Ledger
 from src.metrics import MetricsStore
+from src.scheduler import LocalScheduler, Scheduler
+from src.scheduler_client import HttpScheduler
 
 
 def _require(name: str) -> str:
@@ -22,6 +24,12 @@ def _require(name: str) -> str:
     if not value:
         raise SystemExit(f"missing required environment variable: {name}")
     return value
+
+
+def build_scheduler(config: ControllerConfig, scheduler_url: str | None) -> Scheduler:
+    if scheduler_url:
+        return HttpScheduler(scheduler_url)
+    return LocalScheduler(config=config, ledger=Ledger())
 
 
 def main() -> None:
@@ -35,6 +43,8 @@ def main() -> None:
     config = ControllerConfig.load(config_path)
     if host not in config.resolved_hosts():
         raise SystemExit(f"RUNNER_HOST '{host}' is not a configured host")
+
+    scheduler = build_scheduler(config, os.environ.get("CI_SCHEDULER_URL"))
 
     private_key = base64.b64decode(_require("GITHUB_RUNNER_APP_PRIVATE_KEY_B64")).decode()
     github = GitHubAdapter(
@@ -51,7 +61,7 @@ def main() -> None:
         config=config,
         github=github,
         docker=docker_pool,
-        ledger=Ledger(),
+        scheduler=scheduler,
         metrics=metrics,
         host_stats_reader=read_host_stats,
         host=host,

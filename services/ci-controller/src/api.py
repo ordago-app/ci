@@ -42,11 +42,13 @@ def create_app(controller: Controller, poll_interval: float) -> FastAPI:
 
     @app.get("/status")
     async def status() -> dict:
-        return controller.status()
+        # status() reaches the scheduler over HTTP with blocking retries; called inline it
+        # would stall the event loop, and /healthz with it, for the whole retry window.
+        return await asyncio.to_thread(controller.status)
 
     @app.get("/metrics", response_class=PlainTextResponse)
     async def metrics() -> str:
-        s = controller.status()
+        s = await asyncio.to_thread(controller.status)
         lines = [
             f"ci_budget_ram_mb {s['budget_ram_mb']}",
             f"ci_ledger_ram_mb {s['ledger_ram_mb']}",

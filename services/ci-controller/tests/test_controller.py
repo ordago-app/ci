@@ -1741,3 +1741,51 @@ def test_a_blocked_idle_reap_is_recorded_in_the_metrics_db(write_config, monkeyp
     assert blocked["reason"] == "deregistration_refused"
     assert blocked["lane_id"] == "powerserver-cici-7"
     assert cfg.idle_lane_max_seconds == 600  # the ceiling this lane blew through
+
+
+def test_controller_admits_via_the_scheduler(make_controller, monkeypatch):
+    """The controller must not call evaluate() itself: admission verdicts come from
+    the Scheduler, which is the component that will later live in another process."""
+    from src.scheduler import LocalScheduler
+
+    controller, _docker = make_controller()
+    calls: list[int] = []
+    original = controller.scheduler.plan
+
+    def spy(jobs, host_stats, healthy):
+        calls.append(len(jobs))
+        return original(jobs, host_stats, healthy)
+
+    monkeypatch.setattr(controller.scheduler, "plan", spy)
+    controller.tick()
+
+    assert calls, "controller.tick() did not consult the scheduler"
+    assert isinstance(controller.scheduler, LocalScheduler)
+
+
+def test_controller_never_touches_the_ledger_directly():
+    """The ledger is scheduler-owned. Reads count as much as writes: HttpScheduler has
+    no in-process ledger, so any surviving `self.ledger` here raises AttributeError the
+    moment the scheduler moves to its own container (Task 7)."""
+    import re
+    from pathlib import Path
+
+    import src.controller
+
+    source = Path(src.controller.__file__).read_text()
+    offenders = re.findall(r"self\.ledger\.(\w+)\(", source)
+    assert offenders == [], f"controller touches the ledger directly: {offenders}"
+
+
+def test_status_still_reports_per_host_totals(make_controller):
+    """status() aggregated straight off the ledger before this task. It must keep
+    producing the same shape after the reads move behind the scheduler."""
+    ctrl, _docker = make_controller()
+    ctrl.tick()
+
+    status = ctrl.status()
+
+    assert "hosts" in status or "powerserver" in str(status)
+    assert isinstance(status["lanes_running"], int)
+    assert isinstance(status["ledger_ram_mb"], int)
+    assert set(status["disk_gb"]) == set(ctrl.config.disk_budget_gb)

@@ -6,7 +6,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from src.admission import evaluate
 from src.config import ControllerConfig
 from src.docker_adapter import DockerPool, LaneInfo
 from src.github_adapter import RUNS_SCAN_LIMIT, GitHubAdapter
@@ -26,6 +25,7 @@ from src.models import (
     QueuedJob,
     Reservation,
 )
+from src.scheduler import LocalScheduler, Scheduler
 
 log = logging.getLogger("ci-controller")
 
@@ -73,21 +73,42 @@ def _idle_for(res: Reservation, now: float) -> float:
     return now - res.idle_since  # type: ignore[operator]
 
 
+def _on_host(lanes: list[Reservation], host: str | None) -> list[Reservation]:
+    return [r for r in lanes if host is None or r.host == host]
+
+
+def _total_ram(lanes: list[Reservation]) -> int:
+    return sum(r.ram_mb for r in lanes)
+
+
+def _kvm_in_use(lanes: list[Reservation]) -> bool:
+    return any(r.needs_kvm for r in lanes)
+
+
+def _disk_gb_in_use(lanes: list[Reservation], disk: str) -> int:
+    return sum(r.work_gb for r in lanes if r.work_disk == disk)
+
+
 class Controller:
     def __init__(
         self,
         config: ControllerConfig,
         github: GitHubAdapter,
         docker: DockerPool,
-        ledger: Ledger,
+        ledger: Ledger | None = None,
         metrics: MetricsStore | None = None,
         host_stats_reader: Callable[[], HostStats] | None = None,
         host: str = "powerserver",
+        scheduler: Scheduler | None = None,
     ) -> None:
+        if scheduler is None:
+            scheduler = LocalScheduler(config=config, ledger=ledger or Ledger())
+        elif ledger is not None:
+            raise ValueError("pass either `ledger` or `scheduler`, not both")
         self.config = config
         self.github = github
         self.docker = docker
-        self.ledger = ledger
+        self.scheduler = scheduler
         self._last_decisions: list[Decision] = []
         # job_id -> the epoch second we FIRST saw it deferred, so /status can say how long
         # a job has been waiting. Deliberately in-memory and therefore reset by a restart:
@@ -122,6 +143,19 @@ class Controller:
         # lane it holds, so that verdict is debounced; skipping it for admission is not.
         self._unhealthy_ticks: dict[str, int] = {}
 
+    @property
+    def ledger(self) -> Ledger:
+        """The scheduler's ledger, for tests and status rendering.
+
+        Available only while the scheduler runs in-process. A remote scheduler has no
+        local ledger to expose; this property raises there rather than returning a
+        hollow one, so a caller that still needs direct ledger access fails loudly
+        instead of silently reading an empty set."""
+        ledger = getattr(self.scheduler, "ledger", None)
+        if ledger is None:
+            raise AttributeError("this scheduler has no in-process ledger")
+        return ledger
+
     def _emit(self, **fields: object) -> None:
         if self.metrics is None:
             return
@@ -145,7 +179,11 @@ class Controller:
         an unregistered lane as confirmed absent rather than merely unheard-from."""
         self._synced_repos = set()
         self._seen_runner_names = set()
-        lane_ids = self.ledger.lane_ids()
+        # One snapshot for the whole loop, not one per repo: a lane_id appears in at most
+        # one repo's runner listing per tick, so nothing below can invalidate it, and it
+        # collapses N scheduler round-trips into one.
+        lanes = self.scheduler.lanes()
+        lane_ids = {r.lane_id for r in lanes}
         self._unresolved_attributions = {
             lane_id: n
             for lane_id, n in self._unresolved_attributions.items()
@@ -166,12 +204,12 @@ class Controller:
             if listing.complete:
                 self._synced_repos.add(repo)
             self._seen_runner_names.update(runners)
-            for res in self.ledger.reservations():
+            for res in lanes:
                 info = runners.get(res.lane_id)
                 if info is None:
                     continue
                 if res.runner_id != info.runner_id or res.repo != repo:
-                    self.ledger.update(res.lane_id, runner_id=info.runner_id, repo=repo)
+                    self.scheduler.update(res.lane_id, runner_id=info.runner_id, repo=repo)
                 if not info.busy or res.running_job_id is not None:
                     continue
                 try:
@@ -184,7 +222,7 @@ class Controller:
                     self._note_unresolved_attribution(res.lane_id, complete=lookup.complete)
                     continue  # busy but not yet visible in the runs list; retry next tick
                 self._unresolved_attributions.pop(res.lane_id, None)
-                self.ledger.update(
+                self.scheduler.update(
                     res.lane_id,
                     running_job_id=running.job_id,
                     workflow=running.workflow,
@@ -300,8 +338,9 @@ class Controller:
                     )
 
         # Drop ledger entries whose lane is gone (frees budget); emit reap events.
-        for lane_id in self.ledger.lane_ids() - set(running):
-            res = next((r for r in self.ledger.reservations() if r.lane_id == lane_id), None)
+        reservations = self.scheduler.lanes()
+        for lane_id in {r.lane_id for r in reservations} - set(running):
+            res = next((r for r in reservations if r.lane_id == lane_id), None)
             # Its host is unresponsive but not yet declared lost: the lane is invisible
             # only because we cannot ask. Hold the reservation — do not free the budget
             # and do not record an outcome — until the host either answers again or
@@ -373,11 +412,11 @@ class Controller:
                 # anonymous volume with the container (ADR 0023). A remote host left in
                 # bind mode would leak a workspace per killed lane, which is why
                 # test_deploy_wiring asserts none is.
-            self.ledger.remove(lane_id)
+            self.scheduler.release(lane_id)
         # Re-adopt running lanes the ledger doesn't know about (post-restart). Identity is
         # lane_id, not job_id: an attributed lane's claimed_job_id no longer matches the
         # job_id on its own Docker label, and it must not be mistaken for an orphan.
-        known_lane_ids = self.ledger.lane_ids()
+        known_lane_ids = {r.lane_id for r in self.scheduler.lanes()}
         for lane in running.values():
             if lane.lane_id in known_lane_ids:
                 # Refresh the start time from the daemon every tick rather than stamping
@@ -385,7 +424,7 @@ class Controller:
                 # controller restart, so "how long has this been running" stays true
                 # across one instead of resetting to zero under a lane that never stopped.
                 if lane.started_at is not None:
-                    self.ledger.update(lane.lane_id, started_at=lane.started_at)
+                    self.scheduler.update(lane.lane_id, started_at=lane.started_at)
                 continue
             host = lane.host or listed_on[lane.lane_id]
             self._readopt(
@@ -452,7 +491,7 @@ class Controller:
                 resolved,
             )
         job_class = self.config.classes[resolved]
-        self.ledger.add(
+        self.scheduler.adopt(
             Reservation(
                 lane_id=lane_id,
                 spawned_for_job_id=job_id,
@@ -490,7 +529,7 @@ class Controller:
             except Exception as exc:
                 log.warning("host stats read failed: %s", exc)
 
-        decisions = evaluate(jobs, self.ledger, self.config, host_stats, self._healthy)
+        decisions = self.scheduler.plan(jobs, host_stats, self._healthy)
         for decision in decisions:
             if isinstance(decision, AdmitDecision):
                 if not self._admit(decision):
@@ -560,7 +599,7 @@ class Controller:
         idle = sorted(
             (
                 r
-                for r in self.ledger.reservations()
+                for r in self.scheduler.lanes()
                 if r.running_job_id is None and r.idle_since is not None and r.host in self._healthy
             ),
             key=lambda r: r.idle_since,  # type: ignore[arg-type,return-value]
@@ -616,7 +655,7 @@ class Controller:
         exist to prevent."""
         first = res.reap_blocked_reason != reason
         count = 1 if first else res.reap_block_count + 1
-        self.ledger.update(res.lane_id, reap_blocked_reason=reason, reap_block_count=count)
+        self.scheduler.update(res.lane_id, reap_blocked_reason=reason, reap_block_count=count)
         # Emit on the first block and then sparsely: one row per tick per stuck lane would
         # be ~200 rows for the 2026-08-20 leak alone, and the signal is the streak, not
         # each repetition.
@@ -715,35 +754,29 @@ class Controller:
             self._reap_work_dir(res.lane_id, res.work_disk)
         # else: same as reconcile() — the controller can only see its OWN filesystem, so
         # a remote host reclaims its own workspaces via work_dir_mode=volume (ADR 0023).
-        self.ledger.remove(res.lane_id)
+        self.scheduler.release(res.lane_id)
         self._peaks.pop(res.lane_id, None)
         log.info("reaped idle lane %s (%s)", res.lane_id, res.class_name)
 
     def _admit(self, decision: AdmitDecision) -> bool:
-        """True once the lane exists AND the ledger knows about it. The ledger insert is
-        inside the guard so a spawn that half-succeeds cannot leave the two out of step,
-        and the caller emits no admit event unless this returns True."""
+        """True once the lane exists AND the scheduler holds a reservation for it; the
+        caller emits no admit event unless this returns True.
+
+        The two can go out of step: under `HttpScheduler` the commit is a network call, so
+        a lane can be spawned and running while the reservation never lands. That returns
+        False, leaving the job queued and its budget unreserved. `_readopt` closes it on a
+        later tick — the container is listed on its host and re-adopted into the ledger,
+        with its class read back from `CLASS_LABEL`."""
         try:
             token = self.github.mint_registration_token(decision.job.repo)
             lane_id, container_id = self.docker.for_host(decision.host).spawn(
                 decision, registration_token=token
             )
-            self.ledger.add(
-                Reservation(
-                    lane_id=lane_id,
-                    spawned_for_job_id=decision.job.job_id,
-                    repo=decision.job.repo,
-                    class_name=decision.class_name,
-                    ram_mb=decision.ram_mb,
-                    needs_kvm=decision.needs_kvm,
-                    work_disk=decision.work_disk,
-                    work_gb=decision.work_gb,
-                    workflow=decision.job.workflow,
-                    job_name=decision.job.job_name,
-                    host=decision.host,
-                    idle_since=_now(),
-                    container_id=container_id,
-                )
+            self.scheduler.commit(
+                decision,
+                lane_id=lane_id,
+                container_id=container_id,
+                idle_since=_now(),
             )
         except Exception as exc:  # spawn failure: leave job queued
             log.error("failed to spawn lane for job %s: %s", decision.job.job_id, exc)
@@ -758,6 +791,7 @@ class Controller:
         return True
 
     def status(self) -> dict:
+        lanes = self.scheduler.lanes()
         deferred = [d for d in self._last_decisions if isinstance(d, DeferDecision)]
         hosts: dict[str, dict[str, int | bool]] = {}
         for name, host_cfg in self.config.resolved_hosts().items():
@@ -774,24 +808,25 @@ class Controller:
                 if host_cfg.ram_budget_mb is None
                 else host_cfg.ram_budget_mb
             )
+            on_host = _on_host(lanes, name)
             hosts[name] = {
-                "lanes": self.ledger.lane_count(name),
+                "lanes": len(on_host),
                 "max_lanes": max_lanes,
-                "ram_mb": self.ledger.total_ram(name),
+                "ram_mb": _total_ram(on_host),
                 "budget_ram_mb": budget_ram_mb,
                 "healthy": name in self._healthy,
             }
         return {
             "budget_ram_mb": self.config.ram_budget_mb,
-            "ledger_ram_mb": self.ledger.total_ram(),
-            "lanes_running": self.ledger.lane_count(),
+            "ledger_ram_mb": _total_ram(lanes),
+            "lanes_running": len(lanes),
             "max_lanes": self.config.max_concurrent_lanes,
-            "kvm_in_use": self.ledger.kvm_in_use(),
+            "kvm_in_use": _kvm_in_use(lanes),
             "config_version": self._config_version,
             "admission_mode": self.config.admission_mode,
             "disk_gb": {
                 disk: {
-                    "used": self.ledger.disk_gb_in_use(disk),
+                    "used": _disk_gb_in_use(lanes, disk),
                     "budget": budget,
                 }
                 for disk, budget in self.config.disk_budget_gb.items()
@@ -825,7 +860,7 @@ class Controller:
                         None if r.started_at is None else max(0, int(_now() - r.started_at))
                     ),
                 }
-                for r in self.ledger.reservations()
+                for r in lanes
             ],
             "deferred": [
                 {

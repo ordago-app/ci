@@ -15,18 +15,37 @@ Supersedes the static pools in `services/github-actions-runner` (which become
 `ci-controller` config). CI-green → review is unchanged — handled by the existing
 `request-review.yml` reusable workflow.
 
-## Architecture: one controller, multiple hosts
+## Architecture: scheduler + dispatcher, one ledger, multiple hosts
 
-One controller instance runs on `powerserver` and admits against **one ledger and one
-metrics DB**, even when a job ends up scheduled on another host. `personal/ci-controller.yml`'s
+Two containers, split along the credential line (see
+[ADR 0025](../../docs/decisions/0025-ci-scheduler-dispatcher-split.md)):
+
+- **`ci-controller`** (this image, default command) — holds the GitHub App key and the
+  `docker-socket-proxy` reach. Polls GitHub, mints JIT registration tokens, spawns and
+  reaps lane containers.
+- **`ci-scheduler`** (same image, `python -m src.scheduler_main`, port 8001) — holds
+  **no credentials and no Docker reach**. Owns the reservation ledger, capacity gates,
+  host health bookkeeping and placement decisions.
+
+`ci-controller` talks to the scheduler over HTTP (`/plan`, `/lanes`, `/lanes/adopt`,
+`/lanes/{id}`). Which transport it uses is one env var: `CI_SCHEDULER_URL` set (as
+`compose.yml` sets it here, to `http://ci-scheduler:8001`) selects `HttpScheduler`;
+**unset**, `src/main.py` falls back to an in-process `LocalScheduler` and no `ci-scheduler`
+container is needed at all — the single-operator, single-container deployment this
+service shipped as before the split.
+
+Either way there is **one ledger and one metrics DB**, even when a job ends up scheduled on
+another host. `personal/ci-controller.yml`'s
 `hosts:` map names each host's own `docker-socket-proxy` endpoint, allowed job classes, and
 CPU weight; every host-agnostic knob (RAM budget, lane ceiling, disk budget, RAM floor, load
 ceiling, work dirs, mounts, lane env) is inherited from the top-level config unless a host
-overrides it. Each tick the controller health-checks every host; a host that stops responding
-is skipped for admission and its in-flight lanes are reaped and recorded as `infra_failure`
-rather than disappearing silently. Among the enabled, healthy hosts whose `allowed_classes`
-admit a job's class, the controller picks the one with the most free reservation headroom,
-ties broken by host name — deterministic, so a replay of recorded jobs is reproducible.
+overrides it. Each tick `ci-controller` health-checks every host — it owns the Docker reach, so host
+health is its bookkeeping, not the scheduler's — and a host that stops responding is
+skipped for admission and its in-flight lanes are reaped and recorded as `infra_failure`
+rather than disappearing silently. It passes the healthy set to the scheduler, which picks,
+among the enabled, healthy hosts whose `allowed_classes` admit a job's class, the one with
+the most free reservation headroom, ties broken by host name — deterministic, so a replay
+of recorded jobs is reproducible.
 
 Today's second host, `powervaro-ci`, is the operator's desktop running a dedicated,
 ansible-managed WSL distro reachable over the tailnet — **opportunistic capacity, never a
@@ -61,7 +80,8 @@ choice for the second host.
 ## Ops
 
 - Health: `docker exec ci-controller python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"`
-  (the slim image ships Python, not curl).
+  (the slim image ships Python, not curl). Same one-liner against `ci-scheduler` on port
+  8001 checks the scheduler; both are on `dashboard_health_targets`.
 - Live state: `curl http://ci-controller:8000/status` from another homelab container
   (shows the ledger, running lanes, and **why** queued jobs are deferred). Both lists
   carry the job's `class`, `host`, `workflow` and `job_name`, so a reader can answer

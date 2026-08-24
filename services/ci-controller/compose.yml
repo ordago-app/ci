@@ -38,8 +38,10 @@ services:
     init: true
     depends_on:
       - docker-socket-proxy
+      - ci-scheduler
     environment:
       CI_CONTROLLER_CONFIG: /etc/ci-controller/ci-controller.yml
+      CI_SCHEDULER_URL: http://ci-scheduler:8001
       # 5s (was 15s): light jobs run ~20-40s, so a 15s reconcile left finished lanes
       # unreaped for up to 15s — stale reservations consumed the lane budget and real
       # container occupancy sat at ~3-4 despite a higher ceiling. 5s reaps + refills
@@ -65,6 +67,23 @@ services:
       - /opt/personal/github-actions/ci-controller:/opt/personal/github-actions/ci-controller:rw
     expose:
       - "8000"
+    networks:
+      - homelab
+
+  ci-scheduler:
+    image: homelab/ci-controller:latest
+    build: .
+    container_name: ci-scheduler
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "src.scheduler_main"]
+    environment:
+      CI_CONTROLLER_CONFIG: /etc/ci-controller/ci-controller.yml
+    volumes:
+      - /opt/personal/ci-controller.yml:/etc/ci-controller/ci-controller.yml:ro
+      - /opt/personal/repos.yml:/etc/ci-controller/repos.yml:ro
+    expose:
+      - "8001"
     networks:
       - homelab
 
