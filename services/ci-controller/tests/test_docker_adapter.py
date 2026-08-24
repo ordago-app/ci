@@ -547,7 +547,7 @@ classes:
     ram_mb: 700
     work_disk: ssd
 repos:
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
 hosts:

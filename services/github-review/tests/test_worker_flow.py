@@ -74,8 +74,6 @@ def config(tmp_path: Path) -> ReviewConfig:
         """
         repos:
           homelab:
-            repo: alvaro/homelab
-            project: homelab
             provider: codex
             enabled: true
             review_drafts: false
@@ -111,7 +109,7 @@ def test_worker_polls_runs_review_and_marks_posted(tmp_path: Path) -> None:
     )
     worker.tick()
     assert store.list_by_status(JobStatus.POSTED)[0].head_sha == "head"
-    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT", "head")]
+    assert gh.posted == [("alvaro-francisco-gil/homelab", 1, "No findings.", "COMMENT", "head")]
 
 
 class FlakyProvider:
@@ -154,7 +152,7 @@ def test_worker_retries_failed_job_on_next_tick(tmp_path: Path) -> None:
     posted = store.list_by_status(JobStatus.POSTED)
     assert posted and posted[0].head_sha == "head"
     assert provider.calls == 2
-    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "COMMENT", "head")]
+    assert gh.posted == [("alvaro-francisco-gil/homelab", 1, "No findings.", "COMMENT", "head")]
 
 
 class FailingProvider:
@@ -195,7 +193,9 @@ def test_a_failed_job_is_logged_not_just_recorded_in_the_db(
     assert store.list_by_status(JobStatus.FAILED), "precondition: the job must have failed"
     err = capsys.readouterr().err
     assert "codex boom" in err, "the cause must reach the container log, not just last_error"
-    assert "alvaro/homelab" in err, "the log must name the repo so a broken repo is greppable"
+    assert "alvaro-francisco-gil/homelab" in err, (
+        "the log must name the repo so a broken repo is greppable"
+    )
     assert "#1" in err, "the log must name the PR"
 
 
@@ -243,7 +243,7 @@ def test_run_pr_review_raises_when_review_fails(tmp_path: Path) -> None:
         max_attempts=3,
     )
     with pytest.raises(RuntimeError):
-        worker.run_pr_review("alvaro/homelab", 1)
+        worker.run_pr_review("alvaro-francisco-gil/homelab", 1)
 
 
 class ApprovingProvider:
@@ -271,11 +271,11 @@ def test_run_pr_review_returns_verdict_summary(tmp_path: Path) -> None:
         reviewer_bot="reviewer[bot]",
         max_attempts=3,
     )
-    summary = worker.run_pr_review("alvaro/homelab", 1)
+    summary = worker.run_pr_review("alvaro-francisco-gil/homelab", 1)
     assert summary.verdict == "APPROVE"
     assert summary.head_sha == "head"
     assert summary.escalated is False
-    assert gh.posted == [("alvaro/homelab", 1, "No findings.", "APPROVE", "head")]
+    assert gh.posted == [("alvaro-francisco-gil/homelab", 1, "No findings.", "APPROVE", "head")]
     # Verdict persisted so a repeat request is idempotent.
     posted = store.list_by_status(JobStatus.POSTED)
     assert posted and posted[0].verdict == "APPROVE"
@@ -312,13 +312,13 @@ def test_tick_skips_jobs_over_round_cap(tmp_path: Path) -> None:
     store.init()
 
     # Seed one POSTED round at head_sha="head-v1" — rounds_for == 1.
-    j1 = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "head-v1", "base")
+    j1 = store.enqueue("alvaro-francisco-gil/homelab", "homelab", "codex", 1, "head-v1", "base")
     store.mark_running(j1.id)
     store.mark_posted(j1.id, verdict="REQUEST_CHANGES")
-    assert store.rounds_for("alvaro/homelab", 1) == 1
+    assert store.rounds_for("alvaro-francisco-gil/homelab", 1) == 1
 
     # Enqueue a new QUEUED job for the same PR at a different head.
-    j2 = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "head-v2", "base")
+    j2 = store.enqueue("alvaro-francisco-gil/homelab", "homelab", "codex", 1, "head-v2", "base")
     assert store.get(j2.id).status == JobStatus.QUEUED
 
     # EmptyGitHub so poll_once doesn't enqueue extra jobs.
@@ -354,10 +354,10 @@ def test_run_pr_review_idempotent_for_legacy_posted_row_without_verdict(tmp_path
 
     # FakeGitHub returns head_sha="head"; seed a POSTED row for that head with
     # verdict=None (simulating a legacy migrated row).
-    j1 = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "head", "base")
+    j1 = store.enqueue("alvaro-francisco-gil/homelab", "homelab", "codex", 1, "head", "base")
     store.mark_running(j1.id)
     store.mark_posted(j1.id)  # no verdict arg → verdict stays NULL
-    assert store.get_posted("alvaro/homelab", 1, "head").verdict is None
+    assert store.get_posted("alvaro-francisco-gil/homelab", 1, "head").verdict is None
 
     gh = FakeGitHub()
     worker = ReviewWorker(
@@ -370,7 +370,7 @@ def test_run_pr_review_idempotent_for_legacy_posted_row_without_verdict(tmp_path
         reviewer_bot="reviewer[bot]",
     )
 
-    summary = worker.run_pr_review("alvaro/homelab", 1)
+    summary = worker.run_pr_review("alvaro-francisco-gil/homelab", 1)
 
     assert summary.verdict == "REQUEST_CHANGES", "conservative fallback for legacy NULL verdict"
     assert summary.escalated is False

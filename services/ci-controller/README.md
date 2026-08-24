@@ -42,6 +42,10 @@ choice for the second host.
 - `ram_budget_mb` — the only hard gate. Raise after the RAM upgrade.
 - `max_concurrent_lanes` — blunt secondary ceiling against CPU thrash.
 - `classes` — per-class `ram_mb`, `needs_kvm`, `needs_android_sdk`, `work_disk`, `group_add`.
+- `repos[].project` — the project slug; its GitHub `owner/name` is resolved from
+  `personal/repos.yml`, mounted beside this file. The App that mints registration
+  tokens has a different installation id under each owning account, so the owner
+  is read from the one place it is written.
 - `repos[].label_class` — the allowlist + label→class map (also the ACL).
 - `hosts` — per-host `docker_endpoint`, `allowed_classes`, `cpu_shares`, plus optional
   overrides of any of the above (see "Architecture" above and ADR 0016).

@@ -12,9 +12,12 @@ class ConfigError(ValueError):
 
 
 class RepoPolicy(BaseModel):
+    # name, project and repo are all filled in by ReviewConfig.load from the
+    # config's own map key: the key IS the project slug, and personal/repos.yml
+    # is the single place that slug's GitHub `owner/name` is written.
     name: str = Field(default="")
-    repo: str
-    project: str
+    repo: str = Field(default="")
+    project: str = Field(default="")
     provider: str
     enabled: bool = True
     review_drafts: bool = False
@@ -28,13 +31,6 @@ class RepoPolicy(BaseModel):
     def review_mode_is_known(cls, value: str) -> str:
         if value not in {"all", "labeled"}:
             raise ValueError("review_mode must be 'all' or 'labeled'")
-        return value
-
-    @field_validator("repo")
-    @classmethod
-    def repo_must_be_owner_repo(cls, value: str) -> str:
-        if value.count("/") != 1 or not all(value.split("/")):
-            raise ValueError("repo must be owner/name")
         return value
 
 
@@ -56,6 +52,27 @@ class ToolProfile(BaseModel):
         return value
 
 
+def _load_project_repos(path: Path) -> dict[str, str]:
+    """personal/repos.yml: `project_repos: {<project>: "<owner>/<name>"}`.
+
+    The one place a project's GitHub repo is written. A malformed or missing
+    entry raises rather than being skipped: a project quietly absent from here
+    becomes a repo nobody reviews, which looks exactly like a quiet day."""
+    try:
+        doc = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f"invalid repo registry {path}: {exc}") from exc
+    raw = doc.get("project_repos") if isinstance(doc, dict) else None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: missing a `project_repos:` mapping")
+    out: dict[str, str] = {}
+    for project, repo in raw.items():
+        if not isinstance(repo, str) or repo.count("/") != 1 or not all(repo.split("/")):
+            raise ConfigError(f"{path}: project {project!r} must map to 'owner/name', got {repo!r}")
+        out[str(project)] = repo
+    return out
+
+
 class _RawConfig(BaseModel):
     repos: dict[str, RepoPolicy]
     tool_profiles: dict[str, ToolProfile]
@@ -67,7 +84,12 @@ class ReviewConfig:
     tool_profiles: dict[str, ToolProfile]
 
     @classmethod
-    def load(cls, path: Path) -> ReviewConfig:
+    def load(cls, path: Path, repos_path: Path | None = None) -> ReviewConfig:
+        """`repos_path` defaults to repos.yml beside the review config, which is
+        how both the container (`/etc/github-review/`) and the operator checkout
+        (`personal/`) lay them out."""
+        registry_path = repos_path or path.parent / "repos.yml"
+        project_repos = _load_project_repos(registry_path)
         try:
             raw_doc = yaml.safe_load(path.read_text()) or {}
             raw = _RawConfig.model_validate(raw_doc)
@@ -83,7 +105,13 @@ class ReviewConfig:
             profile = raw.tool_profiles[repo.tool_profile]
             if profile.allow_git_push:
                 raise ConfigError(f"tool_profile {repo.tool_profile} sets allow_git_push=true")
-            repos[name] = repo.model_copy(update={"name": name})
+            if name not in project_repos:
+                raise ConfigError(
+                    f"no GitHub repo declared for project {name!r} in {registry_path}"
+                )
+            repos[name] = repo.model_copy(
+                update={"name": name, "project": name, "repo": project_repos[name]}
+            )
         return cls(repos=repos, tool_profiles=dict(raw.tool_profiles))
 
     def enabled_repos(self) -> list[RepoPolicy]:

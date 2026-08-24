@@ -17,6 +17,8 @@ def test_credential_helper_vendored_and_executable() -> None:
     assert os.access(helper, os.X_OK), "git-credential-helper must be executable"
     body = helper.read_text()
     assert "internal/github-token?role=" in body, "helper must request a role-scoped token"
+    # Behaviour lives in tests/test_agent_token_wrappers.py, which executes this
+    # script; this is the build-context half — the file has to be here at all.
     assert "x-access-token" in body, "helper must return the App token as x-access-token"
 
 

@@ -13,6 +13,28 @@ class ConfigError(ValueError):
     """Raised when the controller config file is missing or invalid."""
 
 
+def _load_project_repos(path: Path) -> dict[str, str]:
+    """personal/repos.yml: `project_repos: {<project>: "<owner>/<name>"}`.
+
+    The one place a project's GitHub repo is written. A malformed or missing
+    entry raises rather than being skipped: a project quietly absent from here
+    is a repo the controller stops provisioning lanes for, which presents as
+    jobs that queue forever with nothing in the logs."""
+    try:
+        doc = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f"invalid repo registry {path}: {exc}") from exc
+    raw = doc.get("project_repos") if isinstance(doc, dict) else None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: missing a `project_repos:` mapping")
+    out: dict[str, str] = {}
+    for project, repo in raw.items():
+        if not isinstance(repo, str) or repo.count("/") != 1 or not all(repo.split("/")):
+            raise ConfigError(f"{path}: project {project!r} must map to 'owner/name', got {repo!r}")
+        out[str(project)] = repo
+    return out
+
+
 class JobClass(BaseModel):
     ram_mb: int
     needs_kvm: bool = False
@@ -30,7 +52,14 @@ class JobClass(BaseModel):
 
 
 class RepoConfig(BaseModel):
-    repo: str
+    """`project` is the slug; `repo` is its GitHub `owner/name`, filled in by
+    ControllerConfig.load from personal/repos.yml. The full name is not written
+    here because it is written there, and a repo that moves between accounts
+    must not need editing in two files to keep its App token minted from the
+    right installation."""
+
+    project: str
+    repo: str = ""
     label_class: dict[str, str] = {}
 
 
@@ -183,7 +212,7 @@ class ControllerConfig(BaseModel):
             for label, class_name in repo.label_class.items():
                 if class_name not in self.classes:
                     raise ValueError(
-                        f"repo {repo.repo}: label '{label}' maps to unknown class '{class_name}'"
+                        f"repo {repo.project}: label '{label}' maps to unknown class '{class_name}'"
                     )
         if self.admission_mode not in {"reservation", "reservation_plus_guard"}:
             raise ValueError(
@@ -221,12 +250,24 @@ class ControllerConfig(BaseModel):
         return {name: host._resolve(self) for name, host in self.hosts.items()}
 
     @classmethod
-    def load(cls, path: Path) -> ControllerConfig:
+    def load(cls, path: Path, repos_path: Path | None = None) -> ControllerConfig:
+        """`repos_path` defaults to repos.yml beside the controller config, which
+        is how both the container (`/etc/ci-controller/`) and the operator
+        checkout (`personal/`) lay them out."""
+        registry_path = repos_path or path.parent / "repos.yml"
         try:
             raw = yaml.safe_load(path.read_text())
-            return cls.model_validate(raw)
+            config = cls.model_validate(raw)
         except (OSError, ValidationError, yaml.YAMLError) as exc:
             raise ConfigError(f"invalid ci-controller config {path}: {exc}") from exc
+        project_repos = _load_project_repos(registry_path)
+        for repo in config.repos:
+            if repo.project not in project_repos:
+                raise ConfigError(
+                    f"no GitHub repo declared for project {repo.project!r} in {registry_path}"
+                )
+            repo.repo = project_repos[repo.project]
+        return config
 
     def config_version(self) -> str:
         """8-char hash of the full config; any meaningful change yields a new id."""

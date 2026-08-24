@@ -1,8 +1,10 @@
 # Rendered by ansible from personal/github-runners.yml — do not edit on the host.
-# GitHub Actions self-hosted runners. Each runner serves
-# `runner.repository | default(github_actions_runners.repository)`; only the
-# heavy ordago runner has /dev/kvm, so at most one Android emulator runs at a
-# time. Runners with `ephemeral: true` register one-job runners. See README.md
+# GitHub Actions self-hosted runners. Each runner serves the project named by
+# `runner.project | default(github_actions_runners.project)`, resolved to a
+# GitHub `owner/name` through personal/repos.yml (`project_repos`) — the App
+# that registers runners has a different installation id per owning account, so
+# the owner has to come from the one place it is written. Only the heavy ordago
+# runner has /dev/kvm, so at most one Android emulator runs at a time. Runners with `ephemeral: true` register one-job runners. See README.md
 # for the capacity reasoning.
 services:
 {% for runner in github_actions_runners.runners %}
@@ -18,7 +20,7 @@ services:
     # reaps them and transparently forwards signals to run.sh.
     init: true
     environment:
-      RUNNER_REPOSITORY: "{{ runner.repository | default(github_actions_runners.repository) }}"
+      RUNNER_REPOSITORY: "{{ project_repos[runner.project | default(github_actions_runners.project)] }}"
       RUNNER_NAME: "{{ inventory_hostname }}-{{ runner.name }}"
       RUNNER_LABELS: "{{ (['self-hosted', 'linux', 'x64'] + runner.labels) | join(',') }}"
       RUNNER_WORKDIR: "/runner-work"

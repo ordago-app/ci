@@ -5,9 +5,19 @@ import pytest
 
 @pytest.fixture()
 def write_config(tmp_path: Path):
-    """Write controller YAML to a temp file and return its path."""
+    """Write controller YAML to a temp file and return its path.
+
+    The repo registry (personal/repos.yml) is written beside it, which is where
+    ControllerConfig.load looks: `repos:` entries name a project, and the
+    project's GitHub `owner/name` lives in exactly one file for the whole host."""
 
     def _write(text: str) -> Path:
+        (tmp_path / "repos.yml").write_text(
+            "project_repos:\n"
+            "  homelab: alvaro-francisco-gil/homelab\n"
+            "  ordago-apps: alvaro-francisco-gil/ordago-apps\n"
+            "  cultuvilla: alvaro-francisco-gil/cultuvilla\n"
+        )
         path = tmp_path / "ci-controller.yml"
         path.write_text(text)
         return path
@@ -39,11 +49,11 @@ classes:
     ram_mb: 700
     work_disk: ssd
 repos:
-  - repo: alvaro-francisco-gil/ordago-apps
+  - project: ordago-apps
     label_class:
       android-e2e: emulator
       ordago-ci: light
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
 """

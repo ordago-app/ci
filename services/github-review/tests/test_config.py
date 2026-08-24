@@ -19,8 +19,6 @@ def test_loads_codex_repo_and_profile(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            repo: alvaro-francisco-gil/homelab
-            project: homelab
             provider: codex
             enabled: true
             review_drafts: false
@@ -53,8 +51,6 @@ def test_rejects_unknown_provider(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            repo: alvaro-francisco-gil/homelab
-            project: homelab
             provider: other
             enabled: true
             review_drafts: false
@@ -82,8 +78,6 @@ def test_rejects_missing_profile(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            repo: alvaro-francisco-gil/homelab
-            project: homelab
             provider: codex
             enabled: true
             review_drafts: false
@@ -99,8 +93,6 @@ def test_rejects_missing_profile(tmp_path: Path) -> None:
 REVIEW_MODE_UNSET_YAML = """
     repos:
       homelab:
-        repo: alvaro-francisco-gil/homelab
-        project: homelab
         provider: codex
         enabled: true
         review_drafts: false
@@ -121,8 +113,6 @@ REVIEW_MODE_UNSET_YAML = """
 REVIEW_MODE_BAD_YAML = """
     repos:
       homelab:
-        repo: alvaro-francisco-gil/homelab
-        project: homelab
         provider: codex
         enabled: true
         review_drafts: false
@@ -160,8 +150,6 @@ def test_rejects_git_push_for_reviewer(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            repo: alvaro-francisco-gil/homelab
-            project: homelab
             provider: codex
             enabled: true
             review_drafts: false
@@ -181,3 +169,70 @@ def test_rejects_git_push_for_reviewer(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="allow_git_push"):
         ReviewConfig.load(cfg_path)
+
+
+def test_repo_is_resolved_from_the_shared_registry(tmp_path: Path) -> None:
+    """The review config names a project; the GitHub owner/name comes from
+    personal/repos.yml, so an owner move is a one-line edit in one file."""
+    cfg_path = write(
+        tmp_path / "agent-review.yml",
+        """
+        repos:
+          homelab:
+            provider: codex
+            tool_profile: default-reviewer
+        tool_profiles:
+          default-reviewer:
+            github_role: reviewer
+""",
+    )
+    cfg = ReviewConfig.load(cfg_path)
+    repo = cfg.repos["homelab"]
+    assert repo.repo == "alvaro-francisco-gil/homelab"
+    assert repo.project == "homelab"
+
+
+def test_a_project_missing_from_the_registry_is_rejected(tmp_path: Path) -> None:
+    """Silently skipping it would be a repo nobody reviews, which looks exactly
+    like a quiet day."""
+    (tmp_path / "repos.yml").write_text("project_repos:\n  ordago-apps: acme/ordago-apps\n")
+    cfg_path = write(
+        tmp_path / "agent-review.yml",
+        """
+        repos:
+          homelab:
+            provider: codex
+            tool_profile: default-reviewer
+        tool_profiles:
+          default-reviewer:
+            github_role: reviewer
+""",
+    )
+    with pytest.raises(ConfigError, match="homelab"):
+        ReviewConfig.load(cfg_path)
+
+
+def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "repos.yml").write_text("project_repos:\n  homelab: homelab\n")
+    cfg_path = write(
+        tmp_path / "agent-review.yml",
+        """
+        repos:
+          homelab:
+            provider: codex
+            tool_profile: default-reviewer
+        tool_profiles:
+          default-reviewer:
+            github_role: reviewer
+""",
+    )
+    with pytest.raises(ConfigError, match="owner/name"):
+        ReviewConfig.load(cfg_path)
+
+
+def test_the_committed_config_and_registry_agree() -> None:
+    """personal/agent-review.yml and personal/repos.yml ship together; a project
+    in one and not the other is a container that will not start."""
+    personal = Path(__file__).resolve().parents[3] / "personal"
+    cfg = ReviewConfig.load(personal / "agent-review.yml")
+    assert cfg.repos["ordago-apps"].repo == "alvaro-francisco-gil/ordago-apps"

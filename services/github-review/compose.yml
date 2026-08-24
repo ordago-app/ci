@@ -26,6 +26,8 @@ services:
       - /opt/personal/codex-code-state:/opt/personal/codex-code-state:rw
       - /opt/personal/state/github-review:/var/lib/github-review:rw
       - /opt/personal/agent-review.yml:/etc/github-review/agent-review.yml:ro
+      # Resolved from beside agent-review.yml; see ReviewConfig.load.
+      - /opt/personal/repos.yml:/etc/github-review/repos.yml:ro
     expose:
       - "8000"
     networks:

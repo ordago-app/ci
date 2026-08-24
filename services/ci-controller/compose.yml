@@ -54,6 +54,8 @@ services:
         required: false
     volumes:
       - /opt/personal/ci-controller.yml:/etc/ci-controller/ci-controller.yml:ro
+      # Resolved from beside ci-controller.yml; see ControllerConfig.load.
+      - /opt/personal/repos.yml:/etc/ci-controller/repos.yml:ro
       - /opt/personal/state/ci-controller:/var/lib/ci-controller:rw
       # Lane work-dir bases (work_dirs.{ssd,hdd} in ci-controller.yml), mounted at
       # their host paths so the controller can delete each lane's <lane_id>-work dir

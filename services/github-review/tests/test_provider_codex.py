@@ -77,6 +77,9 @@ def test_starts_codex_review_container(tmp_path: Path) -> None:
     assert (tmp_path / "projects" / "homelab" / "review-sessions" / "3" / "config.toml").exists()
     env = raw.containers.run.call_args.kwargs["environment"]
     assert env["AGENT_ROLE"] == codex_mod.CODEX_GH_ROLE
+    # A review container is scoped to one repo (unlike github-review itself), so
+    # its gh/git wrappers are told which one rather than guessing the owner.
+    assert env["GITHUB_REPO"] == "alvaro/homelab"
 
 
 def test_review_container_cannot_post_to_github() -> None:

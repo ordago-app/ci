@@ -93,6 +93,10 @@ class CodexReviewProvider:
                 "SESSION_ID": f"review-{job.id}",
                 "ROUTER_INTERNAL_URL": self._router_url,
                 "AGENT_ROLE": CODEX_GH_ROLE,
+                # The reviewed repo, so the container's gh/git wrappers can ask
+                # the router for a token from the right App installation. A
+                # review container is scoped to one repo, unlike this service.
+                "GITHUB_REPO": job.repo,
                 "CODEX_HOME": "/home/agent/.codex",
             },
             volumes={

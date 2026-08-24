@@ -26,11 +26,16 @@ COPY src /app/src
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Authenticate git fetches against private repos as the reviewer GitHub App.
-# The helper asks claude-router for a role-scoped token (AGENT_ROLE=reviewer);
-# the token never lands in argv or logs. Mirrors codex-code's agent overlay.
+# The helper asks claude-router for a token scoped to BOTH the role
+# (AGENT_ROLE=reviewer) and the repo; the token never lands in argv or logs.
+#
+# useHttpPath true is load-bearing, not a default left alone: this container
+# fetches every reviewed repo, and the App has a different installation id under
+# each owning account. The path is how git tells the helper which repo the
+# request is for, so it can ask for the right installation instead of guessing.
 COPY bin/git-credential-helper /usr/local/bin/git-credential-helper
 RUN chmod +x /usr/local/bin/git-credential-helper \
  && git config --system credential.helper /usr/local/bin/git-credential-helper \
- && git config --system credential.useHttpPath false
+ && git config --system credential.useHttpPath true
 
 CMD ["python", "-m", "src.main"]

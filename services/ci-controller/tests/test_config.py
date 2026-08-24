@@ -258,3 +258,39 @@ def test_operator_config_never_underprices_a_mapped_label() -> None:
         for label, class_name in repo.label_class.items():
             assert class_name in cfg.classes, f"{repo.repo}: '{label}' -> unknown '{class_name}'"
             assert cfg.class_for(repo.repo, ["self-hosted", label]) == class_name
+
+
+def test_repos_are_resolved_through_the_shared_registry(write_config) -> None:
+    """`repos:` names projects; the GitHub owner/name comes from
+    personal/repos.yml, so a repo that changes owner is one edit in one file."""
+    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+    assert cfg.repo_names() == {
+        "alvaro-francisco-gil/ordago-apps",
+        "alvaro-francisco-gil/homelab",
+    }
+    assert cfg.class_for("alvaro-francisco-gil/homelab", ["self-hosted", "homelab"]) == "light"
+
+
+def test_a_project_missing_from_the_registry_is_rejected(tmp_path) -> None:
+    """Skipping it would stop provisioning lanes for that repo, which presents
+    as jobs queueing forever with nothing in the logs."""
+    (tmp_path / "repos.yml").write_text("project_repos:\n  homelab: personal/homelab\n")
+    path = tmp_path / "ci-controller.yml"
+    path.write_text(VALID_CONFIG)
+    with pytest.raises(ConfigError, match="ordago-apps"):
+        ControllerConfig.load(path)
+
+
+def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path) -> None:
+    (tmp_path / "repos.yml").write_text("project_repos:\n  homelab: homelab\n  ordago-apps: a/b\n")
+    path = tmp_path / "ci-controller.yml"
+    path.write_text(VALID_CONFIG)
+    with pytest.raises(ConfigError, match="owner/name"):
+        ControllerConfig.load(path)
+
+
+def test_the_operator_config_and_registry_agree() -> None:
+    """personal/ci-controller.yml and personal/repos.yml are copied to the host
+    together; a project in one and not the other crash-loops the controller."""
+    cfg = ControllerConfig.load(OPERATOR_CONFIG)
+    assert "alvaro-francisco-gil/ordago-apps" in cfg.repo_names()

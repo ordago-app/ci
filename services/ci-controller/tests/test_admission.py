@@ -32,7 +32,7 @@ classes:
     ram_mb: 900
     work_disk: ssd
 repos:
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
 """
@@ -58,7 +58,7 @@ classes:
     work_disk: hdd
     work_gb: 50
 repos:
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
       node: node
@@ -86,7 +86,7 @@ classes:
     needs_kvm: true
     work_disk: hdd
 repos:
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
       android-e2e: emulator
@@ -119,7 +119,7 @@ classes:
     needs_kvm: true
     work_disk: hdd
 repos:
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
       android-e2e: emulator
@@ -148,7 +148,7 @@ classes:
     ram_mb: 700
     work_disk: ssd
 repos:
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
 hosts:
@@ -174,7 +174,7 @@ classes:
     ram_mb: 700
     work_disk: ssd
 repos:
-  - repo: alvaro-francisco-gil/homelab
+  - project: homelab
     label_class:
       homelab: light
 hosts:

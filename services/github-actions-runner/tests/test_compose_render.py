@@ -9,11 +9,13 @@ rendered text matches what `ansible.builtin.template` writes on the host.
 from pathlib import Path
 
 import jinja2
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TEMPLATE = REPO_ROOT / "services/github-actions-runner/compose.yml.j2"
 POOL_CONFIG = REPO_ROOT / "personal/github-runners.yml"
+REPO_REGISTRY = REPO_ROOT / "personal/repos.yml"
 HOST = "powerserver"
 
 
@@ -39,8 +41,14 @@ def render(respect_enabled: bool = False) -> dict:
         keep_trailing_newline=True,
         undefined=jinja2.StrictUndefined,
     )
+    # The template resolves each runner's project to a GitHub owner/name through
+    # the same registry ansible loads, so a project the operator forgot to declare
+    # renders as a StrictUndefined error here rather than as a runner that tries to
+    # register against nothing.
+    project_repos = yaml.safe_load(REPO_REGISTRY.read_text())["project_repos"]
     text = env.get_template(TEMPLATE.name).render(
         github_actions_runners=runners_cfg,
+        project_repos=project_repos,
         inventory_hostname=HOST,
     )
     return yaml.safe_load(text)
@@ -229,8 +237,9 @@ def test_secret_env_file_and_external_network():
 # ── Tests for per-runner repository override + ephemeral flag (Stage B) ──
 
 
-def test_ordago_runner_uses_top_level_repository():
-    """Ordago runners have no per-runner repository; they should use the top-level default."""
+def test_ordago_runner_uses_top_level_project():
+    """Ordago runners have no per-runner project; they use the top-level default,
+    resolved to an owner/name through personal/repos.yml."""
     services = render()["services"]
     for name in (
         "ordago-android-e2e",
@@ -243,8 +252,8 @@ def test_ordago_runner_uses_top_level_repository():
         assert repo == "alvaro-francisco-gil/ordago-apps"
 
 
-def test_homelab_runner_overrides_repository():
-    """Homelab runners declare repository: alvaro-francisco-gil/homelab; that must win."""
+def test_homelab_runner_overrides_project():
+    """Homelab runners declare project: homelab; that must win over the default."""
     services = render()["services"]
     for name in ("homelab-ci-1", "homelab-ci-2"):
         repo = services[name]["environment"]["RUNNER_REPOSITORY"]
@@ -278,3 +287,36 @@ def test_homelab_runner_labels_include_self_hosted_and_homelab():
         labels = services[name]["environment"]["RUNNER_LABELS"].split(",")
         assert "self-hosted" in labels
         assert "homelab" in labels
+
+
+def test_every_declared_project_resolves_to_an_owner_and_a_name():
+    """The runner App has a different installation id under each owning account,
+    so a runner whose repo lost its owner would register against the wrong one —
+    or, once resolution is per repo, against nothing at all."""
+    services = render()["services"]
+    assert services
+    for name, svc in services.items():
+        repo = svc["environment"]["RUNNER_REPOSITORY"]
+        owner, _, project = repo.partition("/")
+        assert owner and project, f"{name}: RUNNER_REPOSITORY {repo!r} is not owner/name"
+
+
+def test_a_project_absent_from_the_registry_fails_the_render():
+    """StrictUndefined, not an empty string: a runner registering against ''
+    fails later with a message about a bad token, naming nothing useful."""
+    config = yaml.safe_load(POOL_CONFIG.read_text())
+    runners_cfg = dict(config["github_actions_runners"])
+    runners_cfg["runners"] = [{**r, "enabled": True} for r in runners_cfg["runners"]]
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(TEMPLATE.parent)),
+        trim_blocks=True,
+        lstrip_blocks=False,
+        keep_trailing_newline=True,
+        undefined=jinja2.StrictUndefined,
+    )
+    with pytest.raises(jinja2.exceptions.UndefinedError):
+        env.get_template(TEMPLATE.name).render(
+            github_actions_runners=runners_cfg,
+            project_repos={},
+            inventory_hostname=HOST,
+        )

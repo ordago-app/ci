@@ -27,7 +27,6 @@ def config(
         repos:
           homelab:
             repo: alvaro/homelab
-            project: homelab
             provider: codex
             enabled: true
             review_drafts: {str(review_drafts).lower()}
