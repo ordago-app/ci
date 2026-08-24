@@ -16,7 +16,7 @@ def project_repo_registry(tmp_path: Path) -> Path:
     path.write_text(
         "project_repos:\n"
         "  homelab: alvaro-francisco-gil/homelab\n"
-        "  ordago-apps: alvaro-francisco-gil/ordago-apps\n"
+        "  ordago-apps: ordago-app/ordago-apps\n"
     )
     return path
 

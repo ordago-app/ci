@@ -844,7 +844,7 @@ def test_a_failing_runner_poll_does_not_break_reconcile(write_config) -> None:
 
 NOW = 10_000.0
 HOMELAB = "alvaro-francisco-gil/homelab"
-ORDAGO = "alvaro-francisco-gil/ordago-apps"
+ORDAGO = "ordago-app/ordago-apps"
 
 
 def _lane(ctrl, lanes, lane_id, job_id, repo, class_name, ram_mb, **over):

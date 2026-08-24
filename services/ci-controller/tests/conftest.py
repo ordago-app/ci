@@ -15,7 +15,7 @@ def write_config(tmp_path: Path):
         (tmp_path / "repos.yml").write_text(
             "project_repos:\n"
             "  homelab: alvaro-francisco-gil/homelab\n"
-            "  ordago-apps: alvaro-francisco-gil/ordago-apps\n"
+            "  ordago-apps: ordago-app/ordago-apps\n"
             "  cultuvilla: alvaro-francisco-gil/cultuvilla\n"
         )
         path = tmp_path / "ci-controller.yml"

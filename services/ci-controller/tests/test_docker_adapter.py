@@ -189,9 +189,7 @@ def test_spawn_falls_back_to_the_top_level_runner_image(write_config) -> None:
 
 def test_spawn_emulator_lane_gets_kvm(write_config) -> None:
     adapter, client, _ = _adapter(write_config)
-    job = QueuedJob(
-        job_id=7, repo="alvaro-francisco-gil/ordago-apps", labels=["self-hosted", "android-e2e"]
-    )
+    job = QueuedJob(job_id=7, repo="ordago-app/ordago-apps", labels=["self-hosted", "android-e2e"])
     decision = AdmitDecision(job=job, class_name="emulator", ram_mb=2500, needs_kvm=True)
 
     adapter.spawn(decision, registration_token="TOK")

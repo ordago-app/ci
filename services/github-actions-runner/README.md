@@ -2,7 +2,8 @@
 
 Compose-managed GitHub Actions runner pools for selected private repositories.
 
-The pool serves `alvaro-francisco-gil/ordago-apps` and is split by capacity into
+The pool serves the `ordago-apps` project (`personal/repos.yml` resolves it to an
+owner/name, so this doc does not restate one) and is split by capacity into
 **1 heavy + 4 light** runners (the box is an i7-4770, 4 cores / 15 GiB — one
 Android emulator alone wants 4 cores + 4 GB, so only one emulator may run at a
 time):

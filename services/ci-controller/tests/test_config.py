@@ -13,20 +13,15 @@ def test_loads_valid_config(write_config) -> None:
     assert cfg.classes["emulator"].needs_kvm is True
     assert cfg.classes["light"].work_disk == "ssd"
     assert cfg.repo_names() == {
-        "alvaro-francisco-gil/ordago-apps",
+        "ordago-app/ordago-apps",
         "alvaro-francisco-gil/homelab",
     }
 
 
 def test_class_for_maps_label(write_config) -> None:
     cfg = ControllerConfig.load(write_config(VALID_CONFIG))
-    assert (
-        cfg.class_for("alvaro-francisco-gil/ordago-apps", ["self-hosted", "android-e2e"])
-        == "emulator"
-    )
-    assert (
-        cfg.class_for("alvaro-francisco-gil/ordago-apps", ["self-hosted", "ordago-ci"]) == "light"
-    )
+    assert cfg.class_for("ordago-app/ordago-apps", ["self-hosted", "android-e2e"]) == "emulator"
+    assert cfg.class_for("ordago-app/ordago-apps", ["self-hosted", "ordago-ci"]) == "light"
 
 
 def test_class_for_falls_back_to_default(write_config) -> None:
@@ -236,6 +231,7 @@ def test_work_dir_mode_defaults_to_bind(write_config) -> None:
 
 
 OPERATOR_CONFIG = Path(__file__).resolve().parents[3] / "personal" / "ci-controller.yml"
+REPO_REGISTRY = Path(__file__).resolve().parents[3] / "personal" / "repos.yml"
 
 
 def test_operator_config_loads() -> None:
@@ -265,7 +261,7 @@ def test_repos_are_resolved_through_the_shared_registry(write_config) -> None:
     personal/repos.yml, so a repo that changes owner is one edit in one file."""
     cfg = ControllerConfig.load(write_config(VALID_CONFIG))
     assert cfg.repo_names() == {
-        "alvaro-francisco-gil/ordago-apps",
+        "ordago-app/ordago-apps",
         "alvaro-francisco-gil/homelab",
     }
     assert cfg.class_for("alvaro-francisco-gil/homelab", ["self-hosted", "homelab"]) == "light"
@@ -292,5 +288,12 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path) -> None:
 def test_the_operator_config_and_registry_agree() -> None:
     """personal/ci-controller.yml and personal/repos.yml are copied to the host
     together; a project in one and not the other crash-loops the controller."""
+    import yaml
+
     cfg = ControllerConfig.load(OPERATOR_CONFIG)
-    assert "alvaro-francisco-gil/ordago-apps" in cfg.repo_names()
+    registry = yaml.safe_load(REPO_REGISTRY.read_text())["project_repos"]
+    # Every project the controller admits for must resolve through the registry.
+    # Asserting a literal owner here instead would restate what repos.yml says,
+    # and would go stale on the next transfer rather than catching a real gap.
+    assert set(cfg.repo_names()) <= set(registry.values())
+    assert registry["ordago-apps"] in cfg.repo_names()

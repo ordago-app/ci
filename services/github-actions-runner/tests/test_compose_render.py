@@ -17,6 +17,10 @@ TEMPLATE = REPO_ROOT / "services/github-actions-runner/compose.yml.j2"
 POOL_CONFIG = REPO_ROOT / "personal/github-runners.yml"
 REPO_REGISTRY = REPO_ROOT / "personal/repos.yml"
 HOST = "powerserver"
+# Read from the registry rather than restated: #171 made personal/repos.yml the
+# one place a repo's owner lives, and a literal here would be a second copy —
+# the exact duplication that made the org move a seven-file edit.
+ORDAGO_REPO = yaml.safe_load(REPO_REGISTRY.read_text())["project_repos"]["ordago-apps"]
 
 
 def render(respect_enabled: bool = False) -> dict:
@@ -90,7 +94,7 @@ def test_runner_names_and_labels():
     assert heavy["container_name"] == "github-runner-ordago-android-e2e"
     env = heavy["environment"]
     assert env["RUNNER_NAME"] == f"{HOST}-ordago-android-e2e"
-    assert env["RUNNER_REPOSITORY"] == "alvaro-francisco-gil/ordago-apps"
+    assert env["RUNNER_REPOSITORY"] == ORDAGO_REPO
     # self-hosted,linux,x64 are prepended; android-e2e routes the emulator job.
     assert env["RUNNER_LABELS"].split(",") == [
         "self-hosted",
@@ -249,7 +253,7 @@ def test_ordago_runner_uses_top_level_project():
         "ordago-android-e2e-5",
     ):
         repo = services[name]["environment"]["RUNNER_REPOSITORY"]
-        assert repo == "alvaro-francisco-gil/ordago-apps"
+        assert repo == ORDAGO_REPO
 
 
 def test_homelab_runner_overrides_project():

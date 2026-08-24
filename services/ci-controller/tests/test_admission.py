@@ -227,7 +227,7 @@ def test_kvm_exclusivity(write_config) -> None:
     cfg = _cfg(write_config)
     led = Ledger()
     led.add(Reservation("a", 100, "o/r", "emulator", 2500, True))
-    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/ordago-apps", labels=["android-e2e"])
+    job = QueuedJob(job_id=1, repo="ordago-app/ordago-apps", labels=["android-e2e"])
     decisions = evaluate([job], led, cfg)
     assert isinstance(decisions[0], DeferDecision)
     assert decisions[0].reason == KVM_BUSY
@@ -543,7 +543,7 @@ def test_single_host_config_produces_identical_decisions_to_the_pre_hosts_behavi
     valid_jobs = [
         _homelab_job(9),
         _homelab_job(10),
-        QueuedJob(job_id=11, repo="alvaro-francisco-gil/ordago-apps", labels=["android-e2e"]),
+        QueuedJob(job_id=11, repo="ordago-app/ordago-apps", labels=["android-e2e"]),
     ]
 
     valid_decisions = evaluate(valid_jobs, ledger, valid)
