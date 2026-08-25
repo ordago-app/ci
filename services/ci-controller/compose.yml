@@ -67,8 +67,58 @@ services:
       - /opt/personal/github-actions/ci-controller:/opt/personal/github-actions/ci-controller:rw
     expose:
       - "8000"
+    # No network of its own: it shares ci-fabric's namespace, so it reaches the
+    # homelab network through the sidecar AND has a route onto the CI fabric.
+    network_mode: "service:ci-fabric"
+
+  # Tailscaled on the CI FABRIC (tail037f40.ts.net) -- a different tailnet from the
+  # host-level daemon on powernet, which is untouched. The dispatcher shares this
+  # namespace so it can dial a remote lane host's socket proxy.
+  #
+  # TS_USERSPACE=false, with NET_ADMIN and a tun device. This is NOT the lane host's
+  # configuration and the difference is load-bearing: measured against the real
+  # fabric on 2026-08-25, a container sharing a USERSPACE tailscaled's namespace
+  # cannot open outbound connections to tailnet IPs at all -- curl times out, and
+  # only tailscaled's own SOCKS5 proxy works, which docker-py cannot use for a
+  # tcp:// endpoint. With a tun device a tailscale0 interface appears in the
+  # namespace and the same request returns 200. A lane host only ACCEPTS
+  # connections, which userspace handles fine, so it keeps userspace and no
+  # NET_ADMIN -- the guarantee is strongest where the untrusted code runs.
+  #
+  # dns: 100.100.100.100 puts MagicDNS behind docker's embedded resolver rather
+  # than in front of it. Verified both still work: docker service names resolve
+  # (embedded DNS answers first) and tailnet FQDNs resolve (it forwards the rest).
+  # Short tailnet names do not -- there is no search domain -- so lane-host
+  # endpoints are written as FQDNs in personal/ci-controller.yml.
+  #
+  # The `ci-controller` network alias keeps http://ci-controller:8000/healthz
+  # resolving for the dashboard: the dispatcher no longer has its own name on the
+  # network, but the namespace it shares does.
+  ci-fabric:
+    image: tailscale/tailscale:v1.102.2
+    container_name: ci-fabric
+    restart: unless-stopped
+    hostname: powerserver-dispatcher
+    environment:
+      TS_USERSPACE: "false"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_EXTRA_ARGS: "--advertise-tags=tag:ci-dispatcher-alvaro-francisco-gil"
+    env_file:
+      # Rendered by ansible from the sops store; never inlined here.
+      - path: /opt/personal/secrets/ci-fabric.env
+        required: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    dns:
+      - 100.100.100.100
+    volumes:
+      - ci-fabric-state:/var/lib/tailscale
     networks:
-      - homelab
+      homelab:
+        aliases:
+          - ci-controller
 
   ci-scheduler:
     image: homelab/ci-controller:latest
@@ -91,3 +141,8 @@ networks:
   homelab:
     external: true
     name: homelab
+
+volumes:
+  # The sidecar's tailnet node identity. Losing it drops the dispatcher off the
+  # fabric until it re-authenticates from the env file.
+  ci-fabric-state:

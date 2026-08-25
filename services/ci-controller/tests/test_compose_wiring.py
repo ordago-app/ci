@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import yaml
@@ -64,3 +65,48 @@ def test_scheduler_command_overrides_the_image_cmd_to_run_the_scheduler():
 def test_scheduler_exposes_its_port():
     scheduler = _compose()["services"]["ci-scheduler"]
     assert "8001" in scheduler.get("expose", [])
+
+
+def test_dispatcher_shares_the_fabric_sidecars_netns_and_the_scheduler_does_not():
+    """The dispatcher originates connections to remote lane hosts, so it needs a
+    route onto the fabric. The scheduler is dialled BY dispatchers and never dials
+    a socket proxy, so it stays where it is -- keeping its blast radius unchanged."""
+    compose = _compose()
+    assert compose["services"]["ci-controller"]["network_mode"] == "service:ci-fabric"
+    assert "networks" not in compose["services"]["ci-controller"]
+    assert "network_mode" not in compose["services"]["ci-scheduler"]
+    assert compose["services"]["ci-scheduler"]["networks"] == ["homelab"]
+
+
+def test_fabric_sidecar_uses_a_tun_device_not_userspace():
+    """Measured 2026-08-25 against the real fabric: with TS_USERSPACE=true a
+    container sharing the netns CANNOT open outbound connections to tailnet IPs --
+    curl times out (exit 28) and only tailscaled's own SOCKS5 proxy works. With
+    TS_USERSPACE=false plus NET_ADMIN and /dev/net/tun, a tailscale0 interface
+    appears in the netns and the same request returns 200.
+
+    The lane host's sidecar stays userspace on purpose: it only ACCEPTS
+    connections, which userspace handles, so it needs no NET_ADMIN."""
+    sidecar = _compose()["services"]["ci-fabric"]
+    assert sidecar["environment"]["TS_USERSPACE"] == "false"
+    assert "NET_ADMIN" in sidecar["cap_add"]
+    assert any("/dev/net/tun" in d for d in sidecar["devices"])
+
+
+def test_fabric_sidecar_keeps_docker_dns_and_gains_magicdns():
+    """Both must work at once: the dispatcher resolves `ci-scheduler` and
+    `docker-socket-proxy` through docker's embedded DNS, and lane hosts through
+    MagicDNS. Verified 2026-08-25 -- docker service names still resolve with
+    100.100.100.100 configured, and tailnet FQDNs then resolve too. Short tailnet
+    names do NOT (no search domain), which is why endpoints are written as FQDNs."""
+    sidecar = _compose()["services"]["ci-fabric"]
+    assert "100.100.100.100" in sidecar["dns"]
+    assert sidecar["networks"]["homelab"]["aliases"] == ["ci-controller"]
+
+
+def test_fabric_sidecar_reads_its_key_from_a_rendered_env_file():
+    """powerserver holds secrets, unlike a lane host, so the key comes from the
+    sops-rendered env file. It must never be inlined here -- this file is committed."""
+    sidecar = _compose()["services"]["ci-fabric"]
+    assert sidecar["env_file"][0]["path"] == "/opt/personal/secrets/ci-fabric.env"
+    assert "tskey-" not in json.dumps(sidecar)

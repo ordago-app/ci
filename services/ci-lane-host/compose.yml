@@ -39,24 +39,42 @@ services:
       EVENTS: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    # The one difference from powerserver's proxy: powerserver reaches its own
-    # proxy over the internal `homelab` docker network and publishes nothing.
-    # This one has to be reachable from another machine, so it publishes 2375.
+    # No published port and no docker network: this proxy shares the fabric
+    # sidecar's network namespace, so 2375 listens on the fabric interface and
+    # NOWHERE else. It is not bound on the host at all.
     #
-    # The bind address is NOT optional and NOT "0.0.0.0". This port is an
-    # UNAUTHENTICATED container-create API: anyone who can reach it can start a
-    # container that bind-mounts / and thereby owns the machine. Binding it to
-    # the host's tailnet address means the only paths to it are inside the
-    # tailnet, where a Tailscale ACL further restricts port 2375 to powerserver.
-    # CI_LANE_BIND_ADDR is rendered into .env by ansible/playbooks/ci-lane-host.yml
-    # from `tailscale ip -4`; compose fails to start if it is unset, which is the
-    # intended behaviour — no bind address means no listener, not a wide-open one.
-    ports:
-      - "${CI_LANE_BIND_ADDR:?tailnet bind address required}:2375:2375"
-    networks:
-      - homelab
+    # This replaces CI_LANE_BIND_ADDR, which published 2375 on the host's personal
+    # tailnet address. That worked, but its failure mode was 0.0.0.0 -- an
+    # unauthenticated container-create API on every network the host can see -- and
+    # it needed an ansible lookup, a guard and a rendered .env to stay safe. Not
+    # binding it at all is a smaller thing to get right.
+    #
+    # Reachability is now decided by the fabric's ACL (tailscale/acl.hujson), which
+    # is generated from the same allowed_orgs the scheduler filters placement on.
+    network_mode: "service:ci-fabric"
+    depends_on:
+      - ci-fabric
 
-networks:
-  homelab:
-    external: true
-    name: homelab
+  # Userspace tailscaled on the CI FABRIC -- a different tailnet from the one the
+  # host-level tailscaled joined, which is untouched. TS_USERSPACE avoids needing
+  # NET_ADMIN or a tun device.
+  #
+  # Deliberately NO TS_AUTHKEY and no env_file: a lane host holds no secrets
+  # (ADR 0016/0017), and a key in compose would persist in `docker inspect` on the
+  # guest. The join happens once via `make ci-fabric-join`, run from the operator's
+  # workstation, which reads the key from the gitignored secrets/secrets.vm.yml and
+  # hands it to `tailscale up` on the guest. Only tailscaled state lands on disk.
+  ci-fabric:
+    image: tailscale/tailscale:v1.102.2
+    container_name: ci-fabric
+    restart: unless-stopped
+    environment:
+      TS_USERSPACE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+    volumes:
+      # Named volume, not a bind: the state is the node identity. Losing it drops
+      # this host out of the fabric until someone re-runs the join.
+      - ci-fabric-state:/var/lib/tailscale
+
+volumes:
+  ci-fabric-state:
