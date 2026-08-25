@@ -13,6 +13,18 @@
 # an interactive step here is one someone eventually skips, and this is the step
 # that decides whether the host is reachable by its dispatcher at all.
 #
+# The join sets NO non-default preferences -- not even a hostname. containerboot
+# runs its own `tailscale up --accept-dns=false --hostname=...` when the sidecar
+# starts, and `tailscale up` refuses to change settings without mentioning every
+# non-default one already set:
+#
+#     Error: changing settings via 'tailscale up' requires mentioning all
+#     non-default flags.
+#
+# The sidecar then SIGTERMs itself in a restart loop. Leaving prefs at their
+# defaults here makes containerboot the single owner of them; this volume carries
+# only the node identity. Hit on 2026-08-25 deploying powervaro-ci.
+#
 # A script rather than a Makefile recipe: make runs recipes under /bin/sh (dash),
 # where the bash-isms this needs do not exist. See scripts/secrets_set.sh.
 set -euo pipefail
@@ -44,8 +56,7 @@ printf '%s' "$KEY" | ssh "powerbot@${HOST}" 'read -r K; docker run --rm \
     tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state \
       --socket=/tmp/ts.sock >/dev/null 2>&1 &
     for i in \$(seq 1 40); do [ -S /tmp/ts.sock ] && break; done
-    tailscale --socket=/tmp/ts.sock up --authkey=\"\$TS_KEY\" \
-      --hostname='"${HOST}"' --accept-routes=false
+    tailscale --socket=/tmp/ts.sock up --authkey=\"\$TS_KEY\"
   "'
 
 echo "==> ${HOST} joined the CI fabric; bring the stack up with the ci-lane-host play"

@@ -71,6 +71,16 @@ services:
     environment:
       TS_USERSPACE: "true"
       TS_STATE_DIR: /var/lib/tailscale
+      # Without this the node registers under the CONTAINER ID, and
+      # personal/ci-controller.yml's docker_endpoint -- which names the host --
+      # resolves to nothing. The join deliberately sets no prefs (see
+      # scripts/ci_fabric_join.sh), so the hostname has to come from here.
+      #
+      # Rendered into .env by ansible from inventory_hostname. Yes, this file just
+      # deleted a .env: that one carried CI_LANE_BIND_ADDR, whose failure mode was
+      # publishing an unauthenticated API on 0.0.0.0. A hostname is not a secret
+      # and its failure mode is a container that will not start.
+      TS_HOSTNAME: "${CI_LANE_HOSTNAME:?lane host name required}"
     volumes:
       # Named volume, not a bind: the state is the node identity. Losing it drops
       # this host out of the fabric until someone re-runs the join.
