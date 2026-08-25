@@ -65,8 +65,12 @@ services:
       # fill the disk. Keep these paths in sync with work_dirs in ci-controller.yml.
       - /mnt/ci-ssd/ci-controller:/mnt/ci-ssd/ci-controller:rw
       - /opt/personal/github-actions/ci-controller:/opt/personal/github-actions/ci-controller:rw
-    expose:
-      - "8000"
+    # No `expose:` here. Docker rejects it outright when network_mode is a
+    # container namespace -- "conflicting options: port exposing and the container
+    # type network mode" -- and the container fails to create. It was only metadata
+    # anyway: docker needs no expose for container-to-container traffic, and the
+    # port is reached through the sidecar's namespace and its `ci-controller` alias.
+    #
     # No network of its own: it shares ci-fabric's namespace, so it reaches the
     # homelab network through the sidecar AND has a route onto the CI fabric.
     network_mode: "service:ci-fabric"

@@ -110,3 +110,25 @@ def test_fabric_sidecar_reads_its_key_from_a_rendered_env_file():
     sidecar = _compose()["services"]["ci-fabric"]
     assert sidecar["env_file"][0]["path"] == "/opt/personal/secrets/ci-fabric.env"
     assert "tskey-" not in json.dumps(sidecar)
+
+
+def test_no_service_combines_expose_with_a_container_network_mode():
+    """Docker rejects the combination outright:
+
+        conflicting options: port exposing and the container type network mode
+
+    and the container fails to CREATE -- so the stack comes up partially, which on
+    2026-08-25 left ci-scheduler stopped and the dispatcher unable to schedule.
+    `expose` is metadata only; container-to-container traffic never needed it.
+
+    The test that let this through checked network_mode and networks but not
+    expose, which is why this asserts the property for every service rather than
+    for the one that happened to break."""
+    for name, service in _compose()["services"].items():
+        if str(service.get("network_mode", "")).startswith("service:"):
+            assert "expose" not in service, (
+                f"{name}: docker refuses `expose` alongside a container network mode"
+            )
+            assert "ports" not in service, (
+                f"{name}: published ports belong to the namespace owner, not the sharer"
+            )
