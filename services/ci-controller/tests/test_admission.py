@@ -714,3 +714,86 @@ def test_a_job_with_no_class_to_name_reports_none(write_config) -> None:
     assert isinstance(decision, DeferDecision)
     assert decision.reasons == (NOT_ALLOWLISTED,)
     assert decision.class_name is None
+
+
+# Two hosts that differ ONLY in which org may place work on them. Both allow the
+# `light` class and both have ample budget, so any difference in the outcome is
+# `allowed_orgs` and nothing else.
+ORG_SPLIT_CONFIG = """\
+ram_budget_mb: 4000
+max_concurrent_lanes: 4
+default_class: light
+default_host: aaa-personal
+runner_image: homelab/github-actions-runner:latest
+work_dirs:
+  ssd: /mnt/ci-ssd/ci-controller
+  hdd: /opt/personal/github-actions/ci-controller
+classes:
+  light:
+    ram_mb: 700
+    work_disk: ssd
+repos:
+  - project: homelab
+    label_class:
+      homelab: light
+  - project: ordago-apps
+    label_class:
+      ordago-ci: light
+hosts:
+  aaa-personal:
+    docker_endpoint: tcp://100.64.0.4:2375
+    allowed_orgs: [alvaro-francisco-gil]
+  zzz-ordago:
+    docker_endpoint: tcp://100.64.0.3:2375
+    allowed_orgs: [ordago-app]
+"""
+
+
+def test_a_host_that_excludes_the_jobs_org_is_not_eligible(write_config):
+    """allowed_orgs is the scheduling half of the lane-host trust boundary. A host
+    listing only [ordago-app] must never be offered a personal job, and vice versa.
+    The SAME fact generates the tailnet ACL, so placement can never grant reach the
+    fabric refuses -- see docs/plans/ideas/federated-ci-pool.md decision 6."""
+    config = ControllerConfig.load(write_config(ORG_SPLIT_CONFIG))
+    ledger = Ledger()
+
+    ordago_job = QueuedJob(job_id=1, repo="ordago-app/ordago-apps", labels=["ordago-ci"])
+    personal_job = QueuedJob(job_id=2, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+
+    # Named so the WRONG host wins every tie-break without the filter: equal
+    # headroom is broken by name ascending, so a single ordago job would land on
+    # aaa-personal. Landing on zzz-ordago is therefore evidence of the filter and
+    # not of the tie-break.
+    decisions = evaluate([ordago_job], ledger, config, {}, None)
+    assert isinstance(decisions[0], AdmitDecision)
+    assert decisions[0].host == "zzz-ordago"
+
+    decisions = evaluate([personal_job], ledger, config, {}, None)
+    assert isinstance(decisions[0], AdmitDecision)
+    assert decisions[0].host == "aaa-personal"
+
+
+def test_a_job_no_host_admits_the_org_of_defers_as_no_eligible_host(write_config):
+    """An org nobody accepts is an eligibility verdict, not a capacity one -- the
+    fleet being empty would not help."""
+    config = ControllerConfig.load(write_config(ORG_SPLIT_CONFIG))
+    ledger = Ledger()
+    job = QueuedJob(job_id=1, repo="ordago-app/ordago-apps", labels=["ordago-ci"])
+
+    # Take ordago-host out of the healthy set: the only host that admits this org.
+    decisions = evaluate([job], ledger, config, {}, {"aaa-personal"})
+
+    assert isinstance(decisions[0], DeferDecision)
+    assert decisions[0].reasons == (NO_ELIGIBLE_HOST,)
+
+
+def test_omitting_allowed_orgs_means_every_org(write_config):
+    """Absent config must not silently deny -- every host predates this field."""
+    config = ControllerConfig.load(write_config(TWO_HOST_CONFIG))
+    ledger = Ledger()
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+
+    decisions = evaluate([job], ledger, config, {}, None)
+
+    assert isinstance(decisions[0], AdmitDecision)
+    assert decisions[0].host == "powerserver"

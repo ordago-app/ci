@@ -77,6 +77,16 @@ class HostConfig(BaseModel):
     docker_endpoint: str
     docker_network: str = "homelab"
     allowed_classes: list[str] | None = None
+    # Which GitHub orgs may place work on this host. `None` means no restriction,
+    # which is what every host meant before this field existed -- absent config must
+    # never silently deny. NOT inherited from a top-level default on purpose: the
+    # federated pool's whole point is that hosts differ here, so a fleet-wide default
+    # would be a footgun that quietly widens a trust boundary.
+    #
+    # The SAME fact generates the fabric's tailnet ACL (scripts/gen_tailscale_acl.py),
+    # so placement can never grant reach the network refuses. See
+    # docs/plans/ideas/federated-ci-pool.md decision 6.
+    allowed_orgs: list[str] | None = None
     cpu_shares: int | None = None
     enabled: bool = True
     ram_budget_mb: int | None = None
@@ -154,6 +164,9 @@ class HostConfig(BaseModel):
                 "allowed_classes": (
                     sorted(top.classes) if self.allowed_classes is None else self.allowed_classes
                 ),
+                # Deliberately passed through rather than defaulted: None stays None
+                # and reads downstream as "unrestricted".
+                "allowed_orgs": self.allowed_orgs,
             }
         )
 

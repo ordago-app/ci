@@ -32,6 +32,9 @@ class _HostPolicy:
     host_free_ram_floor_mb: int
     host_load_ceiling: float
     allowed_classes: frozenset[str]
+    # None = unrestricted. An empty frozenset would mean "no org may use this host",
+    # which is a legitimate but very different thing, so the distinction is kept.
+    allowed_orgs: frozenset[str] | None
 
 
 @dataclass
@@ -77,6 +80,7 @@ def _policy(host: HostConfig, config: ControllerConfig) -> _HostPolicy:
         allowed_classes=frozenset(
             config.classes if host.allowed_classes is None else host.allowed_classes
         ),
+        allowed_orgs=(None if host.allowed_orgs is None else frozenset(host.allowed_orgs)),
     )
 
 
@@ -166,10 +170,12 @@ def evaluate(
             continue
 
         job_class = config.classes[class_name]
+        job_org = job.repo.split("/", 1)[0]
         eligible = [
             state
             for _, state in sorted(states.items())
             if class_name in state.policy.allowed_classes
+            and (state.policy.allowed_orgs is None or job_org in state.policy.allowed_orgs)
         ]
         if not eligible:
             # Not a capacity verdict: no host would take this class however empty the fleet.
