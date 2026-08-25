@@ -13,8 +13,7 @@ from src.scheduler_client import HttpScheduler
 from tests.conftest import VALID_CONFIG
 
 JOBS = [
-    QueuedJob(job_id=i, repo="alvaro-francisco-gil/ordago-apps", labels=["ordago-ci"])
-    for i in range(1, 30)
+    QueuedJob(job_id=i, repo="ordago-app/ordago-apps", labels=["ordago-ci"]) for i in range(1, 30)
 ]
 
 

@@ -15,7 +15,7 @@ def _scheduler(write_config) -> LocalScheduler:
 
 def test_plan_admits_a_light_job(write_config):
     sched = _scheduler(write_config)
-    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/ordago-apps", labels=["ordago-ci"])
+    job = QueuedJob(job_id=1, repo="ordago-app/ordago-apps", labels=["ordago-ci"])
 
     decisions = sched.plan([job], host_stats={}, healthy=None)
 
@@ -26,7 +26,7 @@ def test_plan_admits_a_light_job(write_config):
 
 def test_commit_then_lanes_reports_the_reservation(write_config):
     sched = _scheduler(write_config)
-    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/ordago-apps", labels=["ordago-ci"])
+    job = QueuedJob(job_id=1, repo="ordago-app/ordago-apps", labels=["ordago-ci"])
     decision = sched.plan([job], host_stats={}, healthy=None)[0]
 
     sched.commit(decision, lane_id="lane-a", container_id="c1", idle_since=100.0)
@@ -39,7 +39,7 @@ def test_commit_then_lanes_reports_the_reservation(write_config):
 
 def test_committed_job_defers_as_already_running(write_config):
     sched = _scheduler(write_config)
-    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/ordago-apps", labels=["ordago-ci"])
+    job = QueuedJob(job_id=1, repo="ordago-app/ordago-apps", labels=["ordago-ci"])
     sched.commit(
         sched.plan([job], {}, None)[0], lane_id="lane-a", container_id="c1", idle_since=1.0
     )
@@ -52,7 +52,7 @@ def test_committed_job_defers_as_already_running(write_config):
 
 def test_update_then_release(write_config):
     sched = _scheduler(write_config)
-    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/ordago-apps", labels=["ordago-ci"])
+    job = QueuedJob(job_id=1, repo="ordago-app/ordago-apps", labels=["ordago-ci"])
     sched.commit(
         sched.plan([job], {}, None)[0], lane_id="lane-a", container_id="c1", idle_since=1.0
     )

@@ -22,9 +22,7 @@ def test_healthz(client):
 
 def test_plan_returns_an_admit_decision(client):
     body = {
-        "jobs": [
-            {"job_id": 1, "repo": "alvaro-francisco-gil/ordago-apps", "labels": ["ordago-ci"]}
-        ],
+        "jobs": [{"job_id": 1, "repo": "ordago-app/ordago-apps", "labels": ["ordago-ci"]}],
         "host_stats": {},
         "healthy": None,
     }
@@ -37,9 +35,7 @@ def test_plan_returns_an_admit_decision(client):
 
 def test_commit_update_and_release(client):
     body = {
-        "jobs": [
-            {"job_id": 1, "repo": "alvaro-francisco-gil/ordago-apps", "labels": ["ordago-ci"]}
-        ],
+        "jobs": [{"job_id": 1, "repo": "ordago-app/ordago-apps", "labels": ["ordago-ci"]}],
         "host_stats": {},
         "healthy": None,
     }
