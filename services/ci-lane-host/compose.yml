@@ -77,4 +77,11 @@ services:
       - ci-fabric-state:/var/lib/tailscale
 
 volumes:
+  # Explicit `name:` so compose does NOT prefix it with the project directory
+  # name. `make ci-fabric-join` writes the node identity into this volume by its
+  # bare name before the stack exists, and compose would otherwise mount
+  # `<project>_ci-fabric-state` instead -- leaving the sidecar unauthenticated and
+  # printing an interactive login URL nobody reads. Hit exactly that on
+  # 2026-08-25 while deploying powervaro-ci.
   ci-fabric-state:
+    name: ci-fabric-state
