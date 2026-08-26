@@ -66,11 +66,11 @@
 # The socket proxy denies IMAGES and BUILD, so the controller can only `run`
 # an image already present here. Build it locally or every admission to this
 # host 404s — see services/ci-lane-host/README.md.
-# --checksum: `ansible-galaxy collection install` rewrites every file's mtime
-# to install time, so when this role runs from an installed collection, rsync's
-# default size+mtime comparison sees identical content as changed on every
-# deploy. Content-based comparison makes the sync idempotent again. Same reason
-# on the other three `synchronize` tasks in this collection.
+# Installed collections rewrite every file's mtime, so rsync's default size+mtime
+# comparison reports changed on every deploy. Content comparison alone (checksum
+# flag) detects genuine changes; preventing mtime-only syncs (no-times flag) keeps
+# both required. Measured: with mtime ".f..t...", without mtime "(nothing changed)".
+# Same reason on the other three `synchronize` tasks in this collection.
 - name: github-actions-runner build context synced (Dockerfile + entrypoint.sh)
   ansible.posix.synchronize:
     src: "{{ role_path }}/../../services/github-actions-runner/"
@@ -82,6 +82,7 @@
       - "--exclude=__pycache__"
       - "--exclude=.pytest_cache"
       - "--checksum"
+      - "--no-times"
   become: true
   become_user: "{{ operator_user }}"
 

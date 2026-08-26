@@ -84,7 +84,7 @@
     dest: "{{ services_root }}/github-review/compose.yml"
     mode: "0644"
 
-# --checksum: see roles/ci_lane_host/tasks/main.yml.
+# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
 - name: github-review build context (Dockerfile + src/ + pyproject.toml + uv.lock)
   ansible.posix.synchronize:
     src: "{{ role_path }}/../../services/github-review/"
@@ -94,6 +94,7 @@
       - "--exclude=__pycache__"
       - "--exclude=.venv"
       - "--checksum"
+      - "--no-times"
   become: true
   become_user: "{{ operator_user }}"
 

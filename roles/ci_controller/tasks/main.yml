@@ -108,8 +108,7 @@
     dest: "{{ services_root }}/ci-controller/compose.yml"
     mode: "0644"
 
-# --checksum: see roles/ci_lane_host/tasks/main.yml — installed-collection
-# mtimes make rsync's default comparison falsely report changed here too.
+# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
 - name: ci-controller build context (Dockerfile + src/ + pyproject.toml + uv.lock)
   ansible.posix.synchronize:
     src: "{{ role_path }}/../../services/ci-controller/"
@@ -120,6 +119,7 @@
       - "--exclude=.venv"
       - "--exclude=.pytest_cache"
       - "--checksum"
+      - "--no-times"
   become: true
   become_user: "{{ operator_user }}"
 
@@ -175,7 +175,7 @@
 # so it OWNS that image's existence — decoupled from the static runner pool. Once
 # the homelab pool is retired, the pool's compose has no services and can no longer
 # build the image; these two tasks keep a build path that needs no static runner.
-# --checksum: see roles/ci_lane_host/tasks/main.yml.
+# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
 - name: ci-controller runner image build context synced (Dockerfile + entrypoint.sh)
   ansible.posix.synchronize:
     src: "{{ role_path }}/../../services/github-actions-runner/"
@@ -187,6 +187,7 @@
       - "--exclude=__pycache__"
       - "--exclude=.pytest_cache"
       - "--checksum"
+      - "--no-times"
   become: true
   become_user: "{{ operator_user }}"
 
