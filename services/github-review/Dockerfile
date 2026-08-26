@@ -9,7 +9,7 @@ RUN apt-get update \
 
 # Deps come from the committed uv.lock, so a rebuild installs the exact versions
 # that were tested. `pip install -e .` ignored the lock, which let a rebuild pull
-# an untested major version (that is what broke a-private-homelab-service on 2026-08-07).
+# an untested major version (that is what broke a sibling service on 2026-08-07).
 COPY --from=ghcr.io/astral-sh/uv:0.9.28 /uv /usr/local/bin/uv
 ENV UV_LINK_MODE=copy
 
