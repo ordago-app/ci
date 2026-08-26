@@ -95,10 +95,11 @@ class Controller:
         config: ControllerConfig,
         github: GitHubAdapter,
         docker: DockerPool,
+        *,
+        host: str,
         ledger: Ledger | None = None,
         metrics: MetricsStore | None = None,
         host_stats_reader: Callable[[], HostStats] | None = None,
-        host: str = "powerserver",
         scheduler: Scheduler | None = None,
     ) -> None:
         if scheduler is None:

@@ -13,15 +13,33 @@ from src.models import (
     AdmitDecision,
     DeferDecision,
     QueuedJob,
-    Reservation,
+)
+from src.models import (
+    Reservation as _Reservation,
 )
 
 from tests.conftest import VALID_CONFIG
+
+# Test shim, not production behaviour. These tests are all about lanes on ONE
+# host, so an explicit `host=` would be the same literal dozens of times and
+# would say nothing. `Reservation.host` stopped defaulting to a real machine
+# when the platform was prepared for a second operator — see
+# tests/test_no_operator_defaults.py — so the convenience lives here, in the
+# fixture, instead of in shipped code. Tests that are about a NAMED other host
+# pass `host=` explicitly and setdefault leaves them alone.
+THIS_HOST = "powerserver"
+
+
+def Reservation(*args, **kwargs) -> _Reservation:
+    kwargs.setdefault("host", THIS_HOST)
+    return _Reservation(*args, **kwargs)
+
 
 # Crowded config: lane ceiling of 1 and a tight RAM budget so both gates bind at once.
 CROWDED_CONFIG = """\
 ram_budget_mb: 1000
 max_concurrent_lanes: 1
+default_host: powerserver
 default_class: light
 runner_image: homelab/github-actions-runner:latest
 work_dirs:
@@ -41,6 +59,7 @@ repos:
 DISK_CONFIG = """\
 ram_budget_mb: 100000
 max_concurrent_lanes: 50
+default_host: powerserver
 default_class: light
 runner_image: homelab/github-actions-runner:latest
 work_dirs:

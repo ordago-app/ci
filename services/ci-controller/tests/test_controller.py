@@ -16,11 +16,28 @@ from src.models import (
     AdmitDecision,
     DeferDecision,
     QueuedJob,
-    Reservation,
     RunningJob,
+)
+from src.models import (
+    Reservation as _Reservation,
 )
 
 from tests.conftest import VALID_CONFIG
+
+# Test shim, not production behaviour. These tests are all about lanes on ONE
+# host, so an explicit `host=` would be the same literal dozens of times and
+# would say nothing. `Reservation.host` stopped defaulting to a real machine
+# when the platform was prepared for a second operator — see
+# tests/test_no_operator_defaults.py — so the convenience lives here, in the
+# fixture, instead of in shipped code. Tests that are about a NAMED other host
+# pass `host=` explicitly and setdefault leaves them alone.
+THIS_HOST = "powerserver"
+
+
+def Reservation(*args, **kwargs) -> _Reservation:
+    kwargs.setdefault("host", THIS_HOST)
+    return _Reservation(*args, **kwargs)
+
 
 MULTI_HOST_CONFIG = (
     VALID_CONFIG
@@ -81,7 +98,12 @@ def _controller(write_config, queued, metrics=None):
     docker.spawn.side_effect = _spawn
     docker.sample.return_value = (2900, 140.0)
     ctrl = Controller(
-        config=cfg, github=github, docker=_pool(docker), ledger=Ledger(), metrics=metrics
+        host="powerserver",
+        config=cfg,
+        github=github,
+        docker=_pool(docker),
+        ledger=Ledger(),
+        metrics=metrics,
     )
     return ctrl, github, docker
 
@@ -120,7 +142,9 @@ def _multi_host_controller(write_config, queued, metrics=None):
         set(pool.up),
         {name: a.list_lanes() for name, a in adapters.items() if name in pool.up},
     )
-    ctrl = Controller(config=cfg, github=github, docker=pool, ledger=Ledger(), metrics=metrics)
+    ctrl = Controller(
+        host="powerserver", config=cfg, github=github, docker=pool, ledger=Ledger(), metrics=metrics
+    )
     return ctrl, github, adapters, pool
 
 
@@ -194,7 +218,9 @@ def test_reconcile_deletes_work_dir_when_lane_reaped(write_config, tmp_path) -> 
     cfg = ControllerConfig.load(write_config(cfg_text))
     docker = MagicMock()
     docker.list_lanes.return_value = []  # lane finished + auto-removed
-    ctrl = Controller(config=cfg, github=MagicMock(), docker=_pool(docker), ledger=Ledger())
+    ctrl = Controller(
+        host="powerserver", config=cfg, github=MagicMock(), docker=_pool(docker), ledger=Ledger()
+    )
 
     lane_id = "powerserver-cici-1"
     work_dir = ssd / f"{lane_id}-work"
@@ -233,7 +259,9 @@ def test_reconcile_does_not_delete_outside_work_base_for_malicious_lane_id(
     cfg = ControllerConfig.load(write_config(cfg_text))
     docker = MagicMock()
     docker.list_lanes.return_value = []
-    ctrl = Controller(config=cfg, github=MagicMock(), docker=_pool(docker), ledger=Ledger())
+    ctrl = Controller(
+        host="powerserver", config=cfg, github=MagicMock(), docker=_pool(docker), ledger=Ledger()
+    )
 
     # lane_id from an unconstrained Docker label: {work_base}/{lane_id}-work escapes ssd.
     malicious = "../outside"  # -> ssd/../outside-work == tmp_path/outside-work

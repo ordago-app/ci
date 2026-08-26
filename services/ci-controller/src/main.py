@@ -38,7 +38,12 @@ def main() -> None:
         os.environ.get("CI_CONTROLLER_CONFIG", "/etc/ci-controller/ci-controller.yml")
     )
     poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
-    host = os.environ.get("RUNNER_HOST", "powerserver")
+    host = os.environ.get("RUNNER_HOST", "")
+    if not host:
+        raise SystemExit(
+            "RUNNER_HOST is required: it names which pool member this dispatcher "
+            "runs on, and the reaper uses it to tell this host's lanes from a peer's"
+        )
 
     config = ControllerConfig.load(config_path)
     if host not in config.resolved_hosts():

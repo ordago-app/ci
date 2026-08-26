@@ -68,7 +68,7 @@ class Reservation:
     work_gb: int = 0
     workflow: str = ""
     job_name: str = ""
-    host: str = "powerserver"
+    host: str = ""  # empty means "not placed yet"; never a real machine
     # Observation state. GitHub hands a registering runner whichever queued job matches its
     # labels, so the job a lane runs is frequently not the one it was spawned for.
     # Epoch seconds the lane's container started, sourced from the daemon on every
@@ -104,7 +104,7 @@ class AdmitDecision:
     needs_kvm: bool
     work_disk: str = "ssd"
     work_gb: int = 0
-    host: str = "powerserver"
+    host: str = ""  # empty means "not placed yet"; never a real machine
 
 
 @dataclass(frozen=True)

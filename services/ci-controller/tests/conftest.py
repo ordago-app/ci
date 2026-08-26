@@ -29,6 +29,7 @@ VALID_CONFIG = """\
 ram_budget_mb: 12000
 max_concurrent_lanes: 8
 default_class: light
+default_host: powerserver
 runner_image: homelab/github-actions-runner:latest
 work_dirs:
   ssd: /mnt/ci-ssd/ci-controller

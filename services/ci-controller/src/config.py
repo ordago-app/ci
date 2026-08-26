@@ -183,7 +183,10 @@ class ControllerConfig(BaseModel):
     host_unhealthy_ticks: int = 3
     max_concurrent_lanes: int
     default_class: str
-    default_host: str = "powerserver"
+    # Required: names the machine work lands on when `hosts:` is absent. A
+    # platform two operators deploy cannot ship a guess for this — see
+    # tests/test_no_operator_defaults.py.
+    default_host: str
     runner_image: str
     work_dirs: dict[str, str]
     disk_budget_gb: dict[str, int] = {}
