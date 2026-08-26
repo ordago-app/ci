@@ -150,3 +150,52 @@ def test_fabric_sidecar_resolves_both_tailnet_and_public_names():
         "a public resolver must follow MagicDNS, or the dispatcher cannot reach GitHub"
     )
     assert not dns[1].startswith("100.100."), "the second entry must be a PUBLIC resolver"
+
+
+def test_socket_proxy_is_not_on_the_network_lanes_run_on():
+    """The proxy is an unauthenticated container-create API and `homelab` carries
+    lane containers -- untrusted PR code. Measured 2026-08-26 before this change:
+    from a container on homelab, http://docker-socket-proxy:2375/version -> 200,
+    which is a path from a pull request to root on powerserver.
+
+    ADR 0016 closed the same hole on a LANE host with a DOCKER-USER rule;
+    powerserver never had the equivalent because the reachability is
+    container-to-container on a shared bridge rather than a published port."""
+    compose = _compose()
+    proxy_networks = set(compose["services"]["docker-socket-proxy"]["networks"])
+    assert "homelab" not in proxy_networks, (
+        "lanes run on `homelab`; the socket proxy must not share it"
+    )
+    assert proxy_networks == {"ci-internal"}
+
+
+def test_scheduler_cannot_reach_the_socket_proxy():
+    """Decision 1 of the federated-pool spec: a credential-free scheduler must not
+    be able to spawn containers pool-wide. That was an APP-level property -- the
+    scheduler simply has no docker client -- and measurably not an infra one:
+    ci-scheduler reached docker-socket-proxy:2375 over the flat homelab network.
+
+    Sharing no network with the proxy makes it infra-backed, which is what
+    .claude/skills/enforce-trust-boundary prefers for a predicate the
+    infrastructure can enforce natively."""
+    compose = _compose()
+    scheduler_networks = set(compose["services"]["ci-scheduler"]["networks"])
+    proxy_networks = set(compose["services"]["docker-socket-proxy"]["networks"])
+    assert not (scheduler_networks & proxy_networks), (
+        f"scheduler and proxy share {scheduler_networks & proxy_networks}"
+    )
+
+
+def test_only_the_dispatchers_namespace_owner_reaches_the_proxy():
+    """ci-fabric carries the dispatcher's namespace, so it -- and only it -- needs
+    a foot in ci-internal. Anything else joining that network is widening the
+    socket's blast radius and should be seen in review."""
+    compose = _compose()
+    on_internal = {
+        name
+        for name, svc in compose["services"].items()
+        if "ci-internal" in (svc.get("networks") or {})
+    }
+    assert on_internal == {"ci-fabric", "docker-socket-proxy"}, (
+        f"unexpected members of ci-internal: {on_internal}"
+    )

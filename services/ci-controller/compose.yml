@@ -27,8 +27,22 @@ services:
       EVENTS: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    # NOT on `homelab`. That network carries lane containers -- untrusted PR code --
+    # and this is an unauthenticated container-create API: anything that can reach it
+    # can start a container bind-mounting / and own the host. Measured 2026-08-26
+    # from a container on homelab: http://docker-socket-proxy:2375/version -> 200.
+    #
+    # ADR 0016 closed exactly this hole on a LANE host with a DOCKER-USER rule.
+    # powerserver never had the equivalent, because the proxy publishes no port and
+    # the reachability is container-to-container on a shared bridge.
+    #
+    # `ci-internal` is reachable only by ci-fabric, whose namespace the dispatcher
+    # shares. That also removes ci-scheduler's reach, which is the point of decision 1
+    # in docs/plans/ideas/federated-ci-pool.md: a credential-free scheduler must not
+    # be able to spawn containers. Until now that was an app-level property (the
+    # scheduler has no docker client); this makes it infra-backed.
     networks:
-      - homelab
+      - ci-internal
 
   ci-controller:
     image: homelab/ci-controller:latest
@@ -137,6 +151,9 @@ services:
       homelab:
         aliases:
           - ci-controller
+      # The dispatcher shares this namespace and is the only thing that may reach
+      # the socket proxy.
+      ci-internal:
 
   ci-scheduler:
     image: homelab/ci-controller:latest
@@ -159,6 +176,12 @@ networks:
   homelab:
     external: true
     name: homelab
+
+  # Private to the dispatcher and the socket proxy. Deliberately NOT external and
+  # NOT `homelab`: creating it here keeps its membership visible in the same file
+  # that grants the socket, so widening it is an edit a reviewer sees.
+  ci-internal:
+    name: ci-internal
 
 volumes:
   # Explicit `name:` so compose does NOT prefix it with the project directory
