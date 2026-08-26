@@ -229,18 +229,8 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path: Path) -> 
     with pytest.raises(ConfigError, match="owner/name"):
         ReviewConfig.load(cfg_path)
 
-
-def test_the_committed_config_and_registry_agree() -> None:
-    """personal/agent-review.yml and personal/repos.yml ship together; a project
-    in one and not the other is a container that will not start."""
-    import yaml
-
-    personal = Path(__file__).resolve().parents[3] / "personal"
-    cfg = ReviewConfig.load(personal / "agent-review.yml")
-    registry = yaml.safe_load((personal / "repos.yml").read_text())["project_repos"]
-    # Read from the registry rather than restated. A literal owner here would be a
-    # second copy of what repos.yml already says — the duplication #171 removed —
-    # and would go stale on the next transfer while asserting nothing about the
-    # agreement this test exists to check.
-    assert {r.repo for r in cfg.repos.values()} <= set(registry.values())
-    assert cfg.repos["ordago-apps"].repo == registry["ordago-apps"]
+# `test_the_committed_config_and_registry_agree` is NOT here, deliberately. It
+# asserted that one operator's `personal/agent-review.yml` and
+# `personal/repos.yml` ship consistently. That is a fact about a DEPLOYMENT, not
+# about this platform, and those files live in the consumer's repo. It stays
+# with the consumer; re-adding it here would only ever fail.

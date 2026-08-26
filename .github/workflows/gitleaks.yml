@@ -4,10 +4,9 @@ name: gitleaks
 # is a convention until something enforces it.
 #
 # NOT gitleaks/gitleaks-action: it requires a paid licence for repositories
-# owned by an ORGANISATION, and refuses to scan without one. homelab runs the
-# action because it belongs to a personal account. `ordago-app` is an org, so
-# this runs the same scanner as its plain open-source binary instead. Pinned by
-# version so a future release cannot silently change what counts as a leak.
+# owned by an ORGANISATION and refuses to scan without one, which only shows up
+# here because `ordago-app` is an org. This runs the plain open-source binary,
+# pinned by version, exactly as homelab does — its config is in .gitleaks.toml.
 on:
   push:
     branches: [main]
@@ -36,4 +35,4 @@ jobs:
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version
       - name: Scan full history
-        run: gitleaks git --no-banner --redact --verbose .
+        run: gitleaks detect --redact --verbose --source .

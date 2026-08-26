@@ -1,0 +1,22 @@
+# gitleaks config. Inherits the upstream default ruleset and adds this repo's
+# allowlist. CI runs gitleaks over full history on every push/PR.
+#
+# The allowlist is COMMIT-SCOPED on purpose, carried over from homelab: a new
+# test or doc that introduces private-key material must still fail. Pinning to
+# known-historical commits is what makes that possible.
+#
+# Those pins do not survive a history rewrite, which is how this repo was
+# created. homelab allowlists four commits; `git filter-repo`'s commit-map says
+# three of them touched only paths that were not extracted and no longer exist
+# here, and the fourth became the SHA below. Translate through
+# `.git/filter-repo/commit-map`, never by copying SHAs across repos.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Historical fixture private key in a GitHub App JWT-signing test. Generated for the test, never valid anywhere."
+commits = [
+  # was 91e66f0f6c68138a324c32627985df36c7c40d5c in powervaro/homelab
+  "fa2adbe80b9f1c7b088915e9314d414f98cd9ba4",
+]
