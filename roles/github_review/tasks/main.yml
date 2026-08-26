@@ -84,6 +84,7 @@
     dest: "{{ services_root }}/github-review/compose.yml"
     mode: "0644"
 
+# --checksum: see roles/ci_lane_host/tasks/main.yml.
 - name: github-review build context (Dockerfile + src/ + pyproject.toml + uv.lock)
   ansible.posix.synchronize:
     src: "{{ role_path }}/../../services/github-review/"
@@ -92,6 +93,7 @@
       - "--exclude=tests"
       - "--exclude=__pycache__"
       - "--exclude=.venv"
+      - "--checksum"
   become: true
   become_user: "{{ operator_user }}"
 
