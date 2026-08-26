@@ -1,0 +1,105 @@
+---
+# ── github-review (agentic PR reviews; reuses claude-router + codex images) ──
+- name: Preconditions for a github-review host are met
+  ansible.builtin.assert:
+    that:
+      - services_root is defined and services_root | length > 0
+      - personal_root is defined and personal_root | length > 0
+      - operator_user is defined and operator_user | length > 0
+    fail_msg: >-
+      github_review requires services_root, personal_root and operator_user, which
+      come from the OPERATOR's inventory, not from this collection.
+
+- name: This operator has pointed github_review at their own config
+  ansible.builtin.assert:
+    that:
+      - github_review_config is defined and github_review_config | length > 0
+      - github_review_repos_config is defined and github_review_repos_config | length > 0
+    fail_msg: >-
+      github_review_config and github_review_repos_config must point at this
+      operator's own agent-review.yml and repos.yml. This collection deliberately
+      does not ship one operator's pool config for every other operator — set both
+      in your own inventory.
+
+- name: repos.yml is already in place for this stack to mount
+  # repos.yml is placed OUTSIDE the ported range in the source playbook (a
+  # generic loop that renders every operator's repo map, not part of this
+  # extraction) — this role correctly does not place it either. But
+  # compose.yml mounts it read-only, and an absent bind-mount source makes
+  # Docker fabricate a root-owned directory at that path instead of failing:
+  # the container then dies obscurely. Fail loudly here instead.
+  ansible.builtin.stat:
+    path: "{{ github_review_repos_config }}"
+  register: _github_review_repos_config
+
+- name: This operator's repos.yml exists at github_review_repos_config
+  ansible.builtin.assert:
+    that:
+      - _github_review_repos_config.stat.exists
+      - not _github_review_repos_config.stat.isdir
+    fail_msg: >-
+      github_review_repos_config ({{ github_review_repos_config }}) must already
+      exist as a file on this host before this role runs — this collection does
+      not place it (it is out of the ported range). See compose.yml's
+      /opt/personal/repos.yml mount.
+
+# DELIBERATELY no secrets-file assert here, unlike ci_controller. Ruling 7:
+# services/github-review/compose.yml declares no `env_file:` at all — only
+# three plain, non-secret environment variables (AGENT_REVIEW_CONFIG,
+# STATE_DIR, PROJECTS_ROOT) — and the service's own src/main.py reads no
+# token/secret env var either. It authenticates to GitHub only indirectly, by
+# calling claude-router over ROUTER_INTERNAL_URL; claude-router's own stack
+# (not part of this ported range) holds the GitHub App credentials. This
+# stack holds no credential to leak, so it takes no secrets directory and
+# asserts on no secret file. Do not restore a stat-loop assert here without
+# first re-checking services/github-review/compose.yml for a new env_file.
+
+- name: github-review service dir
+  ansible.builtin.file:
+    path: "{{ services_root }}/github-review"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+- name: github-review state dir exists
+  ansible.builtin.file:
+    path: "{{ personal_root }}/state/github-review"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0750"
+
+- name: place agent-review.yml on host
+  ansible.builtin.copy:
+    src: "{{ github_review_config }}"
+    dest: "{{ personal_root }}/agent-review.yml"
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0640"
+
+- name: github-review compose file
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../services/github-review/compose.yml"
+    dest: "{{ services_root }}/github-review/compose.yml"
+    mode: "0644"
+
+# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
+- name: github-review build context (Dockerfile + src/ + pyproject.toml + uv.lock)
+  ansible.posix.synchronize:
+    src: "{{ role_path }}/../../services/github-review/"
+    dest: "{{ services_root }}/github-review/"
+    rsync_opts:
+      - "--exclude=tests"
+      - "--exclude=__pycache__"
+      - "--exclude=.venv"
+      - "--checksum"
+      - "--no-times"
+  become: true
+  become_user: "{{ operator_user }}"
+
+- name: github-review stack up
+  community.docker.docker_compose_v2:
+    project_src: "{{ services_root }}/github-review"
+    state: present
+    build: always

@@ -1,0 +1,413 @@
+---
+# ── ci_lane_host (offer CI capacity: scoped Docker socket proxy + fabric sidecar; does not provision the host itself) ──
+- name: Preconditions for a lane host are met
+  # This role does NOT provision the host. base OS and docker are the machine
+  # owner's responsibility (design decision 2) — extracting homelab's base.yml
+  # would make homelab depend on the CI platform for a server baseline it needs
+  # for non-CI services. So the contract is asserted here, loudly, rather than
+  # written in a README where it goes stale and fails silently.
+  ansible.builtin.assert:
+    that:
+      - ci_lane_allowed_dispatchers | default([]) | length > 0
+      - services_root is defined and services_root | length > 0
+      - operator_user is defined and operator_user | length > 0
+    fail_msg: >-
+      ci_lane_host requires ci_lane_allowed_dispatchers, services_root and
+      operator_user. These come from the OPERATOR's inventory (group_vars), not
+      from this collection.
+
+- name: Docker is installed and responding
+  ansible.builtin.command: docker info
+  changed_when: false
+  register: _docker_info
+  failed_when: _docker_info.rc != 0
+  # Deliberately not `ignore_errors` + a nicer message: a lane host without a
+  # working docker cannot run a single job, and every later task here would fail
+  # in a less obvious way.
+
+- name: Shared "homelab" docker network exists
+  community.docker.docker_network:
+    name: homelab
+    state: present
+
+- name: ci-lane-host service dir
+  ansible.builtin.file:
+    path: "{{ services_root }}/ci-lane-host"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+# Owned by the operator (uid 1000) because the runner container runs as uid
+# 1000 and mkdir's its own <lane_id>-work subdir inside this base. Binding a
+# root-owned path would make "Set up job" fail on every lane.
+- name: ci-lane-host lane work dir
+  ansible.builtin.file:
+    path: "{{ ci_lane_work_dir }}"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+# Same uid-1000 reasoning as the work dir, and the same consequence if it is missed:
+# a bind whose host path does not exist is fabricated root-owned by docker, and the
+# runner then fails at `pnpm install` with EACCES rather than anything that names
+# this file. Created unconditionally — a host that binds no pnpm store simply leaves
+# an empty dir, which costs nothing.
+- name: ci-lane-host pnpm store dir
+  ansible.builtin.file:
+    path: "{{ ci_lane_pnpm_store }}"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+# ── The runner image, which the controller can never install itself ──
+# The socket proxy denies IMAGES and BUILD, so the controller can only `run`
+# an image already present here. Build it locally or every admission to this
+# host 404s — see services/ci-lane-host/README.md.
+# Installed collections rewrite every file's mtime, so rsync's default size+mtime
+# comparison reports changed on every deploy. Content comparison alone (checksum
+# flag) detects genuine changes; preventing mtime-only syncs (no-times flag) keeps
+# both required. Measured: with mtime ".f..t...", without mtime "(nothing changed)".
+# Same reason on the other three `synchronize` tasks in this collection.
+- name: github-actions-runner build context synced (Dockerfile + entrypoint.sh)
+  ansible.posix.synchronize:
+    src: "{{ role_path }}/../../services/github-actions-runner/"
+    dest: "{{ services_root }}/github-actions-runner/"
+    rsync_opts:
+      - "--exclude=compose.yml.j2"
+      - "--exclude=tests"
+      - "--exclude=README.md"
+      - "--exclude=__pycache__"
+      - "--exclude=.pytest_cache"
+      - "--checksum"
+      - "--no-times"
+  become: true
+  become_user: "{{ operator_user }}"
+
+# Built WITHOUT the Android SDK. A lane host's allowed_classes is [light, node] (see
+# personal/ci-controller.yml), and NEITHER class sets needs_android_sdk, so it can
+# never be scheduled a job that needs the SDK -- docker_adapter passes
+# SKIP_ANDROID_SDK=1 for both, and the entrypoint never looks for the seed. Node 20
+# and corepack are in a base layer this tag keeps, so node lanes build fine here;
+# only `emulator` would need the full image. Skipping it drops ~10 GB and removes
+# the least reliable
+# part of this build: sdkmanager blocks in a socket read with no timeout, which
+# wedged this play twice with no output at all. Tagged `:light` rather than
+# `:latest` so the two images are never confused for one another; the host's
+# `runner_image` in personal/ci-controller.yml must name this same tag.
+- name: github-actions-runner lane image built locally
+  community.docker.docker_image:
+    name: homelab/github-actions-runner
+    tag: light
+    source: build
+    force_source: true
+    build:
+      path: "{{ services_root }}/github-actions-runner"
+      pull: true
+      args:
+        WITH_ANDROID: "0"
+
+# ── The scoped socket proxy ──
+# No bind address is computed any more. The proxy shares the fabric sidecar's
+# network namespace (services/ci-lane-host/compose.yml), so 2375 listens on the
+# fabric interface and is not published on this host at all.
+#
+# What this replaced: a `tailscale ip -4` read, a guard that stopped the play on
+# an empty result, and a rendered .env carrying CI_LANE_BIND_ADDR -- all of it to
+# ensure the port was never published on 0.0.0.0. Not publishing it is a smaller
+# thing to keep correct than publishing it carefully.
+# Non-secret: the host's own name, which it already knows. It exists because the
+# compose file is copied verbatim rather than templated, and the fabric sidecar
+# must register under the host's name -- personal/ci-controller.yml's
+# docker_endpoint names it, so a node registered under a container ID is
+# unreachable. Not to be confused with the CI_LANE_BIND_ADDR .env this replaced,
+# which carried a value whose failure mode was a wide-open API.
+- name: ci-lane-host fabric hostname rendered
+  ansible.builtin.copy:
+    dest: "{{ services_root }}/ci-lane-host/.env"
+    content: |
+      # Generated by the ordago.ci.ci_lane_host ansible role — do not edit by hand.
+      CI_LANE_HOSTNAME={{ inventory_hostname }}
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0644"
+
+- name: ci-lane-host compose file
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../services/ci-lane-host/compose.yml"
+    dest: "{{ services_root }}/ci-lane-host/compose.yml"
+    mode: "0644"
+
+# ── Restrict 2375, and keep the restriction after a reboot ──
+# What this does and does NOT cover, stated precisely, because the earlier version of
+# this comment claimed more than the rules deliver:
+#
+#   COVERED - traffic forwarded to the proxy container: remote hosts other than the
+#   controller, and lane containers routing out through the docker bridge. That second
+#   one is the threat that matters: PR code in a lane reaching the socket that spawns
+#   lanes would be root on this host.
+#
+#   NOT COVERED - callers inside this host itself, since DOCKER-USER sits on docker's
+#   FORWARD path and locally-originated traffic to a published port does not traverse
+#   it. On a VM that means root on the VM, which already owns docker anyway. The WSL
+#   predecessor's much larger hole -- Windows and the operator's dev distro shared this
+#   host's network namespace, so no address was private to it, not even 127.0.0.1 --
+#   is closed by the VM having its own stack. See ADR 0017, and verify empirically with
+#   the reachability checks in docs/runbook.md rather than trusting this comment.
+#
+# Applied through a systemd unit rather than live iptables calls: the rules are runtime
+# state, and docker restarts the `unless-stopped` proxy on boot. Without a boot-time
+# restore, 2375 comes back unfiltered after every VM start until someone re-runs
+# this play -- an unnoticed hole in the thing being called a trust boundary.
+- name: Resolve each allowed dispatcher's tailnet IPv4
+  ansible.builtin.command: "getent ahostsv4 {{ item }}"
+  register: ci_lane_dispatcher_lookups
+  changed_when: false
+  failed_when: false
+  # Same reason as the bind-address read above: a name lookup changes nothing, and
+  # skipping it under --check makes every dispatcher look unresolvable.
+  check_mode: false
+  loop: "{{ ci_lane_allowed_dispatchers }}"
+
+# One extraction, named once. `getent ahostsv4` prints one line per socket type
+# (STREAM/DGRAM/RAW) all carrying the same address, so take the first field of the
+# first line and de-duplicate.
+- name: Allowed dispatcher addresses
+  ansible.builtin.set_fact:
+    ci_lane_dispatcher_ips: >-
+      {{ ci_lane_dispatcher_lookups.results
+         | map(attribute='stdout_lines') | select() | map('first')
+         | map('regex_search', '^[0-9.]+') | unique | list }}
+
+# A dispatcher that does not resolve contributes nothing to the allowlist, and the
+# play would carry on and publish a proxy that DROPs it -- a lane host silently
+# invisible to its controller, which ADR 0016 then attributes as infra_failure.
+# Fail here instead, naming the one that did not resolve.
+- name: Every allowed dispatcher resolved
+  ansible.builtin.assert:
+    that:
+      - unresolved | length == 0
+      - ci_lane_dispatcher_ips | length == ci_lane_allowed_dispatchers | unique | length
+      # Every entry must look like an address. A length check alone is not enough:
+      # a broken extraction yields [None], which is one entry per dispatcher and
+      # passes the count while producing ALLOWED="None" -- no allow rules at all,
+      # behind a catch-all DROP. That is a lane host cut off from its controller,
+      # and it renders without error. Caught exactly that way on 2026-08-24.
+      - ci_lane_dispatcher_ips | select('none') | list | length == 0
+    fail_msg: >-
+      could not resolve every ci_lane_allowed_dispatchers entry to an IPv4
+      address from this host. Unresolved: {{ unresolved | join(', ') or 'none' }};
+      extracted: {{ ci_lane_dispatcher_ips }}. The lane host reaches them over the
+      tailnet, so check it has joined and that the names in
+      inventory/group_vars/all.yml are right.
+  vars:
+    unresolved: >-
+      {{ ci_lane_dispatcher_lookups.results
+         | selectattr('stdout_lines', 'equalto', [])
+         | map(attribute='item') | list }}
+
+- name: ci-lane-host firewall script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/ci-lane-firewall.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Managed by the ordago.ci.ci_lane_host ansible role. The single definition of the
+      # socket-proxy restriction: run at boot by ci-lane-firewall.service and once at
+      # deploy time. Idempotent -- every rule is deleted before it is added.
+      set -eu
+      ALLOWED="{{ ci_lane_dispatcher_ips | join(' ') }}"
+      PORT=2375
+      # Every rule this script owns carries this prefix, and deletion matches on
+      # the PREFIX rather than on either full note. Matching the full note deletes
+      # only rules whose comment is spelled exactly as the current script spells
+      # it, so renaming a note orphans every rule written under the old name --
+      # observed 2026-08-24, when widening the allow from "the ci-controller" to
+      # "an allowed dispatcher" left the old RETURN in the chain with nothing able
+      # to remove it. The prefix is the script's namespace and does not change.
+      OWNER_TAG="ci-lane-host:"
+      ALLOW_NOTE="ci-lane-host: allow an allowed dispatcher"
+      DENY_NOTE="ci-lane-host: deny every other forwarded reacher"
+
+      # Delete by COMMENT, not by rule spec, and by line number rather than by
+      # matching a spec we reconstruct.
+      #
+      # The previous version deleted `-s "$CONTROLLER"` -- the address it was about
+      # to add. That converges only while the allowlist never changes: a dispatcher
+      # whose tailnet IP moved, or one removed from ci_lane_allowed_dispatchers,
+      # left its RETURN in the chain with nothing to delete it, and the lane host
+      # went on accepting container-create calls from an address no longer trusted.
+      # Matching the comment removes every rule this script owns whatever source it
+      # names, so the allowlist can shrink as well as grow.
+      #
+      # Highest line number first: deleting by index shifts every later index down.
+      iptables -L DOCKER-USER --line-numbers -n \
+        | awk -v o="$OWNER_TAG" 'index($0, o) { print $1 }' \
+        | sort -rn \
+        | while read -r i; do iptables -D DOCKER-USER "$i"; done
+
+      # Insert the deny at the HEAD, then push each allow in front of it. Never
+      # append.
+      #
+      # Appending puts the deny after everything already in DOCKER-USER, and docker
+      # seeds that chain with an unconditional `-j RETURN` on some versions. Behind
+      # such a rule the deny is unreachable and 2375 is open to every forwarded
+      # reacher -- while `iptables -L` still shows both rules present and in the
+      # right relative order, so it looks correct in exactly the place someone would
+      # check. This host has no tail RETURN today (verified 2026-08-24), which is
+      # precisely why the append survived; a docker upgrade that adds one would open
+      # the boundary silently. Inserting both makes the pair's position independent
+      # of whatever else the chain holds.
+      iptables -I DOCKER-USER 1 -p tcp --dport "$PORT" -j DROP \
+        -m comment --comment "$DENY_NOTE"
+      for ip in $ALLOWED; do
+        iptables -I DOCKER-USER 1 -p tcp --dport "$PORT" -s "$ip" -j RETURN \
+          -m comment --comment "$ALLOW_NOTE"
+      done
+
+- name: ci-lane-host firewall unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-lane-firewall.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Restrict the CI lane socket proxy to the allowed dispatchers
+      # After docker: docker flushes and rebuilds its chains on start, so rules
+      # inserted before it would be lost. DOCKER-USER must exist for this to work.
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/ci-lane-firewall.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: ci-lane-host firewall enabled and applied now
+  ansible.builtin.systemd:
+    name: ci-lane-firewall.service
+    daemon_reload: true
+    enabled: true
+    state: restarted
+
+# ── Bring the proxy back after a reboot ──
+# The proxy publishes on the host's TAILNET address, which does not exist yet when
+# docker starts. Observed 2026-08-09, after the VM was resized and restarted:
+#
+#   failed to bind host port 100.117.169.88:2375/tcp: cannot assign requested address
+#
+# `restart: unless-stopped` retries, backs off, gives up — and the host stays
+# silently dead. It answers ping at the tailnet layer, so nothing looks broken;
+# it just never appears in `make ci-status` as anything but UNHEALTHY. Docker's
+# restart policy cannot express "after tailscaled has an address", so this unit does.
+#
+# Starts the compose stack at boot. It no longer waits for a tailnet address:
+# the proxy binds nothing on this host, and the fabric sidecar authenticates
+# itself from its own state volume. What the unit still earns its keep for is
+# restoring the iptables rules below, which are runtime state docker does not
+# recreate.
+- name: ci-lane-host proxy start script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/ci-lane-proxy-start.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Managed by the ordago.ci.ci_lane_host ansible role.
+      set -eu
+      docker compose --project-directory {{ services_root }}/ci-lane-host up -d
+
+- name: ci-lane-host proxy boot unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-lane-proxy.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Start the CI lane socket proxy once the tailnet address exists
+      # Both are required, and neither implies the other: compose needs docker, and
+      # the published bind address needs tailscaled to have finished coming up.
+      After=docker.service tailscaled.service
+      Requires=docker.service
+      Wants=tailscaled.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/ci-lane-proxy-start.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: ci-lane-host proxy unit enabled
+  ansible.builtin.systemd:
+    name: ci-lane-proxy.service
+    daemon_reload: true
+    enabled: true
+
+# `state: present` at deploy time; the unit above owns the boot path. Running the
+# play is also how a proxy broken by the boot race gets restored.
+- name: ci-lane-host stack up
+  community.docker.docker_compose_v2:
+    project_src: "{{ services_root }}/ci-lane-host"
+    state: present
+
+# ── Disk reclamation ──
+# A BACKSTOP, and no longer the only cleanup this host gets. Lane hosts set
+# work_dir_mode=volume (ADR 0023), so a lane's workspace is an anonymous docker
+# volume that dockerd drops with the container — cleanup that survives SIGKILL, an
+# OOM kill and a dockerd crash, none of which run the entrypoint's EXIT trap.
+#
+# This timer used to be load-bearing, because the controller deletes a lane's work
+# dir only on its OWN filesystem (controller.py skips remote hosts, since it cannot
+# see their disks). It first ran an `-mtime +1` find, and requiring a work dir to be
+# a day old let the 2026-08-09 burst (four PRs, each fanning out to seven services
+# across two workflows) fill the 40 GB VM inside that window and ENOSPC every job.
+# Keying on lane liveness fixed the symptom; volumes removed the need.
+#
+# Kept because it still has work no other mechanism does: reclaiming volumes orphaned
+# by a daemon crash that never ran auto_remove, and clearing work dirs left by a host
+# still in bind mode. Runs every 15 minutes. Do NOT let it become load-bearing again.
+- name: ci-lane-host prune script
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../services/ci-lane-host/prune-lanes.sh"
+    dest: /usr/local/bin/ci-lane-prune
+    mode: "0755"
+
+- name: ci-lane-host work-dir prune service unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-lane-prune-workdirs.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Reclaim CI lane disk (backstop; lanes self-clean via volumes)
+
+      [Service]
+      Type=oneshot
+      Environment=CI_LANE_WORK_DIR={{ ci_lane_work_dir }}
+      ExecStart=/usr/local/bin/ci-lane-prune
+
+- name: ci-lane-host work-dir prune timer unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-lane-prune-workdirs.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Reclaim CI lane disk every 15 minutes
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=15min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+- name: ci-lane-host work-dir prune timer enabled
+  ansible.builtin.systemd:
+    name: ci-lane-prune-workdirs.timer
+    daemon_reload: true
+    enabled: true
+    state: started

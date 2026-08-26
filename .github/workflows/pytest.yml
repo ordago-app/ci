@@ -54,3 +54,18 @@ jobs:
       - run: uv python install 3.12
       - run: uv run --no-project --with pytest --with jinja2 --with pyyaml
                pytest services/github-actions-runner/tests -q
+
+  # scripts/tests has no pyproject.toml either — same ad-hoc treatment as
+  # template-tests. This was never wired into any matrix, so
+  # test_validate_pool_config.py was not actually a gate.
+  scripts-tests:
+    name: scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv run --no-project --with pytest --with pydantic --with pyyaml
+               pytest scripts/tests -q

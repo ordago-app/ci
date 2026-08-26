@@ -1,0 +1,28 @@
+name: ansible
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ansible-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  collection:
+    name: builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+      - run: uv tool install ansible-core
+      # Proves the collection is installable at all. A syntax error here is the
+      # difference between a consumer's deploy working and failing with an
+      # unhelpful "role not found".
+      - run: ansible-galaxy collection build --output-path /tmp/cb
+      - run: ansible-galaxy collection install /tmp/cb/ordago-ci-*.tar.gz -p /tmp/ci

@@ -1,0 +1,206 @@
+---
+# ── ci_controller (dynamic ephemeral runner controller + scoped socket proxy) ──
+- name: Preconditions for a dispatcher host are met
+  ansible.builtin.assert:
+    that:
+      - services_root is defined and services_root | length > 0
+      - personal_root is defined and personal_root | length > 0
+      - operator_user is defined and operator_user | length > 0
+    fail_msg: >-
+      ci_controller requires services_root, personal_root and operator_user, which
+      come from the OPERATOR's inventory, not from this collection.
+
+- name: This operator has pointed ci_controller at their own pool config
+  ansible.builtin.assert:
+    that:
+      - ci_controller_pool_config is defined and ci_controller_pool_config | length > 0
+      - ci_controller_repos_config is defined and ci_controller_repos_config | length > 0
+    fail_msg: >-
+      ci_controller_pool_config and ci_controller_repos_config must point at this
+      operator's own ci-controller.yml and repos.yml. This collection deliberately
+      does not ship one operator's pool config for every other operator — set both
+      in your own inventory.
+
+- name: repos.yml is already in place for this stack to mount
+  # repos.yml is placed OUTSIDE the ported range in the source playbook (a
+  # generic loop that renders every operator's repo map, not part of this
+  # extraction) — this role correctly does not place it either. But
+  # compose.yml mounts it read-only, and an absent bind-mount source makes
+  # Docker fabricate a root-owned directory at that path instead of failing:
+  # the container then dies obscurely inside ControllerConfig.load. Fail
+  # loudly here instead.
+  ansible.builtin.stat:
+    path: "{{ ci_controller_repos_config }}"
+  register: _ci_controller_repos_config
+
+- name: This operator's repos.yml exists at ci_controller_repos_config
+  ansible.builtin.assert:
+    that:
+      - _ci_controller_repos_config.stat.exists
+      - not _ci_controller_repos_config.stat.isdir
+    fail_msg: >-
+      ci_controller_repos_config ({{ ci_controller_repos_config }}) must already
+      exist as a file on this host before this role runs — this collection does
+      not place it (it is out of the ported range). See compose.yml's
+      /opt/personal/repos.yml mount.
+
+- name: The secrets this stack needs have already been rendered
+  # This role receives no secret VALUES, only the directory they were rendered
+  # into. The operator renders them from their own store before invoking this
+  # role — exactly as services.yml does today, in a generic loop that is not part
+  # of the ported range. Taking a path instead of a value is the strongest form of
+  # design decision 5: the role cannot leak, log or assume anything about a
+  # credential it never receives.
+  ansible.builtin.stat:
+    path: "{{ ci_controller_secrets_dir }}/{{ item }}"
+  register: _secret_files
+  failed_when: not _secret_files.stat.exists
+  loop:
+    - ci-fabric.env
+  loop_control:
+    label: "{{ item }}"
+
+- name: ci-controller service dir
+  ansible.builtin.file:
+    path: "{{ services_root }}/ci-controller"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+- name: ci-controller metrics state dir
+  ansible.builtin.file:
+    path: /opt/personal/state/ci-controller
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+- name: ci-controller lane work dirs + shared cache dirs exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+  loop:
+    - /mnt/ci-ssd/ci-controller
+    - /opt/personal/github-actions/ci-controller
+    # Caches live on the NVMe (/mnt/ci-ssd) alongside the lane work dirs so pnpm
+    # can hardlink from the store into node_modules — a cross-fs store would force
+    # slow full copies and balloon disk use. (Moved off the HDD with the NVMe
+    # upgrade; must stay on the same filesystem as the node/light work dirs.)
+    - /mnt/ci-ssd/caches/pnpm-store
+    - /mnt/ci-ssd/caches/gradle
+    - /mnt/ci-ssd/caches/android-sdk
+
+- name: place ci-controller.yml on host
+  ansible.builtin.copy:
+    src: "{{ ci_controller_pool_config }}"
+    dest: "{{ personal_root }}/ci-controller.yml"
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0640"
+
+- name: ci-controller compose file
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../services/ci-controller/compose.yml"
+    dest: "{{ services_root }}/ci-controller/compose.yml"
+    mode: "0644"
+
+# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
+- name: ci-controller build context (Dockerfile + src/ + pyproject.toml + uv.lock)
+  ansible.posix.synchronize:
+    src: "{{ role_path }}/../../services/ci-controller/"
+    dest: "{{ services_root }}/ci-controller/"
+    rsync_opts:
+      - "--exclude=tests"
+      - "--exclude=__pycache__"
+      - "--exclude=.venv"
+      - "--exclude=.pytest_cache"
+      - "--checksum"
+      - "--no-times"
+  become: true
+  become_user: "{{ operator_user }}"
+
+- name: ci-controller stack up
+  community.docker.docker_compose_v2:
+    project_src: "{{ services_root }}/ci-controller"
+    state: present
+    build: always
+
+# Backstop for the in-controller reap cleanup: the controller deletes a lane's
+# work dir when it reaps the lane, but a lane that dies while the controller is
+# down (or pre-existing cruft) is never reaped, so its dir leaks. This daily
+# timer prunes any *-work dir under the work_dirs bases untouched for >1 day.
+# Paths mirror work_dirs.{ssd,hdd} in personal/ci-controller.yml.
+- name: ci-controller work-dir prune service unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-controller-prune-workdirs.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Prune stale ci-controller lane work dirs (reap-cleanup backstop)
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/find /mnt/ci-ssd/ci-controller /opt/personal/github-actions/ci-controller -mindepth 1 -maxdepth 1 -type d -name '*-work' -mtime +1 -exec rm -rf {} +
+  become: true
+
+- name: ci-controller work-dir prune timer unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-controller-prune-workdirs.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Daily prune of stale ci-controller lane work dirs
+
+      [Timer]
+      OnCalendar=daily
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+  become: true
+
+- name: ci-controller work-dir prune timer enabled
+  ansible.builtin.systemd:
+    name: ci-controller-prune-workdirs.timer
+    daemon_reload: true
+    enabled: true
+    state: started
+  become: true
+
+# The controller spawns ephemeral lanes from homelab/github-actions-runner:latest,
+# so it OWNS that image's existence — decoupled from the static runner pool. Once
+# the homelab pool is retired, the pool's compose has no services and can no longer
+# build the image; these two tasks keep a build path that needs no static runner.
+# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
+- name: ci-controller runner image build context synced (Dockerfile + entrypoint.sh)
+  ansible.posix.synchronize:
+    src: "{{ role_path }}/../../services/github-actions-runner/"
+    dest: "{{ services_root }}/ci-controller/runner-image/"
+    rsync_opts:
+      - "--exclude=compose.yml.j2"
+      - "--exclude=tests"
+      - "--exclude=README.md"
+      - "--exclude=__pycache__"
+      - "--exclude=.pytest_cache"
+      - "--checksum"
+      - "--no-times"
+  become: true
+  become_user: "{{ operator_user }}"
+
+# Builds only if the image is ABSENT (force_source false) so routine deploys are
+# a no-op. To rebuild after a Dockerfile/entrypoint change (the ~hours Android-SDK
+# build), pass -e ci_controller_rebuild_runner_image=true.
+- name: ci-controller ensures runner image exists (build if absent)
+  community.docker.docker_image:
+    name: homelab/github-actions-runner
+    tag: latest
+    source: build
+    force_source: "{{ ci_controller_rebuild_runner_image | default(false) | bool }}"
+    state: present
+    build:
+      path: "{{ services_root }}/ci-controller/runner-image"
+      pull: false

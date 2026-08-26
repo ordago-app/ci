@@ -1,0 +1,35 @@
+namespace: ordago
+name: ci
+version: 1.0.0
+readme: README.md
+authors:
+  - "Álvaro Francisco Gil"
+description: Federated CI platform — dispatcher, scheduler, runner image, lane-host stack
+license_file: LICENSE
+repository: https://github.com/ordago-app/ci
+# services/ is NOT ignored on purpose: roles reference compose files and build
+# contexts there as {{ role_path }}/../../services/..., which keeps ONE copy of
+# each. Verified 2026-08-26 that a collection preserves non-standard top-level
+# directories and that role_path-relative reads work from an installed collection.
+build_ignore:
+  - docs
+  - .github
+  - .gitleaks.toml
+  - "*.tar.gz"
+  - "__pycache__"
+  # build_ignore patterns are matched with fnmatch against the path relative
+  # to the collection root (see ansible.galaxy.collection._build_files_manifest_walk),
+  # NOT against a bare basename like __pycache__ gets for free via ansible-galaxy's
+  # own hardcoded ignore-dirs set. A leading "*" is required so these still match
+  # nested dirs such as services/ci-controller/.venv, not just a top-level one.
+  - "*.ansible"
+  - "*.venv"
+  - "*.pytest_cache"
+  - "*.ruff_cache"
+  - "*.superpowers"
+# The roles' modules come from these collections (ansible.posix.synchronize;
+# community.docker.docker_network, docker_image, docker_compose_v2). A
+# consumer who installs this collection gets them automatically.
+dependencies:
+  community.docker: ">=3.10.0"
+  ansible.posix: ">=1.5.0"
