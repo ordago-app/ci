@@ -18,9 +18,10 @@ The division that is actually correct:
 - **Each consumer proves their own config renders** against the template they
   have pinned. homelab keeps its copy for exactly that.
 
-The fixture-based test is not written yet. Until it is, `compose.yml.j2` is
-covered only downstream, which is a real gap — see the CI platform extraction
-plan, and do not mistake a green pipeline here for the template being tested.
+`test_compose_render_fixture.py` is that fixture-based test: it renders
+`compose.yml.j2` against `fixtures/pool.yml` and `fixtures/repos.yml` — a pool
+that belongs to no real operator — and asserts on the template's own contract
+(service naming, KVM device wiring, disabled-runner skipping).
 
 `test_entrypoint_token.py` stayed: its 15 tests assert on `entrypoint.sh`'s own
 token handling and read no operator config.

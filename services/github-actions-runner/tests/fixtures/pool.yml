@@ -1,0 +1,20 @@
+# A fixture pool, deliberately NOT any real operator's. Two runners is the
+# minimum that exercises both archetypes: a light runner and a KVM one.
+github_actions_runners:
+  project: demo
+  secret_env: /opt/fixture/secrets/runner.env
+  runners:
+    - name: fixture-light
+      enabled: true
+      labels: [fixture-ci]
+      volumes:
+        - host: /tmp/fixture-ssd
+          container: /runner-work
+    - name: fixture-heavy
+      enabled: true
+      labels: [fixture-e2e, fixture-ci]
+      kvm: true
+      group_add: ["994"]
+      volumes:
+        - host: /tmp/fixture-hdd
+          container: /runner-work
