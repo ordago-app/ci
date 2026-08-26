@@ -31,11 +31,20 @@ def main(argv: list[str]) -> int:
     # requiring the caller to rearrange their repo.
     with tempfile.TemporaryDirectory() as tmp:
         staged = Path(tmp) / config.name
-        shutil.copy(config, staged)
-        shutil.copy(registry, Path(tmp) / "repos.yml")
         try:
+            shutil.copy(config, staged)
+            shutil.copy(registry, Path(tmp) / "repos.yml")
             ControllerConfig.load(staged)
         except Exception as exc:
+            # Covers both a missing/unreadable input file (OSError from the
+            # copies) and a schema-invalid config (ConfigError from load): the
+            # caller only ever sees this one clean, single-line contract, never
+            # a traceback. A missing path is treated the same as an invalid
+            # config (exit 1, not the exit-2 usage error below) because from
+            # the caller's side both mean "this config cannot be proven valid
+            # right now" and should fail a CI gate the same way; exit 2 is
+            # reserved for malformed invocation (wrong argument count), which
+            # is a distinct, earlier-stage error.
             print(f"invalid pool config {config}: {exc}", file=sys.stderr)
             return 1
     return 0

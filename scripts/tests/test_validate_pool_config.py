@@ -67,6 +67,32 @@ def test_malformed_yaml_is_rejected_not_crashed(tmp_path: Path) -> None:
     assert result.stderr != ""
 
 
+def test_a_missing_config_file_is_rejected_cleanly_not_crashed(tmp_path: Path) -> None:
+    (tmp_path / "repos.yml").write_text(REGISTRY)
+    missing = tmp_path / "does-not-exist.yml"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(missing), str(tmp_path / "repos.yml")],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert str(missing) in result.stderr
+
+
+def test_a_missing_registry_file_is_rejected_cleanly_not_crashed(tmp_path: Path) -> None:
+    (tmp_path / "pool.yml").write_text(VALID)
+    missing = tmp_path / "no-repos.yml"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(tmp_path / "pool.yml"), str(missing)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert str(missing) in result.stderr
+
+
 def test_wrong_argument_count_exits_two_with_usage(tmp_path: Path) -> None:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), str(tmp_path / "pool.yml")],
