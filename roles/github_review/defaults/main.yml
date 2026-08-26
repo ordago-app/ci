@@ -1,0 +1,4 @@
+---
+# No secrets directory var here, unlike ci_controller. This stack holds no
+# credential of its own — see tasks/main.yml for why — so there is nothing to
+# point at a rendered-secrets directory.
