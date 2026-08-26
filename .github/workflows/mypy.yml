@@ -1,0 +1,31 @@
+name: mypy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: mypy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  mypy:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ci-controller, github-review]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+      # Pinned so a future mypy release cannot silently re-break CI.
+      - working-directory: services/${{ matrix.service }}
+        run: |
+          uv pip install mypy==2.1.0
+          uv run mypy --config-file=$GITHUB_WORKSPACE/pyproject.toml src

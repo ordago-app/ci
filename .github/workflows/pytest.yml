@@ -1,0 +1,32 @@
+name: pytest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pytest-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # No changed-services selector here, unlike homelab. That selector exists to
+  # save CI *lanes* on a busy self-hosted pool; these jobs run on GitHub-hosted
+  # runners and cost none. Porting it now would be dead complexity — add it if
+  # and when this repo moves onto the pool. (homelab ADR 0022 has the rationale.)
+  pytest:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ci-controller, github-actions-runner, github-review]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+      - working-directory: services/${{ matrix.service }}
+        run: uv run pytest -q

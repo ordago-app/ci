@@ -1,0 +1,52 @@
+# Repo-wide developer tooling config. Not a Python package — services are.
+# Ruff and mypy auto-discover this when walking up from a service file.
+#
+# Carried from powervaro/homelab at extraction so that a service moved here
+# lints identically to how it linted before the move. Diverge deliberately,
+# not by drift.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  # `class X(str, Enum)` is intentional across services. Migrating to
+  # `enum.StrEnum` changes `str(member)` semantics (value vs "Class.MEMBER"),
+  # which call sites and serializers rely on — keep the explicit str mix-in.
+  "UP042",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI/Starlette DI markers are designed to be *called* in argument
+# defaults. B008 is a false positive for them.
+extend-immutable-calls = [
+  "fastapi.Depends",
+  "fastapi.Query",
+  "fastapi.Header",
+  "fastapi.Path",
+  "fastapi.Cookie",
+  "fastapi.Body",
+  "fastapi.Form",
+  "fastapi.File",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+# Third-party libs that ship no bundled type stubs (no py.typed).
+module = ["yaml", "docker", "docker.*"]
+ignore_missing_imports = true

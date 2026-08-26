@@ -1,0 +1,35 @@
+name: ruff
+
+# GitHub-hosted, deliberately. This repo's own CI must not depend on the pool
+# it implements: a change that breaks the dispatcher would otherwise take out
+# the runners that would have caught it. Revisit once the pool has two
+# independent operators, not before.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ruff-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check .
+
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff format --check .
