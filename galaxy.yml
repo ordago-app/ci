@@ -22,6 +22,7 @@ build_ignore:
   # NOT against a bare basename like __pycache__ gets for free via ansible-galaxy's
   # own hardcoded ignore-dirs set. A leading "*" is required so these still match
   # nested dirs such as services/ci-controller/.venv, not just a top-level one.
+  - "*.ansible"
   - "*.venv"
   - "*.pytest_cache"
   - "*.ruff_cache"
