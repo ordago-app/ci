@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: ci_controller
+  description: Deploy the dispatcher — ephemeral runner controller, scheduler, and fabric sidecar
+  license: MIT
+  min_ansible_version: "2.15"
+dependencies: []

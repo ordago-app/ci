@@ -1,0 +1,4 @@
+---
+# Where the operator rendered this stack's env files. compose reads them via
+# `env_file`. A second operator whose store lands elsewhere overrides this.
+ci_controller_secrets_dir: /opt/personal/secrets
