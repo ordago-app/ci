@@ -1,4 +1,5 @@
 ---
+# ── ci_controller: dynamic ephemeral runner controller + scoped socket proxy ──
 - name: Preconditions for a dispatcher host are met
   ansible.builtin.assert:
     that:
