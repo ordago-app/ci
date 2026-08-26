@@ -2,3 +2,12 @@
 # No secrets directory var here, unlike ci_controller. This stack holds no
 # credential of its own — see tasks/main.yml for why — so there is nothing to
 # point at a rendered-secrets directory.
+
+# No default: this collection deliberately ships no pool config for any
+# operator. Point this at YOUR OWN agent-review.yml (see README.md).
+# github_review_config: /path/to/your/agent-review.yml
+
+# repos.yml is rendered and placed outside this collection's ported range but
+# compose.yml mounts it read-only, so it must already exist on the target
+# host before this role runs.
+github_review_repos_config: "{{ personal_root }}/repos.yml"

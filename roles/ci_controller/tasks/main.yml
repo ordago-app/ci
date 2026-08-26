@@ -10,6 +10,40 @@
       ci_controller requires services_root, personal_root and operator_user, which
       come from the OPERATOR's inventory, not from this collection.
 
+- name: This operator has pointed ci_controller at their own pool config
+  ansible.builtin.assert:
+    that:
+      - ci_controller_pool_config is defined and ci_controller_pool_config | length > 0
+      - ci_controller_repos_config is defined and ci_controller_repos_config | length > 0
+    fail_msg: >-
+      ci_controller_pool_config and ci_controller_repos_config must point at this
+      operator's own ci-controller.yml and repos.yml. This collection deliberately
+      does not ship one operator's pool config for every other operator — set both
+      in your own inventory.
+
+- name: repos.yml is already in place for this stack to mount
+  # repos.yml is placed OUTSIDE the ported range in the source playbook (a
+  # generic loop that renders every operator's repo map, not part of this
+  # extraction) — this role correctly does not place it either. But
+  # compose.yml mounts it read-only, and an absent bind-mount source makes
+  # Docker fabricate a root-owned directory at that path instead of failing:
+  # the container then dies obscurely inside ControllerConfig.load. Fail
+  # loudly here instead.
+  ansible.builtin.stat:
+    path: "{{ ci_controller_repos_config }}"
+  register: _ci_controller_repos_config
+
+- name: This operator's repos.yml exists at ci_controller_repos_config
+  ansible.builtin.assert:
+    that:
+      - _ci_controller_repos_config.stat.exists
+      - not _ci_controller_repos_config.stat.isdir
+    fail_msg: >-
+      ci_controller_repos_config ({{ ci_controller_repos_config }}) must already
+      exist as a file on this host before this role runs — this collection does
+      not place it (it is out of the ported range). See compose.yml's
+      /opt/personal/repos.yml mount.
+
 - name: The secrets this stack needs have already been rendered
   # This role receives no secret VALUES, only the directory they were rendered
   # into. The operator renders them from their own store before invoking this
@@ -62,7 +96,7 @@
 
 - name: place ci-controller.yml on host
   ansible.builtin.copy:
-    src: "{{ role_path }}/../../personal/ci-controller.yml"
+    src: "{{ ci_controller_pool_config }}"
     dest: "{{ personal_root }}/ci-controller.yml"
     owner: "{{ operator_user }}"
     group: "{{ operator_user }}"

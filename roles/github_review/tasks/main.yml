@@ -10,6 +10,39 @@
       github_review requires services_root, personal_root and operator_user, which
       come from the OPERATOR's inventory, not from this collection.
 
+- name: This operator has pointed github_review at their own config
+  ansible.builtin.assert:
+    that:
+      - github_review_config is defined and github_review_config | length > 0
+      - github_review_repos_config is defined and github_review_repos_config | length > 0
+    fail_msg: >-
+      github_review_config and github_review_repos_config must point at this
+      operator's own agent-review.yml and repos.yml. This collection deliberately
+      does not ship one operator's pool config for every other operator — set both
+      in your own inventory.
+
+- name: repos.yml is already in place for this stack to mount
+  # repos.yml is placed OUTSIDE the ported range in the source playbook (a
+  # generic loop that renders every operator's repo map, not part of this
+  # extraction) — this role correctly does not place it either. But
+  # compose.yml mounts it read-only, and an absent bind-mount source makes
+  # Docker fabricate a root-owned directory at that path instead of failing:
+  # the container then dies obscurely. Fail loudly here instead.
+  ansible.builtin.stat:
+    path: "{{ github_review_repos_config }}"
+  register: _github_review_repos_config
+
+- name: This operator's repos.yml exists at github_review_repos_config
+  ansible.builtin.assert:
+    that:
+      - _github_review_repos_config.stat.exists
+      - not _github_review_repos_config.stat.isdir
+    fail_msg: >-
+      github_review_repos_config ({{ github_review_repos_config }}) must already
+      exist as a file on this host before this role runs — this collection does
+      not place it (it is out of the ported range). See compose.yml's
+      /opt/personal/repos.yml mount.
+
 # DELIBERATELY no secrets-file assert here, unlike ci_controller. Ruling 7:
 # services/github-review/compose.yml declares no `env_file:` at all — only
 # three plain, non-secret environment variables (AGENT_REVIEW_CONFIG,
@@ -39,7 +72,7 @@
 
 - name: place agent-review.yml on host
   ansible.builtin.copy:
-    src: "{{ role_path }}/../../personal/agent-review.yml"
+    src: "{{ github_review_config }}"
     dest: "{{ personal_root }}/agent-review.yml"
     owner: "{{ operator_user }}"
     group: "{{ operator_user }}"

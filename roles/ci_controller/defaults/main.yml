@@ -1,4 +1,23 @@
 ---
 # Where the operator rendered this stack's env files. compose reads them via
-# `env_file`. A second operator whose store lands elsewhere overrides this.
-ci_controller_secrets_dir: /opt/personal/secrets
+# `env_file`. This tracks personal_root, but the path is actually FIXED by
+# services/ci-controller/compose.yml, which hardcodes
+# /opt/personal/secrets/ci-fabric.env and
+# /opt/personal/secrets/github-actions-runner.env in its `env_file:` entries.
+# Overriding this variable only moves where the precondition assert looks —
+# the container still reads the hardcoded path and fails at start if the
+# files aren't there too. Truly relocating the secrets dir requires
+# templating compose.yml, which this collection does not do; don't treat this
+# as a working relocation knob until that's done.
+ci_controller_secrets_dir: "{{ personal_root }}/secrets"
+
+# No default: this collection deliberately ships no pool config for any
+# operator. Point this at YOUR OWN ci-controller.yml (see README.md).
+# ci_controller_pool_config: /path/to/your/ci-controller.yml
+
+# repos.yml is rendered and placed outside this collection's ported range
+# (out of scope for this extraction) but compose.yml mounts it read-only, so
+# it must already exist on the target host before this role runs. Tracks
+# personal_root the same way ci_controller_secrets_dir does, but compose.yml
+# hardcodes /opt/personal/repos.yml today — see the note above.
+ci_controller_repos_config: "{{ personal_root }}/repos.yml"
