@@ -1,0 +1,18 @@
+namespace: ordago
+name: ci
+version: 1.0.0
+readme: README.md
+authors:
+  - "Álvaro Francisco Gil"
+description: Federated CI platform — dispatcher, scheduler, runner image, lane-host stack
+license_file: LICENSE
+repository: https://github.com/ordago-app/ci
+# services/ is NOT ignored on purpose: roles reference compose files and build
+# contexts there as {{ role_path }}/../../services/..., which keeps ONE copy of
+# each. Verified 2026-08-26 that a collection preserves non-standard top-level
+# directories and that role_path-relative reads work from an installed collection.
+build_ignore:
+  - docs
+  - .github
+  - .gitleaks.toml
+  - "*.tar.gz"
