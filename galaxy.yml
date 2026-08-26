@@ -16,6 +16,7 @@ build_ignore:
   - .github
   - .gitleaks.toml
   - "*.tar.gz"
+  - "__pycache__"
 # The roles' modules come from these collections (ansible.posix.synchronize;
 # community.docker.docker_network, docker_image, docker_compose_v2). A
 # consumer who installs this collection gets them automatically.
