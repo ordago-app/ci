@@ -132,3 +132,21 @@ def test_no_service_combines_expose_with_a_container_network_mode():
             assert "ports" not in service, (
                 f"{name}: published ports belong to the namespace owner, not the sharer"
             )
+
+
+def test_fabric_sidecar_resolves_both_tailnet_and_public_names():
+    """The dispatcher needs BOTH, and MagicDNS alone gives only one.
+
+    It polls api.github.com and it dials lane hosts by tailnet FQDN. This tailnet
+    has no global nameservers, so 100.100.100.100 answers tailnet names and fails
+    everything else -- which on 2026-08-26 took all CI down with every container
+    Up and /healthz returning 200, because no repo could be polled at all.
+
+    Order matters: MagicDNS first so tailnet names resolve, a public resolver
+    second to catch the SERVFAIL for everything else."""
+    dns = _compose()["services"]["ci-fabric"]["dns"]
+    assert dns[0] == "100.100.100.100", "MagicDNS must be first or tailnet FQDNs fail"
+    assert len(dns) > 1, (
+        "a public resolver must follow MagicDNS, or the dispatcher cannot reach GitHub"
+    )
+    assert not dns[1].startswith("100.100."), "the second entry must be a PUBLIC resolver"

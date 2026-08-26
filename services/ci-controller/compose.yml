@@ -116,7 +116,21 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     dns:
+      # MagicDNS FIRST so tailnet FQDNs resolve, and a PUBLIC resolver second so
+      # everything else still does. Both are required and the order matters.
+      #
+      # MagicDNS alone took all CI down on 2026-08-26: this tailnet has no global
+      # nameservers configured, so 100.100.100.100 answers tailnet names and fails
+      # everything else. The dispatcher could not resolve api.github.com --
+      #   poll failed for ordago-app/ordago-apps: [Errno -3] Temporary failure in
+      #   name resolution
+      # -- so no repo was polled and no job was ever picked up. Nothing looked
+      # broken: every container was Up and /healthz returned 200.
+      #
+      # SERVFAIL from the first resolver fails over to the second, which is why
+      # this works where a single entry did not.
       - 100.100.100.100
+      - 1.1.1.1
     volumes:
       - ci-fabric-state:/var/lib/tailscale
     networks:
