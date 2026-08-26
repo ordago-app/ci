@@ -17,16 +17,40 @@ jobs:
   # No changed-services selector here, unlike homelab. That selector exists to
   # save CI *lanes* on a busy self-hosted pool; these jobs run on GitHub-hosted
   # runners and cost none. Porting it now would be dead complexity — add it if
-  # and when this repo moves onto the pool. (homelab ADR 0022 has the rationale.)
+  # and when this repo moves onto the pool. (See ADR 0022 for the rationale.)
   pytest:
     name: ${{ matrix.service }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: [ci-controller, github-actions-runner, github-review]
+        service: [ci-controller, github-review]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "services/${{ matrix.service }}/uv.lock"
+      - run: uv python install 3.12
+      # `uv run pytest` alone does NOT install the dev extra, so pytest is
+      # simply absent and the step fails with a bare "No such file or
+      # directory". Sync first.
+      - working-directory: services/${{ matrix.service }}
+        run: uv sync --extra dev
       - working-directory: services/${{ matrix.service }}
         run: uv run pytest -q
+
+  # github-actions-runner has tests but no pyproject.toml — they assert on a
+  # Jinja compose template and a shell entrypoint, so there is no package to
+  # sync. It cannot join the matrix above; it gets an ad-hoc environment.
+  template-tests:
+    name: runner image templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv run --no-project --with pytest --with jinja2 --with pyyaml
+               pytest services/github-actions-runner/tests -q
