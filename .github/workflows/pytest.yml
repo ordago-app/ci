@@ -69,3 +69,18 @@ jobs:
       - run: uv python install 3.12
       - run: uv run --no-project --with pytest --with pydantic --with pyyaml
                pytest scripts/tests -q
+
+  # roles/tests has no pyproject.toml either — same ad-hoc treatment as
+  # template-tests and scripts-tests. Without a job here it would not
+  # actually be a gate.
+  roles-tests:
+    name: roles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv run --no-project --with pytest --with pyyaml
+               pytest roles/tests -q
