@@ -1,4 +1,5 @@
 ---
+# ── github-review (agentic PR reviews; reuses claude-router + codex images) ──
 - name: Preconditions for a dispatcher host are met
   ansible.builtin.assert:
     that:
@@ -20,7 +21,6 @@
 # asserts on no secret file. Do not restore a stat-loop assert here without
 # first re-checking services/github-review/compose.yml for a new env_file.
 
-# ── github-review (agentic PR reviews; reuses claude-router + codex images) ──
 - name: github-review service dir
   ansible.builtin.file:
     path: "{{ services_root }}/github-review"

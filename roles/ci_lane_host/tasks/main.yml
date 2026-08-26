@@ -1,4 +1,5 @@
 ---
+# ── ci_lane_host (offer CI capacity: scoped Docker socket proxy + fabric sidecar; does not provision the host itself) ──
 - name: Preconditions for a lane host are met
   # This role does NOT provision the host. base OS and docker are the machine
   # owner's responsibility (design decision 2) — extracting homelab's base.yml
