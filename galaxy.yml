@@ -17,10 +17,15 @@ build_ignore:
   - .gitleaks.toml
   - "*.tar.gz"
   - "__pycache__"
-  - ".venv"
-  - ".pytest_cache"
-  - ".ruff_cache"
-  - ".superpowers"
+  # build_ignore patterns are matched with fnmatch against the path relative
+  # to the collection root (see ansible.galaxy.collection._build_files_manifest_walk),
+  # NOT against a bare basename like __pycache__ gets for free via ansible-galaxy's
+  # own hardcoded ignore-dirs set. A leading "*" is required so these still match
+  # nested dirs such as services/ci-controller/.venv, not just a top-level one.
+  - "*.venv"
+  - "*.pytest_cache"
+  - "*.ruff_cache"
+  - "*.superpowers"
 # The roles' modules come from these collections (ansible.posix.synchronize;
 # community.docker.docker_network, docker_image, docker_compose_v2). A
 # consumer who installs this collection gets them automatically.
