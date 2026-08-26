@@ -234,28 +234,6 @@ OPERATOR_CONFIG = Path(__file__).resolve().parents[3] / "personal" / "ci-control
 REPO_REGISTRY = Path(__file__).resolve().parents[3] / "personal" / "repos.yml"
 
 
-def test_operator_config_loads() -> None:
-    # personal/ci-controller.yml is copied to the host verbatim and only parsed at
-    # container start, so a schema error there surfaces as a crash-looping controller
-    # after deploy rather than as a failing check. Parse it here instead.
-    cfg = ControllerConfig.load(OPERATOR_CONFIG)
-    assert cfg.ram_budget_mb > 0
-    assert cfg.default_class in cfg.classes
-
-
-def test_operator_config_never_underprices_a_mapped_label() -> None:
-    # class_for falls through to default_class for any self-hosted label it does not
-    # recognise, and default_class is the cheapest class. A label that is mapped in one
-    # repo but missing in another therefore silently books the cheapest reserve for a
-    # job that may need many times that — the same under-reserve shape as the readopt
-    # bug. Pin every mapped label so a rename cannot half-land.
-    cfg = ControllerConfig.load(OPERATOR_CONFIG)
-    for repo in cfg.repos:
-        for label, class_name in repo.label_class.items():
-            assert class_name in cfg.classes, f"{repo.repo}: '{label}' -> unknown '{class_name}'"
-            assert cfg.class_for(repo.repo, ["self-hosted", label]) == class_name
-
-
 def test_repos_are_resolved_through_the_shared_registry(write_config) -> None:
     """`repos:` names projects; the GitHub owner/name comes from
     personal/repos.yml, so a repo that changes owner is one edit in one file."""
@@ -285,15 +263,18 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path) -> None:
         ControllerConfig.load(path)
 
 
-def test_the_operator_config_and_registry_agree() -> None:
-    """personal/ci-controller.yml and personal/repos.yml are copied to the host
-    together; a project in one and not the other crash-loops the controller."""
-    import yaml
-
-    cfg = ControllerConfig.load(OPERATOR_CONFIG)
-    registry = yaml.safe_load(REPO_REGISTRY.read_text())["project_repos"]
-    # Every project the controller admits for must resolve through the registry.
-    # Asserting a literal owner here instead would restate what repos.yml says,
-    # and would go stale on the next transfer rather than catching a real gap.
-    assert set(cfg.repo_names()) <= set(registry.values())
-    assert registry["ordago-apps"] in cfg.repo_names()
+# Three tests are NOT here, deliberately: test_operator_config_loads,
+# test_operator_config_never_underprices_a_mapped_label and
+# test_the_operator_config_and_registry_agree. All three loaded
+# `personal/ci-controller.yml` from the repo root and asserted it was
+# internally consistent.
+#
+# That is a fact about ONE OPERATOR'S DEPLOYMENT, not about this platform.
+# `personal/` belongs to whoever deploys this, and there is deliberately no
+# such directory here — a shared platform that shipped one operator's host
+# config would be the same neutrality decay that
+# test_no_operator_defaults.py exists to prevent.
+#
+# Consumers keep these tests against their own config. If this repo ever needs
+# an equivalent, it validates the SCHEMA against a fixture, not a real
+# operator's file.

@@ -45,6 +45,7 @@ def test_compose_runs_an_init_to_reap_zombies() -> None:
     svc = compose["services"]["github-review"]
     assert svc.get("init") is True, "compose must set init: true so PID 1 reaps git helper zombies"
 
+
 # `test_project_clone_worktrees_dir_is_owned_by_the_operator` is NOT here, for
 # the same reason: it asserted on `ansible/playbooks/services.yml`, which belongs
 # to whoever deploys this, not to this repo. The other four tests in this file

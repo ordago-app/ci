@@ -229,6 +229,7 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path: Path) -> 
     with pytest.raises(ConfigError, match="owner/name"):
         ReviewConfig.load(cfg_path)
 
+
 # `test_the_committed_config_and_registry_agree` is NOT here, deliberately. It
 # asserted that one operator's `personal/agent-review.yml` and
 # `personal/repos.yml` ship consistently. That is a fact about a DEPLOYMENT, not
