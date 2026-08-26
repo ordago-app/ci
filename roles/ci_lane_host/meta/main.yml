@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: ci_lane_host
+  description: Provision a machine to offer CI capacity — scoped socket proxy plus fabric sidecar
+  license: MIT
+  min_ansible_version: "2.15"
+dependencies: []

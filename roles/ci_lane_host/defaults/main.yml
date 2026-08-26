@@ -1,0 +1,12 @@
+---
+# Work-dir base for lanes on this host. MUST match both `work_dirs` keys of this
+# host's entry in the operator's pool config — the dispatcher passes the path
+# straight to a docker bind mount, so a mismatch surfaces as a lane that cannot
+# write its workspace. The check that pins these together lives in the CONSUMER,
+# because only there are both facts visible. See the design section above.
+ci_lane_work_dir: /opt/ci-controller/work
+# pnpm's content-addressed store, bound into every lane at /cache/pnpm. Must match
+# this host's `shared_mounts`. Deliberately under /opt, on the same filesystem as
+# /var/lib/docker/volumes, so the store and the lane's work volume share st_dev and
+# pnpm hardlinks into node_modules instead of copying.
+ci_lane_pnpm_store: /opt/ci-controller/caches/pnpm-store
