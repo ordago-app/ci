@@ -1,6 +1,6 @@
 ---
 # ── github-review (agentic PR reviews; reuses claude-router + codex images) ──
-- name: Preconditions for a dispatcher host are met
+- name: Preconditions for a github-review host are met
   ansible.builtin.assert:
     that:
       - services_root is defined and services_root | length > 0
