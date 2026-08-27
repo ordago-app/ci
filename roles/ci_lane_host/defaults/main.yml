@@ -10,3 +10,16 @@ ci_lane_work_dir: /opt/ci-controller/work
 # /var/lib/docker/volumes, so the store and the lane's work volume share st_dev and
 # pnpm hardlinks into node_modules instead of copying.
 ci_lane_pnpm_store: /opt/ci-controller/caches/pnpm-store
+# The runner image this host builds, and whether that build carries the Android
+# SDK. These are variables rather than literals for the same reason the work-dir
+# paths above are: the check that matters -- "this host's allowed_classes never
+# needs a tool this image lacks" -- can only run in the CONSUMER, where the pool
+# config is visible. A consumer that hand-mirrored a literal from this file would
+# pass its own test while silently drifting from what the pinned role builds.
+#
+# The default pairing is the one every lane host has run since the SDK was split
+# out: no Android SDK, tagged `light` so it can never be confused with a full
+# `latest` image. Skipping the SDK drops ~10 GB and removes the least reliable
+# part of the build -- sdkmanager blocks in a socket read with no timeout.
+ci_lane_runner_image_tag: light
+ci_lane_runner_with_android: false

@@ -86,28 +86,41 @@
   become: true
   become_user: "{{ operator_user }}"
 
-# Built WITHOUT the Android SDK. A lane host's allowed_classes is [light, node] (see
-# personal/ci-controller.yml), and NEITHER class sets needs_android_sdk, so it can
-# never be scheduled a job that needs the SDK -- docker_adapter passes
-# SKIP_ANDROID_SDK=1 for both, and the entrypoint never looks for the seed. Node 20
-# and corepack are in a base layer this tag keeps, so node lanes build fine here;
-# only `emulator` would need the full image. Skipping it drops ~10 GB and removes
-# the least reliable
-# part of this build: sdkmanager blocks in a socket read with no timeout, which
-# wedged this play twice with no output at all. Tagged `:light` rather than
-# `:latest` so the two images are never confused for one another; the host's
-# `runner_image` in personal/ci-controller.yml must name this same tag.
+# The image every lane on this host runs. Which image that is -- and whether it
+# carries the Android SDK -- is the consumer's call, supplied through
+# ci_lane_runner_image_tag and ci_lane_runner_with_android; see defaults/main.yml
+# for the default pairing and why it is a variable rather than a literal.
+#
+# Whatever the consumer picks, its own pool config must name the same tag as this
+# host's runner image, and must not admit a job class needing a tool the image
+# lacks. Neither fact is visible from here, so neither is checked here.
+- name: lane runner image tag and Android SDK choice agree
+  # A consumer reads the TAG to decide which job classes this host may be
+  # scheduled -- `light` means "no Android SDK, so never an emulator lane". That
+  # inference is only sound if the two cannot contradict each other here. An
+  # image tagged `light` that carried the SDK, or a `latest` that lacked it,
+  # would make every consumer's scheduling check wrong while still passing.
+  # Any other tag name is free: the consumer simply cannot infer from it.
+  ansible.builtin.assert:
+    that:
+      - not (ci_lane_runner_image_tag == 'light' and ci_lane_runner_with_android)
+      - not (ci_lane_runner_image_tag == 'latest' and not ci_lane_runner_with_android)
+    fail_msg: >-
+      ci_lane_runner_image_tag={{ ci_lane_runner_image_tag }} contradicts
+      ci_lane_runner_with_android={{ ci_lane_runner_with_android }}. `light` means
+      no Android SDK and `latest` means it is present; consumers schedule on that.
+
 - name: github-actions-runner lane image built locally
   community.docker.docker_image:
     name: homelab/github-actions-runner
-    tag: light
+    tag: "{{ ci_lane_runner_image_tag }}"
     source: build
     force_source: true
     build:
       path: "{{ services_root }}/github-actions-runner"
       pull: true
       args:
-        WITH_ANDROID: "0"
+        WITH_ANDROID: "{{ '1' if ci_lane_runner_with_android else '0' }}"
 
 # ── The scoped socket proxy ──
 # No bind address is computed any more. The proxy shares the fabric sidecar's
