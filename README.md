@@ -29,6 +29,14 @@ cannot be asserted from inside a role.
     by this role (it's rendered outside the ported range); it must already
     exist on the target host before the role runs. Defaults to
     `{{ personal_root }}/repos.yml`.
+  - `ci_controller_work_dirs` — list of lane work-dir bases on this machine. No
+    default: a disk layout is the one thing that cannot have a sensible
+    cross-operator value. Must match the `work_dirs` of this host's entry in
+    your pool config — the dispatcher bind-mounts those paths directly.
+  - `ci_controller_cache_root` — parent for the shared pnpm/gradle/android-sdk
+    caches. No default, and it must sit on the **same filesystem** as the work
+    dirs that use it: pnpm hardlinks from its store into `node_modules`, and a
+    cross-filesystem store silently degrades to full copies.
   - `ci_controller_secrets_dir` — where your secrets `env_file`s were
     rendered. Defaults to `{{ personal_root }}/secrets`, but
     `services/ci-controller/compose.yml` currently hardcodes

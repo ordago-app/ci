@@ -21,3 +21,22 @@ ci_controller_secrets_dir: "{{ personal_root }}/secrets"
 # personal_root the same way ci_controller_secrets_dir does, but compose.yml
 # hardcodes /opt/personal/repos.yml today — see the note above.
 ci_controller_repos_config: "{{ personal_root }}/repos.yml"
+
+# Where lanes do their work, and where their shared tool caches live. NO DEFAULTS:
+# a disk layout is the one thing that cannot have a sensible cross-operator value.
+# These used to be hardcoded to one operator's NVMe mount, which made this role
+# unusable on any other machine -- the same neutrality defect
+# services/ci-controller/tests/test_no_operator_defaults.py exists to prevent, in a
+# place that test does not reach.
+#
+# ci_controller_work_dirs must match the `work_dirs` of THIS host's entry in your
+# pool config: the dispatcher passes those paths straight to a docker bind mount, so
+# a mismatch surfaces as a lane that cannot write its workspace. The check that pins
+# them together lives in the CONSUMER, because only there are both facts visible.
+#
+# ci_controller_cache_root must be on the SAME FILESYSTEM as the work dirs that use
+# it: pnpm hardlinks from its store into node_modules, and a cross-filesystem store
+# silently degrades to full copies -- slower, and it balloons disk use.
+# ci_controller_work_dirs:
+#   - /mnt/your-ssd/ci-controller
+# ci_controller_cache_root: /mnt/your-ssd/caches

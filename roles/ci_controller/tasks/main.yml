@@ -15,11 +15,14 @@
     that:
       - ci_controller_pool_config is defined and ci_controller_pool_config | length > 0
       - ci_controller_repos_config is defined and ci_controller_repos_config | length > 0
+      - ci_controller_work_dirs is defined and ci_controller_work_dirs | length > 0
+      - ci_controller_cache_root is defined and ci_controller_cache_root | length > 0
     fail_msg: >-
       ci_controller_pool_config and ci_controller_repos_config must point at this
-      operator's own ci-controller.yml and repos.yml. This collection deliberately
-      does not ship one operator's pool config for every other operator — set both
-      in your own inventory.
+      operator's own ci-controller.yml and repos.yml, and ci_controller_work_dirs /
+      ci_controller_cache_root at this machine's own disk layout. This collection
+      deliberately ships neither one operator's pool config nor one operator's mount
+      points — set all four in your own inventory.
 
 - name: repos.yml is already in place for this stack to mount
   # repos.yml is placed OUTSIDE the ported range in the source playbook (a
@@ -70,7 +73,7 @@
 
 - name: ci-controller metrics state dir
   ansible.builtin.file:
-    path: /opt/personal/state/ci-controller
+    path: "{{ personal_root }}/state/ci-controller"
     state: directory
     owner: "{{ operator_user }}"
     group: "{{ operator_user }}"
@@ -83,16 +86,11 @@
     owner: "{{ operator_user }}"
     group: "{{ operator_user }}"
     mode: "0755"
-  loop:
-    - /mnt/ci-ssd/ci-controller
-    - /opt/personal/github-actions/ci-controller
-    # Caches live on the NVMe (/mnt/ci-ssd) alongside the lane work dirs so pnpm
-    # can hardlink from the store into node_modules — a cross-fs store would force
-    # slow full copies and balloon disk use. (Moved off the HDD with the NVMe
-    # upgrade; must stay on the same filesystem as the node/light work dirs.)
-    - /mnt/ci-ssd/caches/pnpm-store
-    - /mnt/ci-ssd/caches/gradle
-    - /mnt/ci-ssd/caches/android-sdk
+  loop: >-
+    {{ ci_controller_work_dirs
+       + [ci_controller_cache_root ~ '/pnpm-store',
+          ci_controller_cache_root ~ '/gradle',
+          ci_controller_cache_root ~ '/android-sdk'] }}
 
 - name: place ci-controller.yml on host
   ansible.builtin.copy:
@@ -144,7 +142,7 @@
 
       [Service]
       Type=oneshot
-      ExecStart=/usr/bin/find /mnt/ci-ssd/ci-controller /opt/personal/github-actions/ci-controller -mindepth 1 -maxdepth 1 -type d -name '*-work' -mtime +1 -exec rm -rf {} +
+      ExecStart=/usr/bin/find {{ ci_controller_work_dirs | join(' ') }} -mindepth 1 -maxdepth 1 -type d -name '*-work' -mtime +1 -exec rm -rf {} +
   become: true
 
 - name: ci-controller work-dir prune timer unit
