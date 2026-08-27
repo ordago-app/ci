@@ -23,6 +23,7 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 LANE_HOST_TASKS_FILE = REPO / "roles" / "ci_lane_host" / "tasks" / "main.yml"
+ROLE = REPO / "roles" / "ci_lane_host"
 
 
 def _lane_host_tasks() -> list[dict]:
@@ -323,4 +324,56 @@ def test_lane_host_read_only_lookups_run_under_check_mode() -> None:
     assert reads[0].get("check_mode") is False, (
         f"{reads[0].get('name')!r} must set `check_mode: false`, or --check stops the "
         "role before it reaches a single firewall rule"
+    )
+
+
+def test_runner_image_tag_and_android_flag_come_from_variables() -> None:
+    """A consumer's scheduling check reads this host's image TAG to decide which job
+    classes it may run -- `light` means "no Android SDK, never an emulator lane".
+
+    That check lives in the consumer, because only there is the pool config visible.
+    So the consumer must be able to SUPPLY the tag, not copy it. If these were
+    literals here, a consumer could only hand-mirror them in its own config: its test
+    would compare its mirror against itself, pass forever, and drift silently the
+    moment this role's literal changed. Same argument as ci_lane_work_dir.
+    """
+    built = [
+        t.get("community.docker.docker_image")
+        for t in _lane_host_tasks()
+        if t.get("community.docker.docker_image")
+    ]
+    runner = [img for img in built if img.get("name") == "homelab/github-actions-runner"]
+    assert len(runner) == 1, f"expected one runner image build, found {len(runner)}"
+    img = runner[0]
+
+    assert "ci_lane_runner_image_tag" in str(img.get("tag")), (
+        f"tag is {img.get('tag')!r}: it must come from ci_lane_runner_image_tag, or a "
+        "consumer can only mirror a literal and its scheduling test guards nothing"
+    )
+    assert "ci_lane_runner_with_android" in str(img.get("build", {}).get("args", {})), (
+        "WITH_ANDROID must derive from ci_lane_runner_with_android, or the tag a "
+        "consumer supplies can silently disagree with what the image actually holds"
+    )
+
+    defaults = yaml.safe_load((ROLE / "defaults" / "main.yml").read_text())
+    assert defaults["ci_lane_runner_image_tag"] == "light"
+    assert defaults["ci_lane_runner_with_android"] is False
+
+
+def test_a_contradictory_tag_and_android_flag_stop_the_play() -> None:
+    """The consumer's inference "tag == light therefore no Android SDK" is only sound
+    if the two cannot contradict each other. An image tagged `light` that carried the
+    SDK -- or a `latest` that lacked it -- would make every consumer's scheduling
+    check wrong while still passing. The role must refuse to build it."""
+    asserts = [
+        t
+        for t in _lane_host_tasks()
+        if t.get("ansible.builtin.assert")
+        and "ci_lane_runner_image_tag" in str(t["ansible.builtin.assert"])
+    ]
+    assert len(asserts) == 1, "expected exactly one tag/Android-flag consistency assert"
+    conditions = " ".join(asserts[0]["ansible.builtin.assert"]["that"])
+    assert "light" in conditions and "latest" in conditions, (
+        "the assert must pin BOTH named tags; guarding only one leaves the other "
+        f"free to lie about what the image holds. Got: {conditions}"
     )
