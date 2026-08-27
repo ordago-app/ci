@@ -8,13 +8,14 @@
   # written in a README where it goes stale and fails silently.
   ansible.builtin.assert:
     that:
-      - ci_lane_allowed_dispatchers | default([]) | length > 0
       - services_root is defined and services_root | length > 0
       - operator_user is defined and operator_user | length > 0
     fail_msg: >-
-      ci_lane_host requires ci_lane_allowed_dispatchers, services_root and
-      operator_user. These come from the OPERATOR's inventory (group_vars), not
-      from this collection.
+      ci_lane_host requires services_root and operator_user. These come from the
+      OPERATOR's inventory (group_vars), not from this collection.
+
+      ci_lane_allowed_dispatchers is no longer required or read: who may reach
+      2375 is decided by the fabric tailnet ACL, not by this role.
 
 - name: Docker is installed and responding
   ansible.builtin.command: docker info
@@ -153,160 +154,76 @@
     dest: "{{ services_root }}/ci-lane-host/compose.yml"
     mode: "0644"
 
-# ── Restrict 2375, and keep the restriction after a reboot ──
-# What this does and does NOT cover, stated precisely, because the earlier version of
-# this comment claimed more than the rules deliver:
+# ── Retire the old DOCKER-USER rules ──
 #
-#   COVERED - traffic forwarded to the proxy container: remote hosts other than the
-#   controller, and lane containers routing out through the docker bridge. That second
-#   one is the threat that matters: PR code in a lane reaching the socket that spawns
-#   lanes would be root on this host.
+# This role used to resolve every allowed dispatcher to an IPv4, render a firewall
+# script, and install a systemd unit that re-applied `DOCKER-USER` rules for 2375 at
+# boot. All of it is gone, and these tasks remove what it left behind.
 #
-#   NOT COVERED - callers inside this host itself, since DOCKER-USER sits on docker's
-#   FORWARD path and locally-originated traffic to a published port does not traverse
-#   it. On a VM that means root on the VM, which already owns docker anyway. The WSL
-#   predecessor's much larger hole -- Windows and the operator's dev distro shared this
-#   host's network namespace, so no address was private to it, not even 127.0.0.1 --
-#   is closed by the VM having its own stack. See ADR 0017, and verify empirically with
-#   the reachability checks in docs/runbook.md rather than trusting this comment.
+# The rules never sat on the traffic they claimed to filter. Two measurements on
+# 2026-08-27 against a live lane host:
 #
-# Applied through a systemd unit rather than live iptables calls: the rules are runtime
-# state, and docker restarts the `unless-stopped` proxy on boot. Without a boot-time
-# restore, 2375 comes back unfiltered after every VM start until someone re-runs
-# this play -- an unnoticed hole in the thing being called a trust boundary.
-- name: Resolve each allowed dispatcher's tailnet IPv4
-  ansible.builtin.command: "getent ahostsv4 {{ item }}"
-  register: ci_lane_dispatcher_lookups
-  changed_when: false
-  failed_when: false
-  # Same reason as the bind-address read above: a name lookup changes nothing, and
-  # skipping it under --check makes every dispatcher look unresolvable.
-  check_mode: false
-  loop: "{{ ci_lane_allowed_dispatchers }}"
-
-# One extraction, named once. `getent ahostsv4` prints one line per socket type
-# (STREAM/DGRAM/RAW) all carrying the same address, so take the first field of the
-# first line and de-duplicate.
-- name: Allowed dispatcher addresses
-  ansible.builtin.set_fact:
-    ci_lane_dispatcher_ips: >-
-      {{ ci_lane_dispatcher_lookups.results
-         | map(attribute='stdout_lines') | select() | map('first')
-         | map('regex_search', '^[0-9.]+') | unique | list }}
-
-# A dispatcher that does not resolve contributes nothing to the allowlist, and the
-# play would carry on and publish a proxy that DROPs it -- a lane host silently
-# invisible to its controller, which ADR 0016 then attributes as infra_failure.
-# Fail here instead, naming the one that did not resolve.
-- name: Every allowed dispatcher resolved
-  ansible.builtin.assert:
-    that:
-      - unresolved | length == 0
-      - ci_lane_dispatcher_ips | length == ci_lane_allowed_dispatchers | unique | length
-      # Every entry must look like an address. A length check alone is not enough:
-      # a broken extraction yields [None], which is one entry per dispatcher and
-      # passes the count while producing ALLOWED="None" -- no allow rules at all,
-      # behind a catch-all DROP. That is a lane host cut off from its controller,
-      # and it renders without error. Caught exactly that way on 2026-08-24.
-      - ci_lane_dispatcher_ips | select('none') | list | length == 0
-    fail_msg: >-
-      could not resolve every ci_lane_allowed_dispatchers entry to an IPv4
-      address from this host. Unresolved: {{ unresolved | join(', ') or 'none' }};
-      extracted: {{ ci_lane_dispatcher_ips }}. The lane host reaches them over the
-      tailnet, so check it has joined and that the names in
-      inventory/group_vars/all.yml are right.
-  vars:
-    unresolved: >-
-      {{ ci_lane_dispatcher_lookups.results
-         | selectattr('stdout_lines', 'equalto', [])
-         | map(attribute='item') | list }}
-
-- name: ci-lane-host firewall script
-  ansible.builtin.copy:
-    dest: /usr/local/sbin/ci-lane-firewall.sh
-    mode: "0755"
-    content: |
-      #!/bin/sh
-      # Managed by the ordago.ci.ci_lane_host ansible role. The single definition of the
-      # socket-proxy restriction: run at boot by ci-lane-firewall.service and once at
-      # deploy time. Idempotent -- every rule is deleted before it is added.
-      set -eu
-      ALLOWED="{{ ci_lane_dispatcher_ips | join(' ') }}"
-      PORT=2375
-      # Every rule this script owns carries this prefix, and deletion matches on
-      # the PREFIX rather than on either full note. Matching the full note deletes
-      # only rules whose comment is spelled exactly as the current script spells
-      # it, so renaming a note orphans every rule written under the old name --
-      # observed 2026-08-24, when widening the allow from "the ci-controller" to
-      # "an allowed dispatcher" left the old RETURN in the chain with nothing able
-      # to remove it. The prefix is the script's namespace and does not change.
-      OWNER_TAG="ci-lane-host:"
-      ALLOW_NOTE="ci-lane-host: allow an allowed dispatcher"
-      DENY_NOTE="ci-lane-host: deny every other forwarded reacher"
-
-      # Delete by COMMENT, not by rule spec, and by line number rather than by
-      # matching a spec we reconstruct.
-      #
-      # The previous version deleted `-s "$CONTROLLER"` -- the address it was about
-      # to add. That converges only while the allowlist never changes: a dispatcher
-      # whose tailnet IP moved, or one removed from ci_lane_allowed_dispatchers,
-      # left its RETURN in the chain with nothing to delete it, and the lane host
-      # went on accepting container-create calls from an address no longer trusted.
-      # Matching the comment removes every rule this script owns whatever source it
-      # names, so the allowlist can shrink as well as grow.
-      #
-      # Highest line number first: deleting by index shifts every later index down.
-      iptables -L DOCKER-USER --line-numbers -n \
-        | awk -v o="$OWNER_TAG" 'index($0, o) { print $1 }' \
-        | sort -rn \
-        | while read -r i; do iptables -D DOCKER-USER "$i"; done
-
-      # Insert the deny at the HEAD, then push each allow in front of it. Never
-      # append.
-      #
-      # Appending puts the deny after everything already in DOCKER-USER, and docker
-      # seeds that chain with an unconditional `-j RETURN` on some versions. Behind
-      # such a rule the deny is unreachable and 2375 is open to every forwarded
-      # reacher -- while `iptables -L` still shows both rules present and in the
-      # right relative order, so it looks correct in exactly the place someone would
-      # check. This host has no tail RETURN today (verified 2026-08-24), which is
-      # precisely why the append survived; a docker upgrade that adds one would open
-      # the boundary silently. Inserting both makes the pair's position independent
-      # of whatever else the chain holds.
-      iptables -I DOCKER-USER 1 -p tcp --dport "$PORT" -j DROP \
-        -m comment --comment "$DENY_NOTE"
-      for ip in $ALLOWED; do
-        iptables -I DOCKER-USER 1 -p tcp --dport "$PORT" -s "$ip" -j RETURN \
-          -m comment --comment "$ALLOW_NOTE"
-      done
-
-- name: ci-lane-host firewall unit
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/ci-lane-firewall.service
-    mode: "0644"
-    content: |
-      [Unit]
-      Description=Restrict the CI lane socket proxy to the allowed dispatchers
-      # After docker: docker flushes and rebuilds its chains on start, so rules
-      # inserted before it would be lost. DOCKER-USER must exist for this to work.
-      After=docker.service
-      Requires=docker.service
-
-      [Service]
-      Type=oneshot
-      RemainAfterExit=yes
-      ExecStart=/usr/local/sbin/ci-lane-firewall.sh
-
-      [Install]
-      WantedBy=multi-user.target
-
-- name: ci-lane-host firewall enabled and applied now
-  ansible.builtin.systemd:
+#   1. The proxy runs in the fabric sidecar's network namespace, so a dispatcher
+#      reaches it over the fabric tailnet -- a path that does not traverse the host's
+#      FORWARD chain. A request from the dispatcher's fabric address, which matched no
+#      allow rule, reached /_ping successfully. It could not have, had the chain been
+#      on that path.
+#   2. A lane container is blocked by docker's inter-bridge isolation, not by these
+#      rules. Inserting an explicit RETURN in DOCKER-USER for one probe container left
+#      it just as unable to reach the proxy.
+#
+# What actually gates 2375 is the fabric tailnet ACL, enforced by tailscaled ON this
+# host: its compiled packet filter admits exactly one source (the dispatcher's fabric
+# address) to exactly one port. That is stronger than what was removed -- it keys on
+# node identity rather than a resolved hostname, and it updates itself when tags or
+# nodes change.
+#
+# Removing rather than re-pointing, deliberately. Making iptables see this traffic
+# would mean filtering inside the sidecar's namespace: a second, weaker, IP-based copy
+# of the packet filter tailscaled already applies, with its own restart-survival
+# machinery to get wrong. A control that cannot fire is worse than no control, because
+# its presence reads as assurance to whoever checks.
+#
+# These removals are unconditional and idempotent so an already-provisioned host is
+# cleaned on its next run. Dropping the tasks alone would have left the unit enabled
+# and the rules reinstalling at every boot, forever.
+- name: ci-lane-host firewall unit stopped and disabled
+  ansible.builtin.systemd_service:
     name: ci-lane-firewall.service
-    daemon_reload: true
-    enabled: true
-    state: restarted
+    state: stopped
+    enabled: false
+  failed_when: false
 
+- name: ci-lane-host firewall files removed
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/ci-lane-firewall.service
+    - /usr/local/sbin/ci-lane-firewall.sh
+  register: ci_lane_firewall_files
+
+- name: systemd reloaded after removing the firewall unit
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: ci_lane_firewall_files is changed
+
+# Deleting by the comment this role wrote, highest line number first, because deleting
+# by index shifts every later index down. Matching the comment removes every rule the
+# retired script owned whatever source address it named.
+- name: ci-lane-host DOCKER-USER rules removed
+  ansible.builtin.shell: |
+    set -eu
+    while :; do
+      i=$(iptables -L DOCKER-USER --line-numbers -n \
+            | awk 'index($0, "ci-lane-host:") { print $1; exit }')
+      [ -n "$i" ] || break
+      iptables -D DOCKER-USER "$i"
+    done
+  register: ci_lane_rule_purge
+  changed_when: false
+  # Reports changed=false because it is a convergence step with nothing to compare;
+  # the check that matters is the reachability matrix in the consumer's runbook.
 # ── Bring the proxy back after a reboot ──
 # The proxy publishes on the host's TAILNET address, which does not exist yet when
 # docker starts. Observed 2026-08-09, after the VM was resized and restarted:

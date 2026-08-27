@@ -152,64 +152,6 @@ def test_lane_host_proxy_survives_a_reboot() -> None:
     ), "the unit is useless unless enabled for the next boot"
 
 
-def test_lane_host_firewall_survives_a_reboot() -> None:
-    """The restriction must be boot-restored, not a one-shot live iptables mutation.
-
-    iptables rules are runtime state and docker restarts the `unless-stopped` proxy on
-    boot, so a deploy-time-only rule leaves 2375 unfiltered after every VM start until
-    someone re-runs the role — an unnoticed hole in the thing called a trust boundary.
-    """
-    by_dest = {}
-    for task in _lane_host_tasks():
-        copy = task.get("ansible.builtin.copy") or task.get("copy")
-        if copy and "dest" in copy:
-            by_dest[copy["dest"]] = copy.get("content", "")
-
-    script = by_dest.get("/usr/local/sbin/ci-lane-firewall.sh")
-    unit = by_dest.get("/etc/systemd/system/ci-lane-firewall.service")
-    assert script is not None, "the rules need one definition, in a script"
-    assert unit is not None, "the rules need a boot-time restore unit"
-
-    # Both directions: an allow-only rule restricts nothing.
-    assert "-j RETURN" in script, "the controller must be permitted explicitly"
-    assert "-j DROP" in script, "everything else forwarded must be dropped"
-    assert "DOCKER-USER" in script
-    assert "-I DOCKER-USER 1" in script, "the allow must precede the catch-all deny"
-
-    # Idempotent: re-running must not stack duplicate rules.
-    #
-    # Observed on powervaro-ci 2026-08-10: three identical RETURN and three identical
-    # DROP rules after one boot plus two play runs, because iptables matches the FULL
-    # rule spec and a `-D` that omitted the `-m comment` its `-A` added never matched.
-    # That was first fixed by pairing every add with a spec-identical delete, which this
-    # test asserted directly.
-    #
-    # The script now deletes by COMMENT and line number instead, which subsumes it: it
-    # removes every rule the script owns whatever source address the rule names, so a
-    # dispatcher that changed IP or left ci_lane_allowed_dispatchers cannot strand a
-    # stale RETURN. A spec-identical delete could not express that, because the spec it
-    # would have to match is one the script no longer knows.
-    assert "iptables -D DOCKER-USER" in script, "rules must be removed before being re-added"
-    assert "ALLOW_NOTE" in script and "DENY_NOTE" in script, (
-        "both rule families need a stable comment — the comment is what deletion matches on"
-    )
-    assert "-s " not in script.split("iptables -L DOCKER-USER")[1].split("for ip in")[0], (
-        "deletion must not name a source address: that is what left stale allows behind "
-        "when a dispatcher's tailnet IP moved"
-    )
-
-    # docker rebuilds its chains on start, so ordering after it is load-bearing.
-    assert "After=docker.service" in unit
-    assert "WantedBy=multi-user.target" in unit, "must actually be enabled at boot"
-
-    enabled = [
-        (t.get("ansible.builtin.systemd") or t.get("systemd") or {}) for t in _lane_host_tasks()
-    ]
-    assert any(
-        u.get("name") == "ci-lane-firewall.service" and u.get("enabled") is True for u in enabled
-    ), "the unit must be enabled, or it never runs at boot"
-
-
 def _lane_firewall_script() -> str:
     """The rendered-ish body of /usr/local/sbin/ci-lane-firewall.sh, jinja intact."""
     scripts = [
@@ -221,110 +163,6 @@ def _lane_firewall_script() -> str:
     ]
     assert scripts, "the lane-host firewall script task was renamed or removed"
     return (scripts[0].get("ansible.builtin.copy") or scripts[0]["copy"])["content"]
-
-
-def test_lane_host_firewall_deletes_by_comment_so_the_allowlist_can_shrink() -> None:
-    """Deleting the rule it is about to add only converges while the list never changes.
-
-    The previous script deleted `-s "$CONTROLLER"` — the very address it then inserted.
-    A dispatcher whose tailnet IP moved, or one dropped from the allowlist, left its
-    RETURN in DOCKER-USER with nothing able to delete it, and the lane host kept
-    accepting container-create calls from an address no longer trusted. Matching on the
-    comment removes every rule the script owns whatever source it names.
-    """
-    script = _lane_firewall_script()
-    assert "--line-numbers" in script, (
-        "deletion must match the rules this script owns by comment, not by "
-        "reconstructing the spec it is about to add"
-    )
-    # By the namespace PREFIX, not either full note. Matching a full note deletes only
-    # rules spelled the way the current script spells them, so renaming a note orphans
-    # every rule written under the old name — observed 2026-08-24 on powervaro-ci, which
-    # ended up carrying a stale third rule after the allow note was widened.
-    assert "OWNER_TAG=" in script and "index($0, o)" in script, (
-        "delete by the ci-lane-host: prefix so a renamed note cannot orphan old rules"
-    )
-    assert "sort -rn" in script, (
-        "delete highest line number first — deleting by index shifts later indices down"
-    )
-
-
-def test_lane_host_firewall_allows_every_dispatcher_and_denies_the_rest() -> None:
-    """Order is the boundary: each allow must precede the catch-all DROP."""
-    script = _lane_firewall_script()
-    assert "for ip in $ALLOWED" in script, (
-        "the allow must loop over every resolved dispatcher, not a single address"
-    )
-    # Both rules are INSERTED at the head; neither is appended.
-    #
-    # An appended deny sits after everything already in DOCKER-USER, and docker seeds
-    # that chain with an unconditional `-j RETURN` on some versions. Behind one, the
-    # deny never fires and 2375 is open — while `iptables -L` still shows both rules,
-    # in the right relative order, so the place you would look says it is fine. Order
-    # in the SCRIPT is not order in the CHAIN: emitting the deny first and each allow
-    # after it is what puts the allows in front of it, independent of the chain's tail.
-    assert "-A DOCKER-USER" not in script, (
-        "never append to DOCKER-USER — an appended rule lands behind docker's own "
-        "tail RETURN, where it cannot fire"
-    )
-    deny_insert = script.index('-I DOCKER-USER 1 -p tcp --dport "$PORT" -j DROP')
-    allow_insert = script.index('-s "$ip" -j RETURN')
-    assert deny_insert < allow_insert, (
-        "insert the deny first, then push each allow in front of it — reversing this "
-        "leaves the deny ahead of the allows and the dispatcher is locked out"
-    )
-
-
-def test_lane_host_unresolvable_dispatcher_stops_the_play() -> None:
-    """A dispatcher that does not resolve contributes nothing to the allowlist, so the
-    role would go on to publish a proxy that DROPs it — a lane host invisible to its
-    controller, which the dispatcher then has no way to distinguish from any other
-    infra failure. Fail loudly instead."""
-    tasks = _lane_host_tasks()
-    lookups = [t for t in tasks if "getent ahostsv4" in str(t.get("ansible.builtin.command") or "")]
-    assert lookups, "the role must resolve each allowed dispatcher"
-    assert lookups[0].get("failed_when") is False, (
-        "a failed lookup must fall through to the assert that names it, not abort raw"
-    )
-
-    guards = [
-        t
-        for t in tasks
-        if (t.get("ansible.builtin.assert") or t.get("assert"))
-        and "unresolved" in str(t.get("vars", ""))
-    ]
-    assert guards, "an unresolvable dispatcher must stop the play"
-
-    # Counting is not enough, and this is not hypothetical: a double-escaped regex in
-    # the extraction returned [None] on 2026-08-24 -- one entry per dispatcher, so the
-    # count matched -- and rendered ALLOWED="None". That is zero allow rules behind a
-    # catch-all DROP: the lane host silently unreachable by its own controller.
-    conditions = str((guards[0].get("ansible.builtin.assert") or guards[0]["assert"])["that"])
-    assert "select('none')" in conditions, (
-        "the guard must reject a failed extraction, not just count the entries"
-    )
-
-
-def test_lane_host_read_only_lookups_run_under_check_mode() -> None:
-    """`--check` must reach the trust boundary it exists to rehearse.
-
-    The dispatcher lookup is a `command`, which ansible skips in check mode; skipped,
-    it yields nothing and every dispatcher looks unresolvable, so the role stops
-    before a single firewall rule. It reads nothing it could change, so it opts in.
-
-    There used to be two such lookups. The bind-address read is gone with the
-    published port; see test_lane_host_no_longer_computes_a_bind_address above.
-    """
-    reads = [
-        t
-        for t in _lane_host_tasks()
-        if "getent ahostsv4" in str(t.get("ansible.builtin.command") or "")
-    ]
-    assert len(reads) == 1, f"expected the dispatcher lookup, found {len(reads)}"
-    assert reads[0].get("check_mode") is False, (
-        f"{reads[0].get('name')!r} must set `check_mode: false`, or --check stops the "
-        "role before it reaches a single firewall rule"
-    )
 
 
 def test_runner_image_tag_and_android_flag_come_from_variables() -> None:
@@ -376,4 +214,87 @@ def test_a_contradictory_tag_and_android_flag_stop_the_play() -> None:
     assert "light" in conditions and "latest" in conditions, (
         "the assert must pin BOTH named tags; guarding only one leaves the other "
         f"free to lie about what the image holds. Got: {conditions}"
+    )
+
+
+def test_the_role_installs_no_host_firewall_for_2375() -> None:
+    """2375 is gated by the fabric tailnet ACL, enforced by tailscaled on the lane host
+    itself, and by docker's inter-bridge isolation for containers. Not by iptables.
+
+    This role used to write DOCKER-USER rules for 2375. They never sat on the traffic
+    they claimed to filter, measured twice on a live host: a request from the
+    dispatcher's fabric address matched no allow rule and reached /_ping anyway, and
+    inserting an explicit RETURN for one probe container left it just as unable to
+    reach the proxy.
+
+    A control that cannot fire is worse than no control -- its presence reads as
+    assurance. If someone reintroduces one here, it has to be because they proved it
+    sits on the path, and this test is where they say so.
+    """
+    # Look for rules being ADDED. The retirement task necessarily names iptables and
+    # DOCKER-USER to delete what it owns, so matching those words alone would flag the
+    # cleanup as the thing it cleans up.
+    body = "\n".join(
+        line
+        for line in LANE_HOST_TASKS_FILE.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    installs = [
+        line.strip()
+        for line in body.splitlines()
+        if any(verb in line for verb in ("iptables -I", "iptables -A", "iptables-restore"))
+        or ("-j DROP" in line or "-j RETURN" in line)
+    ]
+    assert not installs, (
+        "the role writes iptables rules again. On the fabric these do not sit on the "
+        f"proxy's path; prove otherwise before adding them back: {installs}"
+    )
+
+    # Strip fail_msg before checking: the preconditions assert explains in prose that
+    # this variable is no longer read, and prose saying so must not read as a use.
+    def _without_messages(node):
+        if isinstance(node, dict):
+            return {k: _without_messages(v) for k, v in node.items() if k != "fail_msg"}
+        if isinstance(node, list):
+            return [_without_messages(v) for v in node]
+        return node
+
+    assert "ci_lane_allowed_dispatchers" not in yaml.dump(_without_messages(_lane_host_tasks())), (
+        "the role reads ci_lane_allowed_dispatchers again. Who may reach 2375 is the "
+        "fabric ACL's decision; a second allowlist here would drift from it silently"
+    )
+
+
+def test_the_role_cleans_up_the_retired_firewall() -> None:
+    """Dropping the tasks alone would leave every already-provisioned host with the unit
+    still enabled and the rules reinstalling at each boot, forever.
+
+    A removal that leaves its artifacts behind is worse than no removal: the operator
+    believes it is gone, and `iptables -S` keeps saying otherwise.
+    """
+    tasks = _lane_host_tasks()
+    dump = yaml.dump(tasks)
+
+    assert "ci-lane-firewall.service" in dump, "nothing stops or removes the retired unit"
+    removals = [
+        t
+        for t in tasks
+        if (
+            (t.get("ansible.builtin.file") or {}).get("state") == "absent"
+            and "ci-lane-firewall" in str(t.get("ansible.builtin.file", {}).get("loop", ""))
+        )
+        or "ci-lane-firewall" in str(t.get("loop", ""))
+    ]
+    assert removals, "the retired unit and script are never deleted from disk"
+
+    purge = [
+        t for t in tasks if "iptables -D DOCKER-USER" in str(t.get("ansible.builtin.shell", ""))
+    ]
+    assert len(purge) == 1, (
+        "exactly one task must delete the rules this role previously wrote; without it "
+        "they survive on every host provisioned before the retirement"
+    )
+    assert 'index($0, "ci-lane-host:")' in str(purge[0]["ansible.builtin.shell"]), (
+        "the purge must match the comment tag this role wrote, so it removes every rule "
+        "it owned regardless of which source address that rule named"
     )
