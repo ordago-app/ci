@@ -137,7 +137,7 @@ These directories are persistent caches, not source of truth.
 6. Confirm root disk has enough headroom for Android SDK and AVD caches:
 
    ```bash
-   ssh powerbot@powerserver 'df -h / && docker system df'
+   ssh <you>@<lane-host> 'df -h / && docker system df'
    ```
 
 7. Deploy only after reviewing the Ansible check output:
