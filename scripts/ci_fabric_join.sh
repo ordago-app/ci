@@ -29,7 +29,11 @@
 # where the bash-isms this needs do not exist. See scripts/secrets_set.sh.
 set -euo pipefail
 
-HOST="${1:?usage: scripts/ci_fabric_join.sh <host>}"
+HOST="${1:?usage: scripts/ci_fabric_join.sh <host> [ssh-user]}"
+# The login on the target. An argument, not a constant: this is a shared platform
+# and a second operator's machines do not carry the first operator's username.
+# Defaults to $USER, which is right for the common case of joining your own host.
+SSH_USER="${2:-${USER:?set USER or pass an ssh-user argument}}"
 VM_SECRETS="secrets/secrets.vm.yml"
 TS_IMAGE="tailscale/tailscale:v1.102.2"
 
@@ -50,7 +54,7 @@ test -n "$KEY" || {
 }
 
 # The key goes over stdin, not argv: an argv would be visible in `ps` on the guest.
-printf '%s' "$KEY" | ssh "powerbot@${HOST}" 'read -r K; docker run --rm \
+printf '%s' "$KEY" | ssh "${SSH_USER}@${HOST}" 'read -r K; docker run --rm \
   -v ci-fabric-state:/var/lib/tailscale \
   -e TS_KEY="$K" '"$TS_IMAGE"' sh -c "
     tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state \
