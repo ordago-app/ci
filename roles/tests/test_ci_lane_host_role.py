@@ -298,3 +298,26 @@ def test_the_role_cleans_up_the_retired_firewall() -> None:
         "the purge must match the comment tag this role wrote, so it removes every rule "
         "it owned regardless of which source address that rule named"
     )
+
+
+def test_every_lane_host_knob_is_documented_in_the_readme() -> None:
+    """The README is a consumer's entry point -- for a second operator it is the first
+    thing they read, and often the only thing before they write their playbook.
+
+    A knob added to defaults/ and not mentioned there is invisible: the consumer takes
+    the default, and finds out it was wrong when a deploy behaves oddly. That already
+    happened twice -- ci_lane_runner_image_tag and ci_lane_runner_with_android shipped
+    undocumented, while the README still listed a variable the role had stopped
+    reading.
+
+    This checks the direction that can be checked mechanically: everything the role
+    declares is named. It cannot tell whether the prose around a name is still true.
+    """
+    defaults = yaml.safe_load((ROLE / "defaults" / "main.yml").read_text()) or {}
+    readme = (ROLE.parents[1] / "README.md").read_text()
+
+    undocumented = sorted(name for name in defaults if f"`{name}`" not in readme)
+    assert not undocumented, (
+        f"ci_lane_host declares {undocumented} but the README never names them. A "
+        "consumer takes the default and finds out it was wrong from a deploy"
+    )

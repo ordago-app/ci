@@ -48,7 +48,19 @@ cannot be asserted from inside a role.
   itself — base OS and Docker are the machine owner's responsibility.
   Requires:
   - `services_root`, `operator_user`.
-  - `ci_lane_allowed_dispatchers` — non-empty list of dispatcher
-    hostnames/addresses this lane host accepts connections from.
   - `ci_lane_work_dir`, `ci_lane_pnpm_store` — defaulted, but must match the
     matching host entry in the dispatcher's pool config.
+  - `ci_lane_runner_image_tag`, `ci_lane_runner_with_android` — defaulted to
+    `light` / `false` (no Android SDK, ~10 GB smaller). Set both or neither:
+    the role refuses a `light` image carrying the SDK, or a `latest` lacking
+    it, because consumers read the tag to decide which job classes a host may
+    run. `runner_image` in your pool config must name the tag you set here.
+
+  There is **no `ci_lane_allowed_dispatchers`** and no host firewall. Who may
+  reach a lane host's port 2375 is decided by the CI fabric's tailnet ACL,
+  enforced by `tailscaled` on the lane host itself — a default-deny packet
+  filter admitting only your dispatcher's node to that one port. The role used
+  to write `DOCKER-USER` rules as well; they were retired in #3 after being
+  measured not to sit on the traffic at all (the proxy runs in the fabric
+  sidecar's network namespace, so lane-host traffic never traverses the host's
+  FORWARD chain). If you add a machine, the ACL is what you edit.
