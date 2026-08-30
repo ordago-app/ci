@@ -127,6 +127,84 @@
     state: present
     build: always
 
+# A healthcheck alone is a control that cannot fire: compose marks a container
+# unhealthy and does nothing about it. ci-controller shares ci-fabric's network
+# namespace, and docker does not restart a dependent when the namespace owner
+# restarts -- so a sidecar bounce strands the dispatcher with no DNS, Up and silent,
+# until a human notices. Seen twice on the reference deployment, both at boot: the
+# sidecar finished 39 s late on 2026-08-28 and 33 s late on 2026-08-30, the second
+# costing an hour of unnoticed CI downtime. Both were fixed by hand with the same
+# `docker restart ci-controller` this performs.
+#
+# A script rather than an inline ExecStart: systemd expands $VAR there, so the
+# command substitution and the anchored name filter below would need escaping, on a
+# single 280-character line.
+- name: ci-controller healthcheck watcher script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/ci-controller-healthcheck-watch
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Restart ci-controller when docker reports it unhealthy. See this role's tasks.
+      set -eu
+
+      # Filtering on HEALTH is the whole point: in the failure this exists for the
+      # container stays `running`, so any liveness-based filter matches nothing.
+      # The name filter is a regex -- anchored so ci-controller-socket-proxy, which
+      # merely starts with the same string, can never match.
+      unhealthy=$(/usr/bin/docker ps \
+        --filter 'name=^/ci-controller$' \
+        --filter health=unhealthy \
+        --quiet)
+      [ -n "$unhealthy" ] || exit 0
+
+      # Say so. The entire cost of this failure was that nothing reported it, and a
+      # silent auto-restart would hide a recurring fault just as effectively.
+      echo "ci-controller unhealthy - restarting (orphaned network namespace after a ci-fabric restart?)"
+      /usr/bin/docker restart ci-controller
+  become: true
+
+- name: ci-controller healthcheck watcher service unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-controller-healthcheck.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Restart ci-controller when its healthcheck reports unhealthy
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ci-controller-healthcheck-watch
+  become: true
+
+- name: ci-controller healthcheck watcher timer unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-controller-healthcheck.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Periodically restart an unhealthy ci-controller
+
+      [Timer]
+      # This failure happens AT BOOT, so arm shortly after one -- but late enough
+      # that the compose stack has had a chance to come up on its own.
+      OnBootSec=3min
+      OnUnitActiveSec=1min
+
+      [Install]
+      WantedBy=timers.target
+  become: true
+
+- name: ci-controller healthcheck watcher timer enabled
+  ansible.builtin.systemd:
+    name: ci-controller-healthcheck.timer
+    daemon_reload: true
+    enabled: true
+    state: started
+  become: true
+
 # Backstop for the in-controller reap cleanup: the controller deletes a lane's
 # work dir when it reaps the lane, but a lane that dies while the controller is
 # down (or pre-existing cruft) is never reaped, so its dir leaks. This daily
