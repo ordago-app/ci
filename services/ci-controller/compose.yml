@@ -79,6 +79,31 @@ services:
       # fill the disk. Keep these paths in sync with work_dirs in ci-controller.yml.
       - /mnt/ci-ssd/ci-controller:/mnt/ci-ssd/ci-controller:rw
       - /opt/personal/github-actions/ci-controller:/opt/personal/github-actions/ci-controller:rw
+    # Resolution, not liveness. When ci-fabric restarts, this container keeps running
+    # in a namespace that no longer has DNS: the process is perfectly healthy and every
+    # outbound call fails. `localhost:8000` still connects (loopback needs no resolver),
+    # so the probe reaches this dispatcher's own handler -- which then tries to call
+    # ci-scheduler BY NAME and fails. That is what makes /status a resolution probe and
+    # /healthz useless here: on 2026-08-26 /healthz returned 200 for a dispatcher that
+    # was polling no repos at all.
+    #
+    # Measured on the live host 2026-08-30 in exactly this state: /status -> 500 while
+    # orphaned, -> 200 after `docker restart ci-controller`.
+    #
+    # A healthcheck alone changes nothing -- compose marks the container unhealthy and
+    # does not act. `ci-controller-healthcheck.timer` on the host is what restarts it;
+    # see ansible/playbooks/services.yml. Do not remove one without the other.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/status', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      # ~90 s of continuous failure before acting. Long enough that a brief
+      # ci-scheduler restart does not trigger a pointless dispatcher restart.
+      retries: 3
+      # Both containers start together at boot and the sidecar bounced twice there on
+      # 2026-08-30; without this the probe would fail during ordinary startup.
+      start_period: 60s
+
     # No `expose:` here. Docker rejects it outright when network_mode is a
     # container namespace -- "conflicting options: port exposing and the container
     # type network mode" -- and the container fails to create. It was only metadata
