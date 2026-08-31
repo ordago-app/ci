@@ -199,3 +199,27 @@ def test_only_the_dispatchers_namespace_owner_reaches_the_proxy():
     assert on_internal == {"ci-fabric", "docker-socket-proxy"}, (
         f"unexpected members of ci-internal: {on_internal}"
     )
+
+
+def test_controller_waits_for_a_healthy_fabric_before_starting():
+    """ci-controller runs inside ci-fabric's network namespace. Plain `depends_on`
+    only orders creation, so the dispatcher could start against a tailscaled that had
+    not finished coming up -- which is how ci-fabric crash-looped twice on the
+    2026-08-31 boot and left the dispatcher stranded. service_healthy makes the wait
+    mean what it reads as."""
+    compose = _compose()
+    controller = compose["services"]["ci-controller"]
+
+    assert controller["network_mode"] == "service:ci-fabric"
+    assert controller["depends_on"]["ci-fabric"]["condition"] == "service_healthy"
+    assert "healthcheck" in compose["services"]["ci-fabric"], (
+        "service_healthy is a silent no-op unless ci-fabric defines a healthcheck"
+    )
+
+
+def test_fabric_healthcheck_proves_the_tailnet_is_up_not_just_the_process():
+    """A healthcheck that only proves the binary is running would go healthy before
+    the namespace can route anywhere -- the exact window this is meant to close."""
+    check = _compose()["services"]["ci-fabric"]["healthcheck"]
+    probe = " ".join(check["test"]) if isinstance(check["test"], list) else check["test"]
+    assert "tailscale" in probe and "status" in probe
