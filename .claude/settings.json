@@ -1,0 +1,64 @@
+{
+  "_": "Shared by both operators. Nothing here may name a machine, a user, a tailnet address or a cloud project — put those in .claude/settings.local.json, which is gitignored.",
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(tree *)",
+      "Bash(diff *)",
+
+      "Bash(uv sync*)",
+      "Bash(uv lock*)",
+      "Bash(uv tree*)",
+      "Bash(uv run pytest*)",
+      "Bash(uv run mypy*)",
+      "Bash(uv run ruff*)",
+      "Bash(uv run --no-project *)",
+      "Bash(uvx ruff*)",
+
+      "Bash(ansible-galaxy collection build*)",
+      "Bash(ansible-playbook --syntax-check*)",
+      "Bash(ansible-lint*)",
+
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git fetch*)",
+      "Bash(git remote -v)",
+      "Bash(git add *)",
+      "Bash(git stash*)",
+      "Bash(git check-ignore*)",
+      "Bash(git worktree list*)",
+      "Bash(git submodule status*)",
+      "Bash(git submodule update --init*)",
+
+      "Bash(gh pr view*)",
+      "Bash(gh pr list*)",
+      "Bash(gh pr diff*)",
+      "Bash(gh pr checks*)",
+      "Bash(gh pr create*)",
+      "Bash(gh issue view*)",
+      "Bash(gh issue list*)",
+      "Bash(gh run view*)",
+      "Bash(gh run list*)",
+      "Bash(gh repo view*)",
+
+      "Bash(node scripts/pr-land.js*)",
+      "Bash(node --test .agents/_shared/scripts/__tests__/*)",
+
+      "WebFetch(domain:docs.ansible.com)",
+      "WebFetch(domain:docs.github.com)",
+      "WebFetch(domain:docs.docker.com)",
+      "WebFetch(domain:docs.astral.sh)",
+      "WebFetch(domain:tailscale.com)"
+    ]
+  }
+}
