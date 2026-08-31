@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+import signal
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
@@ -13,14 +15,61 @@ from src.controller import Controller
 
 log = logging.getLogger("ci-controller")
 
+# 12 ticks -- a minute at the deployed POLL_INTERVAL_SECONDS of 5. Long enough that a
+# scheduler restart or a GitHub blip rides through untouched, short enough that a
+# stranded dispatcher is back within a minute rather than however long it takes a
+# human to notice CI is quiet. Both silent stalls so far were found by a person
+# wondering why no job had started.
+DEFAULT_MAX_CONSECUTIVE_TICK_FAILURES = 12
 
-def create_app(controller: Controller, poll_interval: float) -> FastAPI:
+
+@dataclass
+class _TickHealth:
+    """Shared between the tick loop and /healthz."""
+
+    consecutive_failures: int = 0
+    last_error: str = ""
+
+
+def _terminate() -> None:
+    """SIGTERM rather than os._exit: uvicorn then unwinds the lifespan, so the tick
+    task is cancelled and in-flight requests finish. `restart: unless-stopped` restarts
+    the container regardless of exit status, and the fresh container re-enters
+    ci-fabric's CURRENT network namespace -- which is the whole point."""
+    signal.raise_signal(signal.SIGTERM)
+
+
+def create_app(
+    controller: Controller,
+    poll_interval: float,
+    *,
+    max_consecutive_tick_failures: int = DEFAULT_MAX_CONSECUTIVE_TICK_FAILURES,
+    on_fatal: Callable[[], None] | None = None,
+) -> FastAPI:
+    fatal = on_fatal if on_fatal is not None else _terminate
+    health = _TickHealth()
+
     async def _loop() -> None:
         while True:
             try:
                 await asyncio.to_thread(controller.tick)
             except Exception as exc:
-                log.exception("tick failed: %s", exc)
+                health.consecutive_failures += 1
+                health.last_error = f"{type(exc).__name__}: {exc}"
+                log.exception("tick failed (%d consecutive): %s", health.consecutive_failures, exc)
+                if health.consecutive_failures >= max_consecutive_tick_failures:
+                    log.critical(
+                        "%d consecutive tick failures (last: %s) -- exiting so the "
+                        "restart policy can recover; a dispatcher that cannot reach "
+                        "the scheduler dispatches nothing and must not look healthy",
+                        health.consecutive_failures,
+                        health.last_error,
+                    )
+                    fatal()
+                    return
+            else:
+                health.consecutive_failures = 0
+                health.last_error = ""
             await asyncio.sleep(poll_interval)
 
     @asynccontextmanager
@@ -37,8 +86,17 @@ def create_app(controller: Controller, poll_interval: float) -> FastAPI:
     app = FastAPI(title="ci-controller", lifespan=lifespan)
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    async def healthz() -> dict[str, object]:
+        # Deliberately still 200 while degraded: the dashboard polls this, and the
+        # process exits on its own once the failures are sustained. The count is here
+        # to be *seen* -- a flat "ok" is what hid both silent stalls.
+        body: dict[str, object] = {
+            "status": "ok" if health.consecutive_failures == 0 else "degraded",
+            "consecutive_tick_failures": health.consecutive_failures,
+        }
+        if health.last_error:
+            body["last_tick_error"] = health.last_error
+        return body
 
     @app.get("/status")
     async def status() -> dict:

@@ -51,8 +51,18 @@ services:
     restart: unless-stopped
     init: true
     depends_on:
-      - docker-socket-proxy
-      - ci-scheduler
+      docker-socket-proxy:
+        condition: service_started
+      ci-scheduler:
+        condition: service_started
+      # NOT service_started. This container runs INSIDE ci-fabric's network namespace,
+      # so "the sidecar exists" is not enough -- tailscaled must have finished bringing
+      # the interface up, or the dispatcher's first ticks resolve nothing. ci-fabric
+      # crash-looped twice on the 2026-08-31 boot and the dispatcher, already started,
+      # kept the dead namespace forever (see api.py's exit-on-sustained-failure, which
+      # is the runtime half of this fix -- depends_on only orders `compose up`).
+      ci-fabric:
+        condition: service_healthy
     environment:
       CI_CONTROLLER_CONFIG: /etc/ci-controller/ci-controller.yml
       CI_SCHEDULER_URL: http://ci-scheduler:8001
@@ -147,6 +157,15 @@ services:
       - 1.1.1.1
     volumes:
       - ci-fabric-state:/var/lib/tailscale
+    # `tailscale status` exits non-zero until the node is actually up on the tailnet,
+    # so this gates on reachability rather than on the process existing. start_period
+    # covers first-boot registration, which is slower than a reconnect.
+    healthcheck:
+      test: ["CMD", "tailscale", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
     networks:
       homelab:
         aliases:

@@ -1,3 +1,4 @@
+import time
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
@@ -15,7 +16,7 @@ def test_healthz() -> None:
     client = _client({})
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    assert resp.json()["status"] == "ok"
 
 
 def test_status_passthrough() -> None:
@@ -92,3 +93,62 @@ def test_metrics_exposes_info_and_disk_gauges() -> None:
     assert 'admission_mode="reservation"' in body
     assert 'ci_disk_used_gb{disk="ssd"}' in body
     assert 'ci_disk_budget_gb{disk="hdd"}' in body
+
+
+def test_healthz_reports_consecutive_tick_failures() -> None:
+    """/healthz returning a flat `ok` is how both silent-stall incidents stayed
+    invisible: on 2026-08-26 MagicDNS took every poll down, and on 2026-08-31 a
+    ci-fabric restart stranded the dispatcher in a dead network namespace. In both
+    cases every container was Up and /healthz said ok while nothing was dispatched.
+    The tick failure count is the one number that would have shown it."""
+    client = _client({})
+    body = client.get("/healthz").json()
+    assert body["status"] == "ok"
+    assert body["consecutive_tick_failures"] == 0
+
+
+def test_loop_terminates_the_process_after_sustained_tick_failure() -> None:
+    """The dispatcher shares ci-fabric's network namespace (network_mode:
+    service:ci-fabric). When the sidecar restarts, the namespace the dispatcher holds
+    is dead and never recovers -- every tick raises SchedulerUnavailable forever while
+    the container reports Up and restart=0. Exiting hands recovery to the restart
+    policy, which rejoins the live namespace."""
+    controller = MagicMock()
+    controller.tick.side_effect = RuntimeError("scheduler unreachable")
+    fatal = MagicMock()
+
+    app = create_app(
+        controller,
+        poll_interval=0.001,
+        max_consecutive_tick_failures=3,
+        on_fatal=fatal,
+    )
+    with TestClient(app):
+        deadline = time.monotonic() + 5
+        while not fatal.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert fatal.called, "sustained tick failure must terminate the process"
+    assert controller.tick.call_count >= 3
+
+
+def test_loop_does_not_terminate_when_ticks_recover() -> None:
+    """A transient failure is not a stranding. Only an unbroken run of failures is."""
+    controller = MagicMock()
+    controller.tick.side_effect = [RuntimeError("blip"), None, RuntimeError("blip"), None] + [
+        None
+    ] * 50
+    fatal = MagicMock()
+
+    app = create_app(
+        controller,
+        poll_interval=0.001,
+        max_consecutive_tick_failures=3,
+        on_fatal=fatal,
+    )
+    with TestClient(app):
+        deadline = time.monotonic() + 1
+        while controller.tick.call_count < 10 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert not fatal.called, "an interleaved failure must not trip the exit threshold"
