@@ -68,8 +68,9 @@ over another org's placement, it is wrong regardless of how much simpler it look
 - [`docs/plans/`](docs/plans/) — `ideas/` → `ready/` → `ongoing/`, one file per
   topic, deleted when verified. Rules in [`docs/plans/README.md`](docs/plans/README.md).
 - [`.agents/`](.agents/) — skills (`.claude/skills` is a symlink to
-  `.agents/skills`), the `_shared` submodule, and `land.config.json`. Two of the
-  skills (`ship-a-feature`, `managing-plans-lifecycle`) are shared with other
+  `.agents/skills`), the `_shared` submodule, and `land.config.json`.
+  `ship-a-feature` comes from the `_shared` submodule and `managing-plans-lifecycle`
+  from the `agent-plans` plugin; both are shared with other
   repos and carry procedure only; every value specific to this repo lives here
   and in `land.config.json`. **Run `git submodule update --init` after cloning
   and in every new worktree** — a missing `_shared` is silent: the skills load
