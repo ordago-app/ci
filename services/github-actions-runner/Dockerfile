@@ -1,6 +1,5 @@
 FROM ubuntu:24.04
 
-ARG ACTIONS_RUNNER_VERSION=2.337.0
 ARG ANDROID_CMDLINE_TOOLS_VERSION=13114758
 ARG MAESTRO_VERSION=1.39.0
 
@@ -96,9 +95,17 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Runner download is kept LAST of the heavy layers, after the Android SDK and
-# maestro: it is the only consumer of ACTIONS_RUNNER_VERSION, so bumping the
-# runner version invalidates the build cache only from here down — the slow
-# (~hours) Android-SDK/maestro layers above stay cached.
+# maestro, so bumping the runner version invalidates the build cache only from
+# here down — the slow (~hours) Android-SDK/maestro layers above stay cached.
+#
+# ACTIONS_RUNNER_VERSION is DECLARED here rather than at the top of the file, and
+# that placement is load-bearing: `ci_lane_host` builds this image through
+# community.docker.docker_image, which drives the daemon's CLASSIC builder, and
+# there an ARG whose default changes invalidates every layer BELOW the ARG --
+# not just the ones referencing it. Declared at the top, a runner bump therefore
+# re-ran ~10 GB of sdkmanager (hours). Same rule as WITH_ANDROID and PNPM_VERSION
+# below: declare an ARG immediately above its consumer.
+ARG ACTIONS_RUNNER_VERSION=2.337.0
 RUN mkdir -p /opt/actions-runner \
  && curl -fsSL "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" \
       -o /tmp/actions-runner.tar.gz \
