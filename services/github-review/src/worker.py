@@ -84,10 +84,10 @@ class ReviewWorker:
         repo_dir = self._projects_root / job.project / "repo"
         try:
             self._worktrees.fetch(repo_dir)
-            before = self._worktrees.diff_patch_id(
+            before = self._worktrees.diff_fingerprint(
                 repo_dir=repo_dir, base_sha=previous.base_sha, head_sha=previous.head_sha
             )
-            after = self._worktrees.diff_patch_id(
+            after = self._worktrees.diff_fingerprint(
                 repo_dir=repo_dir, base_sha=job.base_sha, head_sha=job.head_sha
             )
             if before is None or before != after:
@@ -99,9 +99,10 @@ class ReviewWorker:
                 job.repo,
                 job.pr_number,
                 f"{CARRIED_REVIEW_MARKER}\n"
-                f"Approval carried over from `{source[:12]}`: this head changes exactly what "
-                f"that one did (`git patch-id` {before[:12]}), so no new review ran. "
-                "Only the base moved underneath it, and CI re-verifies that.",
+                f"Approval carried over from `{source[:12]}`: this head changes exactly the "
+                f"same files to exactly the same contents (diff fingerprint {before[:12]}), "
+                "so no new review ran. Only the base moved underneath it, and CI re-verifies "
+                "that.",
                 "APPROVE",
                 commit_id=job.head_sha,
             )
