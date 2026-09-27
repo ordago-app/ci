@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -59,29 +60,37 @@ class GitWorktreeManager:
         )
         return worktree
 
-    def diff_patch_id(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
-        """`git patch-id --stable` of what `head_sha` changes relative to its merge-base
-        with `base_sha` — the PR's own diff, whatever the base did around it.
+    def diff_fingerprint(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
+        """An EXACT identity for what `head_sha` changes relative to its merge-base with
+        `base_sha`: sha256 of `git diff --raw --no-abbrev --no-renames`, i.e. every
+        changed path with its mode and its before/after blob hashes.
 
-        Two heads with the same id carry byte-identical changes (line numbers and
-        whitespace aside), which is what a clean rebase produces. None when either
-        commit is gone from the clone (a force-pushed head is only kept until gc)
-        or the diff is empty: no answer, never a guessed one."""
+        Blob hashes are over the bytes, so whitespace and binary content count — which
+        `git patch-id` does not guarantee (it ignores whitespace, and a text diff drops
+        binary content). A clean rebase keeps every blob and only changes commit ids,
+        so its fingerprint is unchanged. If the base touched one of the PR's files,
+        that file's before-blob differs and so does the fingerprint: no carry, which
+        is the safe answer. None when either commit is gone from the clone (a
+        force-pushed head is only kept until gc) or the diff is empty."""
         kwargs = self._subprocess_kwargs()
         merge_base = subprocess.run(self._git(repo_dir, "merge-base", base_sha, head_sha), **kwargs)
         if merge_base.returncode != 0:
             return None
-        diff = subprocess.run(
-            self._git(repo_dir, "diff", "--no-color", merge_base.stdout.strip(), head_sha), **kwargs
+        raw = subprocess.run(
+            self._git(
+                repo_dir,
+                "diff",
+                "--raw",
+                "--no-abbrev",
+                "--no-renames",
+                merge_base.stdout.strip(),
+                head_sha,
+            ),
+            **kwargs,
         )
-        if diff.returncode != 0 or not diff.stdout:
+        if raw.returncode != 0 or not raw.stdout.strip():
             return None
-        patch_id = subprocess.run(
-            self._git(repo_dir, "patch-id", "--stable"), input=diff.stdout, **kwargs
-        )
-        if patch_id.returncode != 0 or not patch_id.stdout.strip():
-            return None
-        return patch_id.stdout.split()[0]
+        return hashlib.sha256(raw.stdout.encode()).hexdigest()
 
     def _git(self, repo_dir: Path, *args: str) -> list[str]:
         # The container runs git as root over a clone owned by the operator

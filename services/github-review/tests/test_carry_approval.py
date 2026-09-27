@@ -26,13 +26,10 @@ def git(repo: Path, *args: str) -> str:
 # --- the fingerprint ----------------------------------------------------------
 
 
-def test_a_clean_rebase_keeps_the_patch_id_and_a_new_change_does_not(
-    tmp_path: Path, repo_dir: Path
-) -> None:
-    mgr = GitWorktreeManager(projects_root=tmp_path)
+def _rebase_onto_moved_base(repo_dir: Path) -> tuple[str, str, str, str]:
+    """(old_base, old_head, new_base, rebased_head) after the base gains an unrelated file."""
     old_base = git(repo_dir, "rev-parse", "main")
     old_head = git(repo_dir, "rev-parse", "feature")
-
     git(repo_dir, "checkout", "-q", "main")
     (repo_dir / "OTHER.md").write_text("the base moved\n")
     git(repo_dir, "add", "OTHER.md")
@@ -40,22 +37,73 @@ def test_a_clean_rebase_keeps_the_patch_id_and_a_new_change_does_not(
     new_base = git(repo_dir, "rev-parse", "main")
     git(repo_dir, "checkout", "-q", "feature")
     git(repo_dir, "rebase", "-q", "main")
-    rebased = git(repo_dir, "rev-parse", "feature")
-    assert rebased != old_head, "precondition: the rebase made a new head"
+    return old_base, old_head, new_base, git(repo_dir, "rev-parse", "feature")
 
-    before = mgr.diff_patch_id(repo_dir=repo_dir, base_sha=old_base, head_sha=old_head)
-    after = mgr.diff_patch_id(repo_dir=repo_dir, base_sha=new_base, head_sha=rebased)
+
+def test_a_clean_rebase_keeps_the_fingerprint(tmp_path: Path, repo_dir: Path) -> None:
+    mgr = GitWorktreeManager(projects_root=tmp_path)
+    old_base, old_head, new_base, rebased = _rebase_onto_moved_base(repo_dir)
+    assert rebased != old_head, "precondition: the rebase made a new head"
+    before = mgr.diff_fingerprint(repo_dir=repo_dir, base_sha=old_base, head_sha=old_head)
+    after = mgr.diff_fingerprint(repo_dir=repo_dir, base_sha=new_base, head_sha=rebased)
     assert before is not None and before == after
 
-    (repo_dir / "README.md").write_text("head, changed after review\n")
-    git(repo_dir, "commit", "-qam", "fix")
-    changed = git(repo_dir, "rev-parse", "feature")
-    assert mgr.diff_patch_id(repo_dir=repo_dir, base_sha=new_base, head_sha=changed) != before
+
+def _amend_and_fingerprint(
+    repo_dir: Path, mgr: GitWorktreeManager, name: str, data: bytes
+) -> str | None:
+    (repo_dir / name).write_bytes(data)
+    git(repo_dir, "add", name)
+    git(repo_dir, "commit", "-qm", f"change {name}")
+    return mgr.diff_fingerprint(
+        repo_dir=repo_dir, base_sha="main", head_sha=git(repo_dir, "rev-parse", "feature")
+    )
 
 
-def test_a_head_missing_from_the_clone_has_no_patch_id(tmp_path: Path, repo_dir: Path) -> None:
+def test_a_whitespace_only_change_is_a_different_diff(tmp_path: Path, repo_dir: Path) -> None:
+    # Indentation is behaviour in Python; `git patch-id` would call these equal.
     mgr = GitWorktreeManager(projects_root=tmp_path)
-    assert mgr.diff_patch_id(repo_dir=repo_dir, base_sha="main", head_sha="0" * 40) is None
+    first = _amend_and_fingerprint(repo_dir, mgr, "mod.py", b"if x:\n    y()\nz()\n")
+    second = _amend_and_fingerprint(repo_dir, mgr, "mod.py", b"if x:\n    y()\n    z()\n")
+    assert first is not None and second is not None and first != second
+
+
+def test_a_binary_change_is_a_different_diff(tmp_path: Path, repo_dir: Path) -> None:
+    mgr = GitWorktreeManager(projects_root=tmp_path)
+    first = _amend_and_fingerprint(repo_dir, mgr, "logo.png", b"\x89PNG\x00\x01")
+    second = _amend_and_fingerprint(repo_dir, mgr, "logo.png", b"\x89PNG\x00\x02")
+    assert first is not None and second is not None and first != second
+
+
+def test_a_base_edit_to_the_prs_own_file_is_not_carried(tmp_path: Path, repo_dir: Path) -> None:
+    # The PR's hunk rebases cleanly and reads the same, but it now sits in a file
+    # the base also changed: the before-blob moved, so the fingerprint must too.
+    mgr = GitWorktreeManager(projects_root=tmp_path)
+    lines = [f"line {i}\n" for i in range(20)]
+    git(repo_dir, "checkout", "-q", "main")
+    (repo_dir / "long.txt").write_text("".join(lines))
+    git(repo_dir, "add", "long.txt")
+    git(repo_dir, "commit", "-qm", "long file")
+    git(repo_dir, "checkout", "-q", "-b", "pr2")
+    (repo_dir / "long.txt").write_text("".join(["PR edit\n", *lines[1:]]))
+    git(repo_dir, "commit", "-qam", "pr edits line 0")
+    old_base, old_head = git(repo_dir, "rev-parse", "main"), git(repo_dir, "rev-parse", "pr2")
+    before = mgr.diff_fingerprint(repo_dir=repo_dir, base_sha=old_base, head_sha=old_head)
+
+    git(repo_dir, "checkout", "-q", "main")
+    (repo_dir / "long.txt").write_text("".join([*lines[:19], "base edit\n"]))
+    git(repo_dir, "commit", "-qam", "base edits line 19")
+    git(repo_dir, "checkout", "-q", "pr2")
+    git(repo_dir, "rebase", "-q", "main")
+    after = mgr.diff_fingerprint(
+        repo_dir=repo_dir, base_sha="main", head_sha=git(repo_dir, "rev-parse", "pr2")
+    )
+    assert before is not None and after is not None and after != before
+
+
+def test_a_head_missing_from_the_clone_has_no_fingerprint(tmp_path: Path, repo_dir: Path) -> None:
+    mgr = GitWorktreeManager(projects_root=tmp_path)
+    assert mgr.diff_fingerprint(repo_dir=repo_dir, base_sha="main", head_sha="0" * 40) is None
 
 
 # --- the worker ---------------------------------------------------------------
@@ -103,17 +151,17 @@ class PRs:
 
 
 class Worktrees:
-    """patch-ids keyed by head; the base is irrelevant to the fake."""
+    """fingerprints keyed by head; the base is irrelevant to the fake."""
 
-    def __init__(self, tmp: Path, patch_ids: dict[str, str | None]) -> None:
+    def __init__(self, tmp: Path, fingerprints: dict[str, str | None]) -> None:
         self.tmp = tmp
-        self.patch_ids = patch_ids
+        self.fingerprints = fingerprints
 
     def fetch(self, repo_dir: Path) -> None:
         pass
 
-    def diff_patch_id(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
-        return self.patch_ids.get(head_sha)
+    def diff_fingerprint(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
+        return self.fingerprints.get(head_sha)
 
     def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
         self.tmp.mkdir(parents=True, exist_ok=True)
@@ -139,14 +187,14 @@ class CountingProvider:
         pass
 
 
-def worker(tmp_path: Path, gh: PRs, patch_ids: dict[str, str | None], provider, **kw):
+def worker(tmp_path: Path, gh: PRs, fingerprints: dict[str, str | None], provider, **kw):
     store = ReviewJobStore(tmp_path / "jobs.db")
     store.init()
     w = ReviewWorker(
         config=config(tmp_path),
         store=store,
         github=gh,
-        worktrees=Worktrees(tmp_path / "wt", patch_ids),
+        worktrees=Worktrees(tmp_path / "wt", fingerprints),
         providers={"codex": provider},
         projects_root=tmp_path / "projects",
         reviewer_bot="reviewer[bot]",
@@ -171,6 +219,8 @@ def test_an_approval_carries_onto_a_rebased_head_without_a_review_run(tmp_path: 
     assert body.startswith(CARRIED_REVIEW_MARKER), "pr-land keys on this marker"
     assert "h1" in body
     assert store.rounds_for(REPO, 1) == 1, "a carried approval is not a round"
+    carried = store.get_posted(REPO, 1, "h2")
+    assert carried is not None and carried.carried_from == "h1"
 
 
 def test_a_changed_diff_is_reviewed_again(tmp_path: Path) -> None:
@@ -203,7 +253,7 @@ def test_an_unknown_fingerprint_falls_back_to_a_review(tmp_path: Path) -> None:
     w.tick()
     gh.head = "h2"
     w.tick()
-    assert provider.runs == 2, "no patch-id is no answer — never read as 'identical'"
+    assert provider.runs == 2, "no fingerprint is no answer — never read as 'identical'"
 
 
 def test_a_carry_is_allowed_at_the_round_cap(tmp_path: Path) -> None:
