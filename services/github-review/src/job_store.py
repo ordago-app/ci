@@ -31,6 +31,9 @@ class ReviewJob:
     finished_at: float | None
     last_error: str | None
     verdict: str | None = None
+    # The head whose APPROVE this row re-posted without a review run; see
+    # ReviewWorker._carry_approval. None for every review that read the diff.
+    carried_from: str | None = None
 
 
 class ReviewJobStore:
@@ -58,6 +61,7 @@ class ReviewJobStore:
                   finished_at REAL,
                   last_error TEXT,
                   verdict TEXT,
+                  carried_from TEXT,
                   UNIQUE(repo, pr_number, head_sha)
                 )
                 """
@@ -65,6 +69,8 @@ class ReviewJobStore:
             cols = {row[1] for row in conn.execute("PRAGMA table_info(review_jobs)")}
             if "verdict" not in cols:
                 conn.execute("ALTER TABLE review_jobs ADD COLUMN verdict TEXT")
+            if "carried_from" not in cols:
+                conn.execute("ALTER TABLE review_jobs ADD COLUMN carried_from TEXT")
 
     def enqueue(
         self,
@@ -177,6 +183,25 @@ class ReviewJobStore:
                 (JobStatus.POSTED, time.time(), verdict, job_id),
             )
 
+    def mark_carried(self, job_id: int, source_head_sha: str) -> None:
+        """POSTED as an APPROVE that no review run produced — excluded from rounds_for."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE review_jobs SET status = ?, finished_at = ?, last_error = NULL, "
+                "verdict = ?, carried_from = ? WHERE id = ?",
+                (JobStatus.POSTED, time.time(), "APPROVE", source_head_sha, job_id),
+            )
+
+    def latest_posted_before(self, repo: str, pr_number: int, head_sha: str) -> ReviewJob | None:
+        """The most recent posted review of this PR at any OTHER head."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_jobs WHERE repo = ? AND pr_number = ? AND head_sha != ? "
+                "AND status = ? ORDER BY finished_at DESC, id DESC LIMIT 1",
+                (repo, pr_number, head_sha, JobStatus.POSTED),
+            ).fetchone()
+        return self._from_row(row) if row else None
+
     def mark_skipped(self, job_id: int, reason: str) -> None:
         self._finish(job_id, JobStatus.SKIPPED, reason)
 
@@ -193,10 +218,11 @@ class ReviewJobStore:
         return self._from_row(row) if row else None
 
     def rounds_for(self, repo: str, pr_number: int) -> int:
+        """Reviews that actually ran. A carried approval read nothing, so it is not one."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(DISTINCT head_sha) FROM review_jobs "
-                "WHERE repo = ? AND pr_number = ? AND status = ?",
+                "WHERE repo = ? AND pr_number = ? AND status = ? AND carried_from IS NULL",
                 (repo, pr_number, JobStatus.POSTED),
             ).fetchone()
         return int(row[0])
@@ -254,4 +280,5 @@ class ReviewJobStore:
             finished_at=float(row["finished_at"]) if row["finished_at"] is not None else None,
             last_error=str(row["last_error"]) if row["last_error"] is not None else None,
             verdict=str(row["verdict"]) if row["verdict"] is not None else None,
+            carried_from=str(row["carried_from"]) if row["carried_from"] is not None else None,
         )

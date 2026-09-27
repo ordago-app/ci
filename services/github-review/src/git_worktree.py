@@ -29,8 +29,11 @@ class GitWorktreeManager:
         self._run_as_uid = run_as_uid
         self._run_as_gid = run_as_gid
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+    def fetch(self, repo_dir: Path) -> None:
         self._run(self._git(repo_dir, "fetch", "--all", "--prune"))
+
+    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+        self.fetch(repo_dir)
         present = subprocess.run(
             self._git(repo_dir, "cat-file", "-e", f"{head_sha}^{{commit}}"),
             **self._subprocess_kwargs(),
@@ -55,6 +58,30 @@ class GitWorktreeManager:
             self._git(repo_dir, "worktree", "add", "--detach", "--force", str(worktree), head_sha)
         )
         return worktree
+
+    def diff_patch_id(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
+        """`git patch-id --stable` of what `head_sha` changes relative to its merge-base
+        with `base_sha` — the PR's own diff, whatever the base did around it.
+
+        Two heads with the same id carry byte-identical changes (line numbers and
+        whitespace aside), which is what a clean rebase produces. None when either
+        commit is gone from the clone (a force-pushed head is only kept until gc)
+        or the diff is empty: no answer, never a guessed one."""
+        kwargs = self._subprocess_kwargs()
+        merge_base = subprocess.run(self._git(repo_dir, "merge-base", base_sha, head_sha), **kwargs)
+        if merge_base.returncode != 0:
+            return None
+        diff = subprocess.run(
+            self._git(repo_dir, "diff", "--no-color", merge_base.stdout.strip(), head_sha), **kwargs
+        )
+        if diff.returncode != 0 or not diff.stdout:
+            return None
+        patch_id = subprocess.run(
+            self._git(repo_dir, "patch-id", "--stable"), input=diff.stdout, **kwargs
+        )
+        if patch_id.returncode != 0 or not patch_id.stdout.strip():
+            return None
+        return patch_id.stdout.split()[0]
 
     def _git(self, repo_dir: Path, *args: str) -> list[str]:
         # The container runs git as root over a clone owned by the operator

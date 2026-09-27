@@ -10,6 +10,10 @@ from .poller import ReviewPoller
 from .prompt import build_review_prompt
 from .provider import ReviewProvider
 
+# Opens the body of a carried approval. pr-land (agent-skills) matches it to keep
+# these out of its round count, so the two strings must stay identical.
+CARRIED_REVIEW_MARKER = "<!-- ai-review:carried-approval -->"
+
 
 class ReviewWorker:
     def __init__(
@@ -54,10 +58,63 @@ class ReviewWorker:
             self._config, self._store, self._github, reviewer_bot=self._reviewer_bot
         ).poll_once()
         for job in self._store.list_retryable(self._max_attempts):
+            if self._carry_approval(job):
+                continue
             if self._store.rounds_for(job.repo, job.pr_number) >= self._max_rounds:
                 self._store.mark_skipped(job.id, f"max review rounds ({self._max_rounds}) reached")
                 continue
             self._run_job(job)
+
+    def _carry_approval(self, job: ReviewJob) -> bool:
+        """Re-post the last APPROVE onto `job`'s head when the PR's own diff is unchanged.
+
+        A rebase moves the base under a PR without changing what the PR changes, yet
+        every new head SHA used to buy a full review run and a round. The review is
+        a judgement of the diff; an identical diff has already been judged. What a
+        rebase CAN break — the integration with the moved base — is CI's question,
+        and CI re-runs on the new head regardless.
+
+        Only the LATEST posted review may be carried, and only if it approved: an
+        older approval followed by findings is not an approval of this PR any more.
+        Anything that stops the comparison (a gc'd head, a git error) falls through
+        to a normal review — the expensive answer, never a wrong one."""
+        previous = self._store.latest_posted_before(job.repo, job.pr_number, job.head_sha)
+        if previous is None or previous.verdict != "APPROVE":
+            return False
+        repo_dir = self._projects_root / job.project / "repo"
+        try:
+            self._worktrees.fetch(repo_dir)
+            before = self._worktrees.diff_patch_id(
+                repo_dir=repo_dir, base_sha=previous.base_sha, head_sha=previous.head_sha
+            )
+            after = self._worktrees.diff_patch_id(
+                repo_dir=repo_dir, base_sha=job.base_sha, head_sha=job.head_sha
+            )
+            if before is None or before != after:
+                return False
+            if self._github.get_pull_request(job.repo, job.pr_number).head_sha != job.head_sha:
+                return False
+            source = previous.carried_from or previous.head_sha
+            self._github.post_review(
+                job.repo,
+                job.pr_number,
+                f"{CARRIED_REVIEW_MARKER}\n"
+                f"Approval carried over from `{source[:12]}`: this head changes exactly what "
+                f"that one did (`git patch-id` {before[:12]}), so no new review ran. "
+                "Only the base moved underneath it, and CI re-verifies that.",
+                "APPROVE",
+                commit_id=job.head_sha,
+            )
+        except Exception as exc:
+            print(
+                f"[github-review] approval carry-over skipped for "
+                f"{job.repo}#{job.pr_number}@{job.head_sha[:12]}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        self._store.mark_carried(job.id, source)
+        return True
 
     def _run_job(self, job: ReviewJob) -> None:
         repo_policy = next(
@@ -147,12 +204,17 @@ class ReviewWorker:
         if existing is not None:
             return ReviewResultSummary(head_sha, existing.verdict or "REQUEST_CHANGES", False)
 
-        # Cost backstop: refuse beyond the hard round cap.
-        if self._store.rounds_for(repo, pr_number) >= self._max_rounds:
-            return ReviewResultSummary(head_sha, "REQUEST_CHANGES", True)
-
         project = self._project_for_repo(repo)
         job = self._store.enqueue(repo, project, "codex", pr_number, head_sha, pr.base_sha)
+        # Before the cap: a carried approval costs nothing and is not a round.
+        if self._carry_approval(job):
+            return ReviewResultSummary(head_sha, "APPROVE", False)
+
+        # Cost backstop: refuse beyond the hard round cap.
+        if self._store.rounds_for(repo, pr_number) >= self._max_rounds:
+            self._store.mark_skipped(job.id, f"max review rounds ({self._max_rounds}) reached")
+            return ReviewResultSummary(head_sha, "REQUEST_CHANGES", True)
+
         self._run_job(job)
         done = self._store.get(job.id)
         if done is None or done.status != JobStatus.POSTED or done.verdict is None:
