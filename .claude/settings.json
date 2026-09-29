@@ -1,5 +1,5 @@
 {
-  "_": "Shared by both operators. Nothing here may name a machine, a user, a tailnet address or a cloud project \u2014 put those in .claude/settings.local.json, which is gitignored.",
+  "_": "Shared by both operators. Nothing here may name a machine, a user, a tailnet address or a cloud project — put those in .claude/settings.local.json, which is gitignored.",
   "permissions": {
     "allow": [
       "Bash(ls *)",
@@ -54,16 +54,5 @@
       "WebFetch(domain:docs.astral.sh)",
       "WebFetch(domain:tailscale.com)"
     ]
-  },
-  "extraKnownMarketplaces": {
-    "agent-plans": {
-      "source": {
-        "source": "github",
-        "repo": "alvaro-francisco-gil/agent-plans"
-      }
-    }
-  },
-  "enabledPlugins": {
-    "plans-lifecycle@agent-plans": true
   }
 }

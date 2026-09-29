@@ -70,7 +70,7 @@ over another org's placement, it is wrong regardless of how much simpler it look
 - [`.agents/`](.agents/) — skills (`.claude/skills` is a symlink to
   `.agents/skills`), the `_shared` submodule, and `land.config.json`.
   `ship-a-feature` comes from the `_shared` submodule and `managing-plans-lifecycle`
-  from the `agent-plans` plugin; both are shared with other
+  from the pinned `agent-plans` files in `.agents/skills/`; both are shared with other
   repos and carry procedure only; every value specific to this repo lives here
   and in `land.config.json`. **Run `git submodule update --init` after cloning
   and in every new worktree** — a missing `_shared` is silent: the skills load
@@ -176,3 +176,9 @@ large refactors uninvited.
 Runs on **GitHub-hosted runners**, deliberately: this repo's own CI must not
 depend on the pool it implements, or a change that breaks the dispatcher takes
 out the runners that would have caught it.
+
+## Shared agent setup
+
+`AGENTS.md` is the shared instruction entry point. Project skills live in
+`.agents/skills/`; `.claude/skills` points to that directory. See
+[`.agents/README.md`](.agents/README.md) for discovery requirements and dependencies.
