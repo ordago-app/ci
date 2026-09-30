@@ -9,7 +9,7 @@ Plans are temporary coordination docs. They exist to make upcoming or in-progres
 
 > **Layering.** This skill defines the *lifecycle* only. Everything repo-specific — which stages the repo uses, whether the priority label is required, what counts as "verified", where cross-repo plans live — belongs in the repo's own agent instructions (`AGENTS.md`, `CLAUDE.md`, or equivalent), **which win over this file wherever they differ.** Referred to below as *the repo's instructions*.
 
-This skill owns the *lifecycle* — where plan files live, when they move, and what the `ongoing` status header contains. It does **not** own the *content*: the design questions, the task breakdown, the engineering judgement. Whatever you already use to think a plan through keeps that job.
+This skill owns the *lifecycle* — where plan files live, when they move, and what each plan's metadata block contains. It does **not** own the *content*: the design questions, the task breakdown, the engineering judgement. Whatever you already use to think a plan through keeps that job.
 
 ## Folder layout
 
@@ -18,7 +18,7 @@ docs/
 ├── plans/
 │   ├── ideas/        # Proposals. May or may not happen. No tasks required.
 │   ├── ready/        # Decided to implement. Plan/tasks written. Not started.
-│   └── ongoing/      # Being implemented. Status header at top is required.
+│   └── ongoing/      # Being implemented. Metadata block at top is required.
 │       └── soak/     # OPTIONAL stage — implementation done and verified in
 │                     # production; only elapsed-time soak remains. See below.
 ├── decisions/        # Durable rationale, written when a plan retires.
@@ -30,30 +30,70 @@ One file per topic. **Same filename throughout the lifecycle** — only the dire
 
 `soak/`, `incidents/` and `ops/` exist only in repos whose instructions declare them. A repo that ships continuously and has no store-release or backfill contract does not need `soak/`; don't create it speculatively.
 
-## Priority label (per-repo)
+## The metadata block
 
-Some repos require every file under `docs/plans/{ideas,ready,ongoing}/` to declare exactly one priority label: `low`, `medium`, or `high`. **Check the repo's instructions before enforcing it** — where the convention is not declared, do not add the field to files that lack it, and do not flag its absence as a defect.
-
-Where it *is* required:
-
-Use this metadata line near the top of `ideas/` and `ready/` plans, immediately after the title unless the file already has a compact metadata block:
+Every plan declares its state in a block of bold lines between the `# Title` and the
+first `## ` heading. Only that span is read, so a `**Priority:**` quoted in the body is
+never mistaken for the plan's own.
 
 ```markdown
-**Priority:** medium
+# Notifications — trigger-based migration
+
+**Priority:** high
+**Gate:** release:0.39.0
+**Next:** flip the `notifications/**` create rule to deny client writes
+**Due:** 2026-11-30
 ```
 
-For `ongoing/` plans, include the same label in the required Status section:
+| Key | `ideas/` | `ready/` | `ongoing/`, `ongoing/soak/` |
+|---|---|---|---|
+| `Priority` | required | required | required |
+| `Gate` | optional | optional | required |
+| `Next` | optional | optional | required |
+| `Landed` | — | — | required where the repo declares it |
+| `Due` | optional | optional | optional |
 
-```markdown
-- **Priority:** medium
-```
+- **`Priority`**: `high` | `medium` | `low`. A trailing ` — rationale` is allowed;
+  `medium-high` is not.
+  - **high:** security, data integrity, release blocker, live-user breakage, a
+    real-world deadline, or work that materially reduces operational risk.
+  - **medium:** decided work with clear value, important maintainability, or a known
+    pain point that is not urgent.
+  - **low:** speculative, parked, cleanup-only, or waiting for a stronger trigger.
+- **`Gate`**: what must happen before `Next` is doable *today*:
+  - `none`: actionable now.
+  - `release:<x.y.z>`: waits for that release to be cut. It must name a real version.
+  - `soak:<trigger>`: shipped; waits for time or a trigger.
+  - `decision:<question>`: waits for the owner to decide.
+  - `blocked:<why>`: waits on someone or something else. When `<why>` is exactly
+    `<repo>:<slug>`, or a bare `<slug>` in the same repo, it is a dependency on that plan.
 
-Priority means:
-- **high:** security, data integrity, release blocker, live-user breakage, or work that materially reduces operational risk.
-- **medium:** decided product/platform work with clear value, important maintainability, or a known pain point that is not urgent.
-- **low:** speculative, parked, future-facing, cleanup-only, or work that should wait for a stronger trigger.
+  Any gate may end with ` (recheck YYYY-MM-DD)`, the date to look again.
+  **Never write a vague gate**: "waiting" is how a plan sits unnoticed for months.
+- **`Next`**: one imperative line, enough for someone to start cold.
+- **`Landed`**: `none` | `dev` | `beta` | `prod` | `n/a`, the furthest environment where
+  the code is live. It is the retirement gate: merged is not verified. It applies only in
+  repos that deploy. Such a repo declares it in its instructions, machine-readably, with a
+  line that is exactly `<!-- plans:landed -->`.
+- **`Due`**: `YYYY-MM-DD`, a real-world deadline, never an estimate.
 
-When creating or promoting a plan, set the priority deliberately. When surveying plans, call out missing or stale priorities before discussing order. Do not leave `TBD` or omit the field.
+### State is derived, never hand-written
+
+Do not write `Updated`, `Stage`, `Status`, `Last reviewed`, `Blockers`, `Waiting-on` or
+`Blocked-by` lines. The **folder** is the stage, **`Gate`** is the wait, and **git** is
+the last touch. A hand-written "last updated" is the field that rots first.
+
+To read when a plan last advanced, walk its `git log` newest-first and skip **sweep**
+commits. A sweep is a mechanical edit across many plans: a convention rollout, a rename,
+a migration. It is not progress on any of them.
+- A commit is a sweep when it touches more than **4** plan files and ships nothing.
+  "Ships nothing" means every file it touches is either under `docs/` or Markdown.
+- The limit is more than **8** plan files when it also ships a file.
+- A plan with uncommitted changes has advanced today.
+- A plan touched only by sweeps dates from its first commit.
+
+Prose sections such as `## Handoff`, `## Done` or a rollout table stay welcome. They
+carry context, not state.
 
 ### File naming — date events, never date living documents
 
@@ -77,7 +117,7 @@ forces every future reader to open it just to find out whether it still applies.
 
 Why plans in particular must not carry one:
 - The filename is stable across the lifecycle (idea → ready → ongoing). A date that was meaningful when the proposal was drafted becomes misleading by the time implementation starts.
-- Git log + the `ongoing` Status header carry every timing question worth answering: when it was proposed, when it was promoted, when it was last touched.
+- Git log carries every timing question worth answering: when it was proposed, when it was promoted, when it last really advanced (walking past sweeps).
 - The folder is the meaningful coordinate, not the date.
 
 If a file lands in `docs/plans/` with a date prefix, rename it on the spot — don't leave it for later. Same applies to file imports from other repos: drop the date during the move.
@@ -97,7 +137,7 @@ Not `docs/archive/`, not `docs/plans/{queued,blocked}/`, and no tool-specific sc
 
 - About to brainstorm or plan something → use it to know where the output should land
 - About to promote a plan between stages → use it for the file move + content edits
-- Starting or resuming work on an `ongoing/` plan → read the status header **first**
+- Starting or resuming work on an `ongoing/` plan → read its metadata block (`Gate`, `Next`) **first**
 - A plan's implementation is merged → use it to distill into `docs/decisions/` and delete the plan
 - The user asks "what plans are in flight" or "what's the status of X" → start from `docs/plans/ongoing/`
 
@@ -108,7 +148,8 @@ Not `docs/archive/`, not `docs/plans/{queued,blocked}/`, and no tool-specific sc
 A new plan lands in `docs/plans/ideas/<topic>.md` directly. No separate spec/plan file split — one file evolves through the stages. If your planning tool writes it somewhere else, or with a date prefix, move and rename it on the spot.
 
 A new `ideas/` doc should contain at minimum:
-- **Priority:** `low`, `medium`, or `high`
+- the metadata block under the title, at least `**Priority:** low | medium | high` as a
+  bare line (not a bullet; a bulleted key is not read as the block)
 - **Goal:** one sentence
 - **Context:** why this is being proposed
 - **Design / approach:** the actual proposal
@@ -131,36 +172,20 @@ Then `git mv docs/plans/ideas/<topic>.md docs/plans/ready/<topic>.md`.
 
 Implementation is starting. Before moving:
 
-1. Insert the **Status** section as the first `##` in the file, above any existing content (after the title and Goal line).
-2. Fill in the initial values.
+1. Complete the metadata block: `Gate` and `Next` (and `Landed` where the repo declares
+   it). `Gate: none` if work can start now.
+2. Put hand-off context the next agent needs (env state, "rerun X before pushing") in a
+   `## Handoff` section, as prose.
 
 Then `git mv docs/plans/ready/<topic>.md docs/plans/ongoing/<topic>.md`.
 
-#### The Status section (required in `ongoing/`)
-
-```markdown
-## Status
-
-- **Updated:** YYYY-MM-DD
-- **Priority:** low | medium | high
-- **Stage:** which task/section is currently in progress
-- **Branch:** repo `branch-name` (or "n/a — multi-repo" with a list)
-- **Done:** what's verifiably complete (one bullet per chunk, terse)
-- **Next:** the immediate next action
-- **Blockers:** any open questions or external dependencies
-- **Handoff:** non-obvious context another agent needs to resume — env state, regen steps, "rerun X before pushing", anything not visible from the diff
-```
-
-Update the Status section:
-- At the **start** of every work session (set `Updated`, refresh `Next` and `Blockers`)
-- At the **end** of every work session (move items from `Next` to `Done`, refresh `Handoff`)
-- Whenever a blocker resolves or a new one appears
-
-The Status section is the contract with the next agent (or future you). If a field doesn't apply, write `none` — don't omit it.
+Keep the block true at the end of every work session: `Next` names the immediate next
+action and `Gate` names what stands in its way. That is the whole contract with the next
+agent; everything else is derived.
 
 #### Rollout / phase table (keep it when the plan has one)
 
-Some repos ship code on dev → beta → prod at different times and run per-env backfills. A prose Status section alone can't tell "Phase 1 shipped" from "Phase 1 shipped on dev only, beta pending." When an `ongoing/` plan has env-specific or multi-phase state, **keep a verifiable progress table below the Status section** (an env-rollout matrix or a phase table). The Status section is the human summary; the table is the verifiable state — a plan that lacks one can stall silently.
+Some repos ship code on dev → beta → prod at different times and run per-env backfills. A one-line `Next` alone can't tell "Phase 1 shipped" from "Phase 1 shipped on dev only, beta pending." When an `ongoing/` plan has env-specific or multi-phase state, **keep a verifiable progress table below the metadata block** (an env-rollout matrix or a phase table). The block is the summary; the table is the verifiable state — a plan that lacks one can stall silently.
 
 ```markdown
 ## Rollout status
@@ -184,7 +209,7 @@ Only in repos that declare `soak/`. Move a plan there when **all** of these hold
 
 Keep it in plain `ongoing/` when production has not been verified yet, implementation still needs code, a required backfill has not run on every env, or the next step is engineering work rather than elapsed time.
 
-When moving into `soak/`: record exact evidence in the Status block (env, marker path or release, date, counts where available, and the remaining trigger); update relative links in the moved file and inbound links from related plans and scripts; and leave the next action concrete — *"after soak, set backfill gates to vX.Y.Z and remove the legacy fields"*, never *"follow up later"*.
+When moving into `soak/`: record exact evidence in the plan body (env, marker path or release, date, counts where available), set `Gate: soak:<the remaining trigger>`; update relative links in the moved file and inbound links from related plans and scripts; and leave the next action concrete — *"after soak, set backfill gates to vX.Y.Z and remove the legacy fields"*, never *"follow up later"*.
 
 ### `ongoing/` (or `soak/`) → retired (plan deleted)
 
@@ -194,7 +219,7 @@ When moving into `soak/`: record exact evidence in the Status block (env, marker
    - **Keep** (move to `docs/decisions/<topic>.md`): non-obvious design choices, rejected alternatives with reasons, invariants the code enforces but doesn't explain, dependencies on external systems / contracts.
    - **Keep** (move to `docs/incidents/<date>-<slug>.md`, where the repo has that folder): production incidents and notable bugs — what happened, scope, recovery. Link out to the `decisions/` doc that fixed it rather than restating it.
    - **Keep** (move to `docs/ops/<slug>.md`, where the repo has that folder): operational recipes and credential/config facts that aren't a decision.
-   - **Delete**: task lists, file-by-file checklists, "how we did it" prose, status headers, rollout tables, anything visible by reading the code or `git log`.
+   - **Delete**: task lists, file-by-file checklists, "how we did it" prose, rollout tables, anything visible by reading the code or `git log`.
    - **Delete**: outdated assumptions, open questions that got answered by reality.
 
    **Default to deleting outright.** Most shipped plans warrant no durable doc at all. Do not write a decision doc to summarise a completed plan, and never when the *why* is already recoverable from git, a closed issue, an upstream source, or an existing decision. A decision doc nobody needs is debt.
@@ -209,7 +234,7 @@ Commit message: `docs: retire <topic> plan; extract decision` (or just `docs: re
 
 When asked "what's in flight" or "what plans do we have":
 
-1. `ls docs/plans/ongoing/` — what's actively being worked on. Read each file's Status section.
+1. `ls docs/plans/ongoing/` — what's actively being worked on. Read each file's metadata block.
 2. `ls docs/plans/ongoing/soak/` — done, waiting on elapsed time (where the repo uses it).
 3. `ls docs/plans/ready/` — what's queued.
 4. `ls docs/plans/ideas/` — what's been proposed.
@@ -223,12 +248,30 @@ When *auditing* rather than listing, the bar is higher: for each plan that looks
 
 - **Adding a `done/`, `completed/`, `archive/`, `queued/`, or `blocked/` folder.** Done plans are deleted, not archived. The history is in git + decisions. Decided-not-started is `ready/`; gated/speculative is `ideas/`.
 - **Keeping the date prefix.** Dates rot as the plan evolves; the filename should be stable across the lifecycle.
-- **Skipping the Status header on `ongoing/`.** A plan without a Status header is unusable for handoff — fix it before doing any other work.
-- **Moving a plan into `ongoing/` without a rollout/phase table when it has per-env or multi-phase state.** The Status line alone hides which envs shipped.
+- **An `ongoing/` plan without `Gate` and `Next`.** It is unusable for handoff; fix it before doing any other work.
+- **Hand-writing state.** `Updated`, `Stage` or `Status` lines rot; the folder, `Gate` and git already carry them.
+- **Moving a plan into `ongoing/` without a rollout/phase table when it has per-env or multi-phase state.** The metadata block alone hides which envs shipped.
 - **Writing a decision doc that restates the implementation.** If a future reader could learn it by reading the code, it doesn't belong in `docs/decisions/`.
 - **Promoting `ideas/` → `ready/` without resolving open questions.** Move the questions to "Out of scope" or answer them. `ready/` means decided.
+- **A vague gate.** `blocked:waiting` says nothing; name who or what, and add `(recheck YYYY-MM-DD)`.
 - **Marking work `ongoing/` before implementation actually starts.** `ready/` is where decided-but-unstarted work waits; an `ongoing/` plan nobody is touching makes every real one harder to find.
 - **Retiring a plan because the code merged.** Merged is not verified. Retire on confirmed behaviour in the environment that matters.
 - **Inventing a parallel lifecycle taxonomy.** If a state feels unrepresentable, it is almost always `ideas/` (undecided) or `ready/` with the gate stated inline. Adding a folder fragments the index for everyone.
 - **Burying unresolved follow-up work in a PR or chat message.** Those vanish. Update the plan, or create one.
 - **Enforcing a convention the repo never adopted** — the priority label being the usual case. Check the repo's instructions first.
+
+## Migrating from v1
+
+v1 kept a hand-written `## Status` section. To migrate a repo:
+
+1. For each plan, write the block under the title:
+   - `Priority` stays. Move it out of any `## Status` bullet.
+   - `Blockers`, `Waiting-on` and `Blocked-by` become one `Gate`, e.g.
+     `blocked:bank statement (recheck 2026-10-03)` or `blocked:<repo>:<slug>`.
+   - `Next` stays, as one line.
+   - `Due` stays.
+2. Delete `Updated`, `Stage`, `Status` and `Last reviewed`. Keep `Done` and `Handoff` as
+   prose sections if they still say something.
+3. Commit the whole repo's migration as **one commit**. When it touches more than 4 plans
+   it is a sweep and resets no plan's freshness; a smaller migration does reset them, so
+   those plans read as advanced on the migration day.

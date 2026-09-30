@@ -12,8 +12,8 @@ Tool-specific permissions, hooks and MCP configuration remain tool-specific.
 ## Upstream skills
 
 The two skills `managing-plans-lifecycle` and `superpowers-plans-bridge` are
-unmodified copies from [agent-plans](https://github.com/alvaro-francisco-gil/agent-plans/tree/0976c3043d5496f9e3ca869fbe6e5056b38af9bb),
-version 1.0.2, commit `0976c3043d5496f9e3ca869fbe6e5056b38af9bb`.
+unmodified copies from [agent-plans](https://github.com/alvaro-francisco-gil/agent-plans/tree/702f79a51189ea256a24168e5db4fa6cc46854ee),
+version 2.0.1, commit `702f79a51189ea256a24168e5db4fa6cc46854ee`.
 The MIT licence is in `skills/LICENSE.agent-plans`.
 
 Update both files together from a reviewed upstream commit and update this pin.
