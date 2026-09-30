@@ -7,6 +7,7 @@ operator's host config to make its tests pass would be the neutrality decay
 ci-controller/tests/test_no_operator_defaults.py exists to prevent.
 """
 
+import re
 from pathlib import Path
 
 import jinja2
@@ -67,3 +68,31 @@ def test_a_disabled_runner_is_not_rendered() -> None:
         )
     )
     assert "fixture-light" not in rendered["services"]
+
+
+def test_runner_version_arg_does_not_precede_the_android_layers():
+    """Keep a runner-version bump from re-running the Android/maestro layers.
+
+    `ci_lane_host` builds this image through `community.docker.docker_image`,
+    which drives the daemon's CLASSIC builder. There, changing an ARG's default
+    invalidates every layer BELOW the ARG -- not merely the ones referencing it.
+    `ACTIONS_RUNNER_VERSION` therefore has to be declared under the Android
+    layers, next to the runner download that is its only consumer.
+
+    Declared at the top of the file (where it lived until GitHub deprecated
+    2.335.1 and forced a bump) it re-ran ~10 GB of sdkmanager for a ~200 MB
+    tarball, extending a total CI outage by hours.
+    """
+    dockerfile = (TESTS.parent / "Dockerfile").read_text()
+
+    declarations = [
+        m.start()
+        for m in re.finditer(r"^ARG ACTIONS_RUNNER_VERSION", dockerfile, re.MULTILINE)
+    ]
+    assert len(declarations) == 1, (
+        f"expected exactly one ACTIONS_RUNNER_VERSION declaration, got {len(declarations)}"
+    )
+    assert dockerfile.index("ARG WITH_ANDROID") < declarations[0], (
+        "ARG ACTIONS_RUNNER_VERSION must be declared BELOW the Android SDK "
+        "layers, or bumping the runner re-runs them on the classic builder"
+    )
