@@ -21,6 +21,9 @@ instructions locally: repository-specific policy belongs in `AGENTS.md`. This co
 a plans-lifecycle plugin install; if you also installed that plugin globally, disable it for
 this project to avoid exposing two copies.
 
+Existing shared skills may link into `.agents/_shared`. Run
+`git submodule update --init --recursive` after cloning and in new worktrees.
+
 References: [Claude instructions](https://code.claude.com/docs/en/memory#read-agentsmd),
 [Claude skills](https://code.claude.com/docs/en/skills),
 [Codex skills](https://learn.chatgpt.com/docs/build-skills).
