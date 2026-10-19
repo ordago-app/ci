@@ -11,19 +11,15 @@ Tool-specific permissions, hooks and MCP configuration remain tool-specific.
 
 ## Upstream skills
 
-The two skills `managing-plans-lifecycle` and `superpowers-plans-bridge` are
-unmodified copies from [agent-plans](https://github.com/alvaro-francisco-gil/agent-plans/tree/702f79a51189ea256a24168e5db4fa6cc46854ee),
-version 2.0.1, commit `702f79a51189ea256a24168e5db4fa6cc46854ee`.
+The skill `managing-plans-lifecycle` is an unmodified copy from
+[agent-plans](https://github.com/alvaro-francisco-gil/agent-plans/tree/ae4235530d9d199372a373d01a977aba63ce1d59),
+version 3.0.0, commit `ae4235530d9d199372a373d01a977aba63ce1d59`.
 The MIT licence is in `skills/LICENSE.agent-plans`.
 
-Update both files together from a reviewed upstream commit and update this pin.
-Do not fork their instructions locally: repository-specific policy belongs in
-`AGENTS.md`. These files replace the project-level plans-lifecycle plugin install;
-if you separately installed that plugin globally, disable it for this project to
-avoid exposing two copies.
-
-Existing shared skills may link into `.agents/_shared`. Run
-`git submodule update --init --recursive` after cloning and in new worktrees.
+Refresh it with the workspace's `vendor-agent-plans.py`, never by hand, and do not fork its
+instructions locally: repository-specific policy belongs in `AGENTS.md`. This copy replaces
+a plans-lifecycle plugin install; if you also installed that plugin globally, disable it for
+this project to avoid exposing two copies.
 
 References: [Claude instructions](https://code.claude.com/docs/en/memory#read-agentsmd),
 [Claude skills](https://code.claude.com/docs/en/skills),
