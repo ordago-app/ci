@@ -84,6 +84,26 @@ def _policy(host: HostConfig, config: ControllerConfig) -> _HostPolicy:
     )
 
 
+# Load average counts tasks blocked in uninterruptible IO as well as runnable ones, so
+# on a box whose root is a spinning disk one swapping container lifts it far past the
+# ceiling while every CPU idles: 2026-10-20, load 20-50 at 5-8 % CPU for five hours, and
+# every CI job deferred host_pressure (docs/incidents/2026-10-20-ci-held-by-io-wait-load.md).
+# The ceiling is there to stop CPU oversubscription (2026-08-07), so load only counts
+# while the CPUs are actually contended. At 2:1 oversubscription some task is always
+# waiting, i.e. PSI cpu `some` near 100 %; half of that still trips well before it.
+_LOAD_COUNTS_FROM_CPU_PRESSURE_PCT = 50.0
+
+
+def _cpu_oversubscribed(stats: HostStats, load_ceiling: float) -> bool:
+    if load_ceiling <= 0 or stats.load_1m <= load_ceiling:
+        return False
+    # No PSI reading: the plain load-average gate, as before, rather than no gate.
+    return (
+        stats.cpu_pressure_pct is None
+        or stats.cpu_pressure_pct >= _LOAD_COUNTS_FROM_CPU_PRESSURE_PCT
+    )
+
+
 def _gates(
     state: _HostState,
     job_class: JobClass,
@@ -116,7 +136,7 @@ def _gates(
         and stats is not None
         and (
             stats.mem_available_mb < policy.host_free_ram_floor_mb
-            or (policy.host_load_ceiling > 0 and stats.load_1m > policy.host_load_ceiling)
+            or _cpu_oversubscribed(stats, policy.host_load_ceiling)
         )
     ):
         reasons.append(HOST_PRESSURE)
