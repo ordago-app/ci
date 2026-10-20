@@ -1,3 +1,4 @@
+import pytest
 from src.admission import evaluate
 from src.config import ControllerConfig
 from src.host_stats import HostStats
@@ -869,3 +870,35 @@ def test_the_ram_floor_does_not_depend_on_cpu_pressure(write_config) -> None:
     decisions = evaluate([job], Ledger(), cfg, {"powerserver": low_ram})
     assert isinstance(decisions[0], DeferDecision)
     assert decisions[0].reason == HOST_PRESSURE
+
+
+@pytest.mark.parametrize(
+    ("load", "pressure", "deferred"),
+    [
+        (40.0, 49.9, False),  # just under the CPU-pressure threshold
+        (40.0, 50.0, True),  # at it
+        (16.0, 95.0, False),  # at the load ceiling, which is a strict bound
+        (16.1, 95.0, True),
+    ],
+)
+def test_load_gate_boundaries(write_config, load, pressure, deferred) -> None:
+    cfg = _load_guarded(write_config)
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    stats = HostStats(mem_available_mb=8000, load_1m=load, cpu_pressure_pct=pressure)
+    decision = evaluate([job], Ledger(), cfg, {"powerserver": stats})[0]
+    assert isinstance(decision, DeferDecision) is deferred
+
+
+def test_a_disabled_load_gate_ignores_load_and_cpu_pressure(write_config) -> None:
+    cfg = ControllerConfig.load(
+        write_config(
+            VALID_CONFIG.replace(
+                "ram_budget_mb: 12000",
+                "admission_mode: reservation_plus_guard\nhost_load_ceiling: 0.0\n"
+                "ram_budget_mb: 12000",
+            )
+        )
+    )
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    stats = HostStats(mem_available_mb=8000, load_1m=99.0, cpu_pressure_pct=100.0)
+    assert isinstance(evaluate([job], Ledger(), cfg, {"powerserver": stats})[0], AdmitDecision)

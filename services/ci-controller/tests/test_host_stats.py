@@ -31,3 +31,8 @@ def test_no_pressure_file_means_no_reading_not_zero(tmp_path) -> None:
     # without PSI; None keeps the gate's plain load-average meaning.
     assert read_host_stats(*_files(tmp_path, None)).cpu_pressure_pct is None
     assert read_host_stats(*_files(tmp_path, "garbage\n")).cpu_pressure_pct is None
+
+
+def test_a_malformed_avg60_means_no_reading(tmp_path) -> None:
+    psi = "some avg10=0.15 avg60=n/a avg300=2.04 total=1\n"
+    assert read_host_stats(*_files(tmp_path, psi)).cpu_pressure_pct is None
