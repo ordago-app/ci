@@ -83,9 +83,27 @@ class CodexReviewProvider:
         # (uid 1000). Hand both mounts to that uid so codex can write.
         self._make_agent_writable(worktree, codex_home)
 
-        container = self._docker.containers.run(
-            image=image.id,
-            name=f"codex-review-{job.id}",
+        # `containers.run` is create-then-start. On a loaded host the start can time
+        # out after the container exists, and this raises before the worker has a
+        # session to clean up -- every retry of the job then died on the name
+        # (docs/incidents/2026-10-20-review-container-name-conflict.md). So clear
+        # the name first (safe: a job is claimed by exactly one worker, this one)
+        # and remove the container if create or start raises.
+        name = f"codex-review-{job.id}"
+        self._remove_existing(name)
+        try:
+            container = self._start_container(job, image.id, name, worktree, codex_home)
+        except BaseException:
+            self._remove_quietly(name)
+            raise
+        return SessionRef(id=str(job.id), container=container.name, worktree=worktree)
+
+    def _start_container(
+        self, job: ReviewJob, image_id: str, name: str, worktree: Path, codex_home: Path
+    ):
+        return self._docker.containers.run(
+            image=image_id,
+            name=name,
             command=["sleep", "infinity"],
             detach=True,
             network="homelab",
@@ -105,7 +123,6 @@ class CodexReviewProvider:
                 str(self._codex_state_root): {"bind": str(self._codex_state_root), "mode": "rw"},
             },
         )
-        return SessionRef(id=str(job.id), container=container.name, worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
         container = self._docker.containers.get(session.container)
@@ -130,17 +147,28 @@ class CodexReviewProvider:
         return ReviewResult(body=body, event=event)
 
     def cleanup(self, session: SessionRef) -> None:
+        self._remove_quietly(session.container)
+
+    def _remove_existing(self, name: str) -> None:
+        """Remove the container if it exists, raising if that fails: a session must
+        not start while a container under its name may still be there."""
+        try:
+            container = self._docker.containers.get(name)
+        except NotFound:
+            return
+        container.remove(force=True)
+
+    def _remove_quietly(self, name: str) -> None:
         # Runs in the worker's finally, so it must not raise. But it must not
         # silently swallow failures either: a hidden remove() error leaks one
         # codex container per review and eventually exhausts the host.
         try:
-            container = self._docker.containers.get(session.container)
+            container = self._docker.containers.get(name)
         except NotFound:
             return
         except Exception as exc:
             print(
-                f"[github-review] could not look up review container "
-                f"{session.container} for cleanup: {exc}",
+                f"[github-review] could not look up review container {name} for cleanup: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -149,7 +177,7 @@ class CodexReviewProvider:
             container.remove(force=True)
         except Exception as exc:
             print(
-                f"[github-review] failed to remove review container {session.container}: {exc}",
+                f"[github-review] failed to remove review container {name}: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
