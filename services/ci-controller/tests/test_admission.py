@@ -1,3 +1,4 @@
+import pytest
 from src.admission import evaluate
 from src.config import ControllerConfig
 from src.host_stats import HostStats
@@ -816,3 +817,88 @@ def test_omitting_allowed_orgs_means_every_org(write_config):
 
     assert isinstance(decisions[0], AdmitDecision)
     assert decisions[0].host == "powerserver"
+
+
+def _load_guarded(write_config) -> ControllerConfig:
+    return ControllerConfig.load(
+        write_config(
+            VALID_CONFIG.replace(
+                "ram_budget_mb: 12000",
+                "admission_mode: reservation_plus_guard\nhost_load_ceiling: 16.0\n"
+                "ram_budget_mb: 12000",
+            )
+        )
+    )
+
+
+def test_load_that_is_cpu_contention_defers(write_config) -> None:
+    cfg = _load_guarded(write_config)
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    oversubscribed = HostStats(mem_available_mb=8000, load_1m=40.0, cpu_pressure_pct=95.0)
+    decisions = evaluate([job], Ledger(), cfg, {"powerserver": oversubscribed})
+    assert isinstance(decisions[0], DeferDecision)
+    assert decisions[0].reason == HOST_PRESSURE
+
+
+def test_load_that_is_only_tasks_blocked_on_io_admits(write_config) -> None:
+    """2026-10-20: one container thrashing its own memory limit swapped onto the HDD.
+    Its tasks blocked in IO pushed load_1m to 20-50 for five hours while the CPUs
+    were 5-8 % busy and RAM was 9 GB free, and the load gate deferred every CI job.
+    Load average counts tasks in uninterruptible IO wait; the ceiling exists to stop
+    CPU oversubscription, so load only counts while the CPUs are contended."""
+    cfg = _load_guarded(write_config)
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    io_bound = HostStats(mem_available_mb=9000, load_1m=40.0, cpu_pressure_pct=0.2)
+    assert isinstance(evaluate([job], Ledger(), cfg, {"powerserver": io_bound})[0], AdmitDecision)
+
+
+def test_load_without_a_cpu_pressure_reading_still_defers(write_config) -> None:
+    # No PSI (kernel without it, or the file unreadable): the gate keeps its old
+    # meaning rather than switching itself off.
+    cfg = _load_guarded(write_config)
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    blind = HostStats(mem_available_mb=8000, load_1m=40.0, cpu_pressure_pct=None)
+    decisions = evaluate([job], Ledger(), cfg, {"powerserver": blind})
+    assert isinstance(decisions[0], DeferDecision)
+    assert decisions[0].reason == HOST_PRESSURE
+
+
+def test_the_ram_floor_does_not_depend_on_cpu_pressure(write_config) -> None:
+    cfg = _load_guarded(write_config)
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    low_ram = HostStats(mem_available_mb=500, load_1m=1.0, cpu_pressure_pct=0.0)
+    decisions = evaluate([job], Ledger(), cfg, {"powerserver": low_ram})
+    assert isinstance(decisions[0], DeferDecision)
+    assert decisions[0].reason == HOST_PRESSURE
+
+
+@pytest.mark.parametrize(
+    ("load", "pressure", "deferred"),
+    [
+        (40.0, 49.9, False),  # just under the CPU-pressure threshold
+        (40.0, 50.0, True),  # at it
+        (16.0, 95.0, False),  # at the load ceiling, which is a strict bound
+        (16.1, 95.0, True),
+    ],
+)
+def test_load_gate_boundaries(write_config, load, pressure, deferred) -> None:
+    cfg = _load_guarded(write_config)
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    stats = HostStats(mem_available_mb=8000, load_1m=load, cpu_pressure_pct=pressure)
+    decision = evaluate([job], Ledger(), cfg, {"powerserver": stats})[0]
+    assert isinstance(decision, DeferDecision) is deferred
+
+
+def test_a_disabled_load_gate_ignores_load_and_cpu_pressure(write_config) -> None:
+    cfg = ControllerConfig.load(
+        write_config(
+            VALID_CONFIG.replace(
+                "ram_budget_mb: 12000",
+                "admission_mode: reservation_plus_guard\nhost_load_ceiling: 0.0\n"
+                "ram_budget_mb: 12000",
+            )
+        )
+    )
+    job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
+    stats = HostStats(mem_available_mb=8000, load_1m=99.0, cpu_pressure_pct=100.0)
+    assert isinstance(evaluate([job], Ledger(), cfg, {"powerserver": stats})[0], AdmitDecision)

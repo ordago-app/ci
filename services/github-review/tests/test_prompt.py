@@ -58,3 +58,9 @@ def test_prompt_contains_review_policy_and_pr_context() -> None:
     assert "would fail if the change were reverted" in prompt
     # CI status is a gate too (the reviewer App has Checks:Read).
     assert "CI is also a gate" in prompt
+    # Every blocking finding in one pass. Each REQUEST_CHANGES costs the author a
+    # push, a CI run and a review run, under a round cap; a reviewer that stops at
+    # the first blocker turns N problems into N rounds. Measured on ordago-apps
+    # (206 REQUEST_CHANGES reviews, 2026-10): a median of one finding per review.
+    assert "every blocking finding" in prompt.lower()
+    assert "this one pass" in prompt.lower()
