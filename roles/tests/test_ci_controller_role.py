@@ -114,3 +114,72 @@ def test_the_state_dir_follows_the_operators_personal_root() -> None:
         "the state dir ignores personal_root; an operator who moved personal_root "
         "gets state written somewhere they never configured"
     )
+
+
+def test_an_unhealthy_dispatcher_is_actually_restarted() -> None:
+    """The dispatcher borrows the fabric sidecar's network namespace, and docker does
+    not restart a dependent when the namespace owner restarts. The result is silent and
+    permanent: no DNS, every call failing, and a container that still reads `Up`.
+
+    A healthcheck alone does not fix it -- compose marks the container unhealthy and
+    takes no action -- so the role must also deploy something that reads the health
+    state and acts. Shipping the probe without the actor would be a control that cannot
+    fire, the defect retired in #3.
+    """
+    tasks = _tasks()
+    by_dest = {}
+    for t in tasks:
+        copy = t.get("ansible.builtin.copy") or t.get("copy")
+        if copy and "dest" in copy:
+            by_dest[copy["dest"]] = copy.get("content", "")
+
+    script = by_dest.get("/usr/local/sbin/ci-controller-healthcheck-watch")
+    unit = by_dest.get("/etc/systemd/system/ci-controller-healthcheck.service")
+    timer = by_dest.get("/etc/systemd/system/ci-controller-healthcheck.timer")
+    assert script is not None, "the role must deploy a watcher script"
+    assert unit is not None, "and a service unit to run it"
+    assert timer is not None, "and a timer to run the service"
+
+    assert "ExecStart=/usr/local/sbin/ci-controller-healthcheck-watch" in unit
+
+    assert "health=unhealthy" in script, (
+        "the watcher must filter on health state; the orphaned dispatcher stays "
+        "`running`, so a liveness-based filter never matches it"
+    )
+    assert "docker restart ci-controller" in script
+    assert "'name=^/ci-controller$'" in script, (
+        "anchor the name filter: unanchored it also matches ci-controller-socket-proxy"
+    )
+    assert "echo" in script or "logger" in script, (
+        "the watcher must log when it fires -- a silent auto-restart hides a recurring "
+        "fault the same way the original failure hid itself"
+    )
+
+    assert "OnUnitActiveSec" in timer and "OnBootSec" in timer
+
+    assert any(
+        (t.get("ansible.builtin.systemd") or t.get("systemd") or {}).get("name")
+        == "ci-controller-healthcheck.timer"
+        for t in tasks
+    ), "the timer must be enabled and started"
+
+
+def test_the_compose_probe_can_see_a_dead_namespace() -> None:
+    """The probe must exercise name resolution. `localhost` needs no resolver, so a
+    probe of this dispatcher's own /status reaches its handler, which then calls the
+    scheduler BY NAME and fails -- which is what makes it a resolution check.
+
+    /healthz answers from the process itself and returned 200 throughout the 2026-08-26
+    outage, when no repo was being polled at all. A liveness probe passes in exactly the
+    broken state.
+    """
+    compose = yaml.safe_load((REPO / "services" / "ci-controller" / "compose.yml").read_text())
+    hc = compose["services"]["ci-controller"].get("healthcheck")
+    assert hc, "ci-controller must have a healthcheck"
+
+    test = hc["test"]
+    probe = " ".join(test) if isinstance(test, list) else str(test)
+    assert "/status" in probe
+    assert "/healthz" not in probe
+    assert hc.get("retries", 0) >= 2
+    assert "start_period" in hc
