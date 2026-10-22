@@ -7,3 +7,7 @@ __pycache__/
 # third-party collections here. Untracked but easy to `git add -A` by accident,
 # and it makes a local `ruff check .` report ~1900 errors from vendored code.
 .ansible/
+# Per-operator agent state. settings.local.json is where a machine name, a
+# cloud project or a tailnet address may live; worktrees are session scratch.
+.claude/settings.local.json
+.claude/worktrees/

@@ -15,6 +15,15 @@ build_ignore:
   - docs
   - .github
   - .gitleaks.toml
+  # Agent tooling is not part of the collection. It also cannot be walked in
+  # CI: .agents/skills/* are symlinks into the .agents/_shared submodule, which
+  # actions/checkout does not fetch, and ansible-galaxy refuses a dangling
+  # symlink outright rather than skipping it (seen 2026-08-31, run 33388725271).
+  - .agents
+  - .claude
+  - .gitmodules
+  - CLAUDE.md
+  - scripts/pr-land.js
   - "*.tar.gz"
   - "__pycache__"
   # build_ignore patterns are matched with fnmatch against the path relative

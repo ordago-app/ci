@@ -36,6 +36,9 @@ def reservation_from_wire(data: dict[str, Any]) -> Reservation:
 class HostStatsWire(BaseModel):
     mem_available_mb: int
     load_1m: float
+    # Optional on the wire so a dispatcher and scheduler from either side of this
+    # field's introduction still talk during a rolling redeploy.
+    cpu_pressure_pct: float | None = None
 
 
 class PlanRequest(BaseModel):

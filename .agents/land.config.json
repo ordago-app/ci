@@ -1,0 +1,38 @@
+{
+  "baseBranch": "main",
+  "protectedBranches": [],
+  "reviewLabel": "ai-review",
+
+  "_requireApprovingReview": "FALSE on an explicit decision (2026-08-31): the agent merges to main on green CI alone. Name it for what it is — a WEAKER bar than requiring a review, because nothing reads the diff but the test suite — and a bar the OTHER operator also lives under, since main is shared. What keeps it defensible: every workflow runs on every PR (ciPaths is '**', so a vacuous green cannot occur), the hardStop list below fences the security boundaries however green, and per AGENTS.md invariant 5 nothing on main reaches anyone's hardware until that machine's owner bumps their SHA pin. The pin is the real gate.",
+  "_requireApprovingReview_flipBack": "Set this back to TRUE the moment the ai-review reviewer starts posting on this repo. The reviewer is this repo's own services/github-review, but its registry (agent-review.yml) is per-operator and private, so the entry cannot live here. And it can ONLY reach this repo through its poll backstop: this repo is PUBLIC, a public repo cannot call a private reusable workflow, and GitHub resolves the callee before any job-level `if` — such a job fails the whole workflow to load with zero jobs (seen 2026-08-22, cultuvilla run 32594475090). Do not add a request-review job to .github/workflows/. The cost of the backstop is latency, not capability.",
+  "requireApprovingReview": false,
+  "maxReviewRounds": 5,
+  "_reviewTimeoutMs": "Only consulted while requireApprovingReview is true; kept short so the flip back does not also mean a long idle.",
+  "reviewTimeoutMs": 120000,
+
+  "_mergeMethod": "Every PR landed here so far is one commit on main with no merge commit (#1–#6); the six merge commits in history predate the extraction. Squash keeps that.",
+  "mergeMethod": "squash",
+
+  "_ciPaths": "No workflow under .github/workflows/ carries a paths: filter — every push and PR to main runs all five (ansible, gitleaks, mypy, pytest, ruff). '**' says that directly; enumerating directories would silently stop being true the moment one is added.",
+  "ciPaths": ["**"],
+
+  "_requiredLanes": "Checks that must reach SUCCESS on every PR — SKIPPED counts as FAILED. Only unconditional jobs may be listed, matched exactly on the display name `gh pr checks` reports. The pytest and mypy matrices both name their jobs `ci-controller` / `github-review`, so those names are ambiguous and are deliberately absent; they are still gated as ordinary checks.",
+  "requiredLanes": ["lint", "format", "gitleaks", "builds", "runner image templates", "scripts", "roles"],
+
+  "_sharedBlastRadius": "A base move here forces a rebase even with no direct file overlap: the root tooling config every service lints against, and the lockfiles.",
+  "sharedBlastRadius": [
+    "pyproject.toml",
+    "services/ci-controller/uv.lock",
+    "services/github-review/uv.lock",
+    ".github/workflows/"
+  ],
+
+  "_hardStop": "Never self-merges, however green. These are the paths where 'the tests passed' and 'the blast radius is acceptable' are different questions — each is a security or trust boundary that a test suite cannot judge. This is the ENFORCED half of the Autonomy contract in AGENTS.md; pr:land regexes changed file paths against these and nothing else. The credential line between dispatcher and scheduler is NOT a path and cannot be listed — that half is agent discipline, stated in AGENTS.md.",
+  "hardStop": [
+    { "pattern": "^scripts/gen_tailscale_acl\\.py$", "why": "the CI fabric's only access control (ADR 0026)" },
+    { "pattern": "^services/ci-lane-host/", "why": "exposes a Docker socket on a machine someone else owns" },
+    { "pattern": "^services/github-actions-runner/(Dockerfile|entrypoint\\.sh)$", "why": "the boundary untrusted job code runs inside" },
+    { "pattern": "^services/ci-controller/tests/test_no_operator_defaults\\.py$", "why": "invariant 4's tripwire — weakening it is a placement decision, not a test edit" },
+    { "pattern": "^\\.github/workflows/", "why": "this repo's own merge gate" }
+  ]
+}

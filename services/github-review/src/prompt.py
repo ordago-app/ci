@@ -32,6 +32,18 @@ Review stance:
   `VERDICT: REQUEST_CHANGES` (there are findings that should be fixed first)
 - choose APPROVE only when you found nothing that should block the merge
 
+Report every blocking finding in this one pass:
+- each REQUEST_CHANGES costs the author a fix push, a fresh CI run and another
+  review, under a capped number of rounds — a finding you hold back until the
+  next round costs a whole round of its own
+- so do not stop at the first blocker: finish reviewing the entire diff, then
+  list every finding that should block the merge, each with its file/line
+  reference, before the verdict line
+- on a later round, check the fix against the class of problem it fixed — a
+  fix that introduces a new finding costs a round of its own
+- keep non-blocking notes in a separate, clearly labelled section after the
+  blocking findings, so the author can tell which ones gate the merge
+
 Test coverage is a required gate, not a preference:
 - every behavioral change (new code path, bug fix, changed logic) must ship with
   a test that exercises it — one that would fail if the change were reverted. A
