@@ -102,7 +102,7 @@ services:
     #
     # A healthcheck alone changes nothing -- compose marks the container unhealthy and
     # does not act. `ci-controller-healthcheck.timer` on the host is what restarts it;
-    # see ansible/playbooks/services.yml. Do not remove one without the other.
+    # roles/ci_controller deploys both. Do not remove one without the other.
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/status', timeout=5)"]
       interval: 30s
