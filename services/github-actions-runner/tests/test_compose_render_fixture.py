@@ -86,8 +86,7 @@ def test_runner_version_arg_does_not_precede_the_android_layers():
     dockerfile = (TESTS.parent / "Dockerfile").read_text()
 
     declarations = [
-        m.start()
-        for m in re.finditer(r"^ARG ACTIONS_RUNNER_VERSION", dockerfile, re.MULTILINE)
+        m.start() for m in re.finditer(r"^ARG ACTIONS_RUNNER_VERSION", dockerfile, re.MULTILINE)
     ]
     assert len(declarations) == 1, (
         f"expected exactly one ACTIONS_RUNNER_VERSION declaration, got {len(declarations)}"
