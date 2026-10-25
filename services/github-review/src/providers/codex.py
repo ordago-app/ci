@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import io
 import json
 import os
 import re
+import shlex
 import sys
+import tarfile
 from pathlib import Path
 
 from docker import DockerClient
@@ -25,6 +28,11 @@ AGENT_GID = 1000
 # this role, so the gh shim / credential helper run unauthenticated (codex
 # reads code from the local worktree and the github MCP, never `gh` writes).
 CODEX_GH_ROLE = "reviewer-readonly"
+
+# The prompt carries the whole PR diff, so it goes into the container as a file
+# and reaches `codex exec -` on stdin: as one argv element it failed every large
+# PR with "argument list too long" (the kernel caps a single argument at 128 KiB).
+PROMPT_PATH = "/tmp/review-prompt.md"
 
 _VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\s*$", re.MULTILINE)
 
@@ -126,13 +134,9 @@ class CodexReviewProvider:
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
         container = self._docker.containers.get(session.container)
-        cmd = [
-            "codex",
-            "exec",
-            "--json",
-            "--dangerously-bypass-approvals-and-sandbox",
-            prompt,
-        ]
+        self._copy_prompt(container, prompt)
+        codex = "codex exec --json --dangerously-bypass-approvals-and-sandbox -"
+        cmd = ["sh", "-c", f"{codex} < {shlex.quote(PROMPT_PATH)}"]
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(container.exec_run, cmd, stdout=True, stderr=True)
             try:
@@ -145,6 +149,16 @@ class CodexReviewProvider:
             raise RuntimeError(f"codex review failed: {output.strip()}")
         body, event = self._parse_review(output)
         return ReviewResult(body=body, event=event)
+
+    def _copy_prompt(self, container, prompt: str) -> None:
+        data = prompt.encode("utf-8")
+        info = tarfile.TarInfo(Path(PROMPT_PATH).name)
+        info.size = len(data)
+        info.mode = 0o644
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            tar.addfile(info, io.BytesIO(data))
+        container.put_archive(str(Path(PROMPT_PATH).parent), archive.getvalue())
 
     def cleanup(self, session: SessionRef) -> None:
         self._remove_quietly(session.container)

@@ -112,6 +112,40 @@ def test_review_container_cannot_post_to_github() -> None:
     )
 
 
+def test_run_review_sends_prompt_through_a_file_not_argv() -> None:
+    # Regression: the prompt carries the whole PR diff, and passing it as one
+    # argv element failed every large PR with "argument list too long"
+    # (ordago-apps #1628 at 126 KB, #1629 at 280 KB). It is copied into the
+    # container and fed to `codex exec -` on stdin instead.
+    import io
+    import tarfile
+
+    provider = _provider()
+    container = MagicMock()
+    container.exec_run.return_value = MagicMock(
+        exit_code=0,
+        output=b'{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}',
+    )
+    provider._docker.containers.get.return_value = container
+    prompt = "x" * 300_000
+
+    provider.run_review(
+        SessionRef(id="3", container="codex-review-3", worktree=Path("/w")), prompt, 60
+    )
+
+    cmd = container.exec_run.call_args.args[0]
+    assert all(len(part) < 1_000 for part in cmd)
+    assert cmd[-1].endswith(f"- < {codex_mod.PROMPT_PATH}")
+    target_dir, archive = container.put_archive.call_args.args
+    assert target_dir == str(Path(codex_mod.PROMPT_PATH).parent)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        member = tar.getmember(Path(codex_mod.PROMPT_PATH).name)
+        assert member.mode == 0o644
+        extracted = tar.extractfile(member)
+        assert extracted is not None
+        assert extracted.read().decode("utf-8") == prompt
+
+
 def test_extract_review_body_parses_codex_agent_message() -> None:
     # Regression: codex `exec --json` emits
     # {"type":"item.completed","item":{"type":"agent_message","text":...}},
