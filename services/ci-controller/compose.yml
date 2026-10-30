@@ -18,7 +18,10 @@ services:
       SERVICES: 0
       NODES: 0
       TASKS: 0
-      INFO: 0
+      # Read-only: the daemon host's kernel, memory and container counts; no secrets.
+      # A controller may read MemTotal from it as an elastic host's RAM offer
+      # (homelab's ram_offer_reserve_mb, whose lane VM is ballooned).
+      INFO: 1
       AUTH: 0
       BUILD: 0
       DISTRIBUTION: 0
