@@ -177,6 +177,15 @@ Runs on **GitHub-hosted runners**, deliberately: this repo's own CI must not
 depend on the pool it implements, or a change that breaks the dispatcher takes
 out the runners that would have caught it.
 
+## Sibling repos
+
+The founders check out the `ordago-app` org side by side. This repo is public and shared
+with another operator, so nothing from the others comes here.
+
+- `../ordago-apps` — the app, and the main consumer of the lanes and the `ai-review` bot.
+- `../business` — the business record: who owns and pays for each account.
+- `../ordago-reels` — reels and social posts; Jaime's.
+
 ## Shared agent setup
 
 `AGENTS.md` is the shared instruction entry point. Project skills live in
