@@ -20,9 +20,9 @@ class ProviderUnavailableError(RuntimeError):
     a fallback costs real credit and a retry does not."""
 
 
-class ReviewBudgetExceededError(RuntimeError):
-    """The review hit its spending cap. Retrying would spend the cap again and stop in
-    the same place, so the worker gives up on this head instead."""
+class ReviewLimitExceededError(RuntimeError):
+    """The review hit its spending or turn cap. Retrying would spend the same again and
+    stop in the same place, so the worker gives up on this head instead."""
 
 
 @dataclass(frozen=True)
@@ -41,12 +41,13 @@ class ReviewResult:
 def parse_verdict(text: str) -> ReviewResult:
     """Split a model's final message into the review body and its GitHub event.
 
-    REQUEST_CHANGES unless the text carries an explicit APPROVE token: a review
-    that forgot its verdict line must never count as an approval. The last verdict
-    wins, because the reviewed PR's title and body are in the prompt and a review
-    can quote a verdict line from them before reaching its own."""
-    verdicts = _VERDICT_RE.findall(text)
-    event = "APPROVE" if verdicts and verdicts[-1] == "APPROVE" else "REQUEST_CHANGES"
+    REQUEST_CHANGES unless the text ENDS on an explicit APPROVE line, as the prompt asks.
+    A review that forgot its verdict must never count as an approval, and the reviewed
+    PR's title and body are in the prompt, so a verdict line anywhere else may be a
+    quotation of what the PR wants the verdict to be."""
+    lines = text.strip().splitlines()
+    verdict = _VERDICT_RE.search(lines[-1]) if lines else None
+    event = "APPROVE" if verdict and verdict.group(1) == "APPROVE" else "REQUEST_CHANGES"
     return ReviewResult(body=_VERDICT_RE.sub("", text).strip(), event=event)
 
 

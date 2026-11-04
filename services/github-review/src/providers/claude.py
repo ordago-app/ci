@@ -14,7 +14,7 @@ from ..git_worktree import GitWorktreeManager
 from ..job_store import ReviewJob
 from ..provider import (
     ProviderUnavailableError,
-    ReviewBudgetExceededError,
+    ReviewLimitExceededError,
     ReviewResult,
     SessionRef,
     parse_verdict,
@@ -50,6 +50,9 @@ _UNAVAILABLE_RE = re.compile(
     r"usage limit|session limit|spend limit|credit balance|failed to authenticate|invalid api key",
     re.IGNORECASE,
 )
+
+
+_LIMIT_SUBTYPES = {"error_max_budget_usd", "error_max_turns"}
 
 
 def review_prompt(prompt: str) -> str:
@@ -196,8 +199,8 @@ class ClaudeReviewProvider:
 
     def _raise_failure(self, payload: dict[str, Any], text: str) -> NoReturn:
         detail = text or "; ".join(str(e) for e in payload.get("errors") or []) or str(payload)
-        if payload.get("subtype") == "error_max_budget_usd":
-            raise ReviewBudgetExceededError(detail)
+        if payload.get("subtype") in _LIMIT_SUBTYPES:
+            raise ReviewLimitExceededError(detail)
         if payload.get("api_error_status") in _UNAVAILABLE_STATUSES or _UNAVAILABLE_RE.search(
             detail
         ):

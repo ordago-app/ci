@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from docker.errors import ImageNotFound
 from src.job_store import JobStatus, ReviewJob
-from src.provider import ProviderUnavailableError, ReviewBudgetExceededError, SessionRef
+from src.provider import ProviderUnavailableError, ReviewLimitExceededError, SessionRef
 from src.providers import claude as claude_mod
 from src.providers.claude import ClaudeReviewProvider
 
@@ -206,7 +206,7 @@ def test_run_review_ignores_the_checkouts_own_config_and_is_bounded(tmp_path: Pa
     assert container.exec_run.call_args.kwargs["demux"] is True
 
 
-def test_the_budget_stop_observed_from_the_cli_is_its_own_error(tmp_path: Path) -> None:
+def test_the_budget_stop_observed_from_the_cli_is_not_retried(tmp_path: Path) -> None:
     provider = _provider(tmp_path)
     container = provider._docker.containers.get.return_value
     container.exec_run.return_value = _exec_result(
@@ -221,7 +221,19 @@ def test_the_budget_stop_observed_from_the_cli_is_its_own_error(tmp_path: Path) 
         exit_code=1,
     )
 
-    with pytest.raises(ReviewBudgetExceededError, match="maximum budget"):
+    with pytest.raises(ReviewLimitExceededError, match="maximum budget"):
+        provider.run_review(SESSION, "prompt", 60)
+
+
+def test_the_turn_limit_is_not_retried_either(tmp_path: Path) -> None:
+    provider = _provider(tmp_path)
+    container = provider._docker.containers.get.return_value
+    container.exec_run.return_value = _exec_result(
+        {"subtype": "error_max_turns", "is_error": True, "errors": ["Reached max turns (60)"]},
+        exit_code=1,
+    )
+
+    with pytest.raises(ReviewLimitExceededError, match="max turns"):
         provider.run_review(SESSION, "prompt", 60)
 
 
@@ -295,7 +307,6 @@ def test_auth_and_credit_failures_are_unavailable(tmp_path: Path, payload: dict)
 @pytest.mark.parametrize(
     "payload",
     [
-        {"subtype": "error_max_turns", "is_error": True, "errors": ["ran out of turns"]},
         {"subtype": "error_during_execution", "is_error": False, "errors": ["it broke"]},
         {"subtype": "success", "is_error": False, "result": "   "},
     ],

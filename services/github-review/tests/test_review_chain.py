@@ -8,11 +8,12 @@ never for a failure the next tick's retry would have fixed for free.
 
 from pathlib import Path
 
+import pytest
 from src.config import ReviewConfig
 from src.job_store import JobStatus, ReviewJob, ReviewJobStore
 from src.provider import (
     ProviderUnavailableError,
-    ReviewBudgetExceededError,
+    ReviewLimitExceededError,
     ReviewResult,
     SessionRef,
 )
@@ -245,18 +246,25 @@ def test_run_pr_review_uses_the_repo_chain(tmp_path: Path) -> None:
 
 
 class CountingWorktrees(FakeWorktrees):
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, cleanup_error: Exception | None = None) -> None:
         super().__init__(path)
         self.events: list[str] = []
+        self.fetches: list[bool] = []
+        self.cleanup_error = cleanup_error
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+    def prepare(
+        self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str, fetch: bool = True
+    ) -> Path:
         self.events.append("prepare")
+        self.fetches.append(fetch)
         return super().prepare(
             repo_dir=repo_dir, project=project, pr_number=pr_number, head_sha=head_sha
         )
 
     def cleanup(self, worktree: Path) -> None:
         self.events.append("cleanup")
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
 
 
 def test_each_provider_reads_a_fresh_worktree(tmp_path: Path) -> None:
@@ -272,9 +280,36 @@ def test_each_provider_reads_a_fresh_worktree(tmp_path: Path) -> None:
     assert worktrees.events == ["prepare", "cleanup", "prepare", "cleanup"]
 
 
-def test_hitting_the_budget_gives_up_instead_of_spending_it_again(tmp_path: Path) -> None:
+def test_only_the_first_provider_fetches(tmp_path: Path) -> None:
+    # The head is in the clone by then: a fetch failing must not stop the fallback.
+    codex = ScriptedProvider(ProviderUnavailableError("quota"))
+    claude = ScriptedProvider(APPROVE)
+    worktrees = CountingWorktrees(tmp_path / "worktree")
+    worker, _, _ = _worker(tmp_path, codex, claude)
+    worker._worktrees = worktrees
+
+    worker.tick()
+
+    assert worktrees.fetches == [True, False]
+
+
+def test_a_worktree_that_will_not_delete_does_not_cost_the_review(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    codex, claude = ScriptedProvider(FINDINGS), ScriptedProvider(APPROVE)
+    worker, github, store = _worker(tmp_path, codex, claude)
+    worker._worktrees = CountingWorktrees(tmp_path / "worktree", cleanup_error=OSError("busy"))
+
+    worker.tick()
+
+    assert github.posted[0][3] == "REQUEST_CHANGES"
+    assert _only_job(store, JobStatus.POSTED).verdict == "REQUEST_CHANGES"
+    assert "could not remove worktree" in capsys.readouterr().err
+
+
+def test_hitting_a_limit_gives_up_and_shows_as_stuck(tmp_path: Path) -> None:
     codex = ScriptedProvider(ProviderUnavailableError("quota"), ProviderUnavailableError("quota"))
-    claude = ScriptedProvider(ReviewBudgetExceededError("Reached maximum budget"), APPROVE)
+    claude = ScriptedProvider(ReviewLimitExceededError("Reached maximum budget"), APPROVE)
     worker, github, store = _worker(tmp_path, codex, claude)
 
     worker.tick()
@@ -282,4 +317,5 @@ def test_hitting_the_budget_gives_up_instead_of_spending_it_again(tmp_path: Path
 
     assert claude.runs == 1
     assert github.posted == []
-    assert "maximum budget" in (_only_job(store, JobStatus.SKIPPED).last_error or "")
+    assert "maximum budget" in (_only_job(store, JobStatus.FAILED).last_error or "")
+    assert store.count_stuck(3) == 1

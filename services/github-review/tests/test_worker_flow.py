@@ -48,7 +48,9 @@ class FakeWorktrees:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+    def prepare(
+        self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str, fetch: bool = True
+    ) -> Path:
         self.path.mkdir(parents=True, exist_ok=True)
         return self.path
 

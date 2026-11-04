@@ -33,8 +33,11 @@ class GitWorktreeManager:
     def fetch(self, repo_dir: Path) -> None:
         self._run(self._git(repo_dir, "fetch", "--all", "--prune"))
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
-        self.fetch(repo_dir)
+    def prepare(
+        self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str, fetch: bool = True
+    ) -> Path:
+        if fetch:
+            self.fetch(repo_dir)
         present = subprocess.run(
             self._git(repo_dir, "cat-file", "-e", f"{head_sha}^{{commit}}"),
             **self._subprocess_kwargs(),

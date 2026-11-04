@@ -59,8 +59,9 @@ cannot be asserted from inside a role.
   `{{ personal_root }}/claude-review-state/api-key`, which the role does not
   place: create it readable only by root and the operator. Model and per-review
   spending cap are `CLAUDE_REVIEW_MODEL` and `CLAUDE_REVIEW_MAX_BUDGET_USD` in
-  the service's `compose.yml`. A review that hits the cap is given up on, not
-  retried, and the head stays unreviewed.
+  the service's `compose.yml`. A review that hits the cap or its turn limit is
+  given up on, not retried: the head stays unreviewed and shows in `/status`
+  as stuck.
 
 - **`ordago.ci.ci_lane_host`** — offers CI capacity from any machine (scoped
   Docker socket proxy + fabric sidecar). Does **not** provision the host

@@ -10,7 +10,7 @@ from .poller import ReviewPoller
 from .prompt import build_review_prompt
 from .provider import (
     ProviderUnavailableError,
-    ReviewBudgetExceededError,
+    ReviewLimitExceededError,
     ReviewProvider,
     ReviewResult,
 )
@@ -149,8 +149,8 @@ class ReviewWorker:
                 job.repo, job.pr_number, result.body, result.event, commit_id=job.head_sha
             )
             self._store.mark_posted(job.id, verdict=result.event)
-        except ReviewBudgetExceededError as exc:
-            self._store.mark_skipped(job.id, str(exc))
+        except ReviewLimitExceededError as exc:
+            self._store.mark_given_up(job.id, str(exc), max_attempts=self._max_attempts)
             self._report_failure(job, exc)
         except Exception as exc:
             self._store.mark_failed(job.id, str(exc))
@@ -176,13 +176,16 @@ class ReviewWorker:
         last_attempt = job.attempts + 1 >= self._max_attempts
         chain = [job.provider, *repo_policy.fallback_providers]
         failures: list[tuple[str, Exception]] = []
-        for name in chain:
+        for index, name in enumerate(chain):
             provider = self._providers[name]
             worktree = self._worktrees.prepare(
                 repo_dir=self._projects_root / job.project / "repo",
                 project=job.project,
                 pr_number=job.pr_number,
                 head_sha=job.head_sha,
+                # The head is already in the clone by then, so a fetch failing now must
+                # not stop the fallback the chain exists to reach.
+                fetch=index == 0,
             )
             session = None
             try:
@@ -190,7 +193,7 @@ class ReviewWorker:
                 result = provider.run_review(
                     session, prompt, timeout_seconds=profile.max_runtime_minutes * 60
                 )
-            except ReviewBudgetExceededError:
+            except ReviewLimitExceededError:
                 raise
             except ProviderUnavailableError as exc:
                 failures.append((name, exc))
@@ -203,13 +206,26 @@ class ReviewWorker:
             finally:
                 if session is not None:
                     provider.cleanup(session)
-                self._worktrees.cleanup(worktree)
+                self._discard_worktree(job, worktree)
             return self._attributed(job, name, failures, result)
         if len(failures) == 1:
             raise failures[0][1]
         raise RuntimeError(
             "no review provider could run: " + "; ".join(f"{name}: {exc}" for name, exc in failures)
         )
+
+    def _discard_worktree(self, job: ReviewJob, worktree: Path) -> None:
+        """Log rather than raise: this runs after a provider answered, and a directory
+        that will not delete must not cost that review. `prepare` clears the path anyway."""
+        try:
+            self._worktrees.cleanup(worktree)
+        except Exception as exc:
+            print(
+                f"[github-review] could not remove worktree {worktree} for "
+                f"{job.repo}#{job.pr_number}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _attributed(
         self,
