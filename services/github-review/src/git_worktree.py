@@ -92,6 +92,21 @@ class GitWorktreeManager:
             return None
         return hashlib.sha256(raw.stdout.encode()).hexdigest()
 
+    def pr_diff(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str:
+        """What `head_sha` changes since its merge base with `base_sha`, as a patch."""
+        kwargs = self._subprocess_kwargs()
+        merge_base = subprocess.run(self._git(repo_dir, "merge-base", base_sha, head_sha), **kwargs)
+        if merge_base.returncode != 0:
+            raise GitWorktreeError(
+                f"no merge base for {base_sha} and {head_sha}: {merge_base.stderr.strip()!r}"
+            )
+        diff = subprocess.run(
+            self._git(repo_dir, "diff", merge_base.stdout.strip(), head_sha), **kwargs
+        )
+        if diff.returncode != 0:
+            raise GitWorktreeError(f"diff of {head_sha} failed: {diff.stderr.strip()!r}")
+        return str(diff.stdout)
+
     def _git(self, repo_dir: Path, *args: str) -> list[str]:
         # The container runs git as root over a clone owned by the operator
         # (uid 1000). Without this, git aborts with "detected dubious

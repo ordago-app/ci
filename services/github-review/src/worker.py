@@ -4,15 +4,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import ReviewConfig
+from .config import RepoPolicy, ReviewConfig, ToolProfile
 from .job_store import JobStatus, ReviewJob, ReviewJobStore
 from .poller import ReviewPoller
 from .prompt import build_review_prompt
-from .provider import ReviewProvider
+from .provider import ProviderUnavailableError, ReviewProvider, ReviewResult
 
 # Opens the body of a carried approval. pr-land (agent-skills) matches it to keep
 # these out of its round count, so the two strings must stay identical.
 CARRIED_REVIEW_MARKER = "<!-- ai-review:carried-approval -->"
+
+_MAX_REASON_CHARS = 200
 
 
 class ReviewWorker:
@@ -124,7 +126,6 @@ class ReviewWorker:
         profile = self._config.profile_for(repo_policy)
         self._store.mark_running(job.id)
         worktree = None
-        session = None
         try:
             pr = self._github.get_pull_request(job.repo, job.pr_number)
             if pr.head_sha != job.head_sha:
@@ -146,13 +147,7 @@ class ReviewWorker:
                 if repo_policy.run_ci_first
                 else "not requested",
             )
-            provider = self._providers[job.provider]
-            session = provider.start_review_session(job, worktree, profile)
-            result = provider.run_review(
-                session,
-                prompt,
-                timeout_seconds=profile.max_runtime_minutes * 60,
-            )
+            result = self._review_with_chain(job, repo_policy, profile, worktree, prompt)
             self._github.post_review(
                 job.repo, job.pr_number, result.body, result.event, commit_id=job.head_sha
             )
@@ -161,10 +156,73 @@ class ReviewWorker:
             self._store.mark_failed(job.id, str(exc))
             self._report_failure(job, exc)
         finally:
-            if session is not None:
-                self._providers[job.provider].cleanup(session)
             if worktree is not None:
                 self._worktrees.cleanup(worktree)
+
+    def _review_with_chain(
+        self,
+        job: ReviewJob,
+        repo_policy: RepoPolicy,
+        profile: ToolProfile,
+        worktree: Path,
+        prompt: str,
+    ) -> ReviewResult:
+        """The first answer from the repo's chain. An answer is any verdict: a fallback
+        never runs because the primary disagreed.
+
+        A fallback spends real credit and a later tick's retry does not, so only two
+        things move down the chain: a provider that says it cannot run, and any failure
+        on the job's last attempt. Anything else re-raises for the normal retry, which
+        starts again from the primary."""
+        last_attempt = job.attempts + 1 >= self._max_attempts
+        chain = [job.provider, *repo_policy.fallback_providers]
+        failures: list[tuple[str, Exception]] = []
+        for name in chain:
+            provider = self._providers[name]
+            session = None
+            try:
+                session = provider.start_review_session(job, worktree, profile)
+                result = provider.run_review(
+                    session, prompt, timeout_seconds=profile.max_runtime_minutes * 60
+                )
+            except ProviderUnavailableError as exc:
+                failures.append((name, exc))
+                continue
+            except Exception as exc:
+                if not last_attempt:
+                    raise
+                failures.append((name, exc))
+                continue
+            finally:
+                if session is not None:
+                    provider.cleanup(session)
+            return self._attributed(job, name, failures, result)
+        if len(failures) == 1:
+            raise failures[0][1]
+        raise RuntimeError(
+            "no review provider could run: " + "; ".join(f"{name}: {exc}" for name, exc in failures)
+        )
+
+    def _attributed(
+        self,
+        job: ReviewJob,
+        reviewer: str,
+        failures: list[tuple[str, Exception]],
+        result: ReviewResult,
+    ) -> ReviewResult:
+        """Say so when a fallback wrote the review: a different model read this diff,
+        and the credit it spent is the operator's to notice."""
+        if not failures:
+            return result
+        reasons = "; ".join(f"`{name}`: {_short_reason(exc)}" for name, exc in failures)
+        print(
+            f"[github-review] {job.repo}#{job.pr_number}@{job.head_sha[:12]} reviewed by "
+            f"fallback {reviewer} — {reasons}",
+            file=sys.stderr,
+            flush=True,
+        )
+        note = f"> Reviewed by fallback `{reviewer}` because of {reasons}"
+        return ReviewResult(body=f"{note}\n\n{result.body}", event=result.event)
 
     def _report_failure(self, job: ReviewJob, exc: Exception) -> None:
         """Put the failure somewhere a human actually looks.
@@ -188,10 +246,10 @@ class ReviewWorker:
         else:
             print(f"[github-review] review FAILED — {detail}", file=sys.stderr, flush=True)
 
-    def _project_for_repo(self, repo: str) -> str:
+    def _policy_for_repo(self, repo: str) -> RepoPolicy:
         for repo_policy in self._config.enabled_repos():
             if repo_policy.repo == repo:
-                return repo_policy.project
+                return repo_policy
         raise KeyError(f"No enabled repo policy configured for {repo!r}")
 
     def run_pr_review(self, repo: str, pr_number: int) -> ReviewResultSummary:
@@ -205,8 +263,10 @@ class ReviewWorker:
         if existing is not None:
             return ReviewResultSummary(head_sha, existing.verdict or "REQUEST_CHANGES", False)
 
-        project = self._project_for_repo(repo)
-        job = self._store.enqueue(repo, project, "codex", pr_number, head_sha, pr.base_sha)
+        repo_policy = self._policy_for_repo(repo)
+        job = self._store.enqueue(
+            repo, repo_policy.project, repo_policy.provider, pr_number, head_sha, pr.base_sha
+        )
         # Before the cap: a carried approval costs nothing and is not a round.
         if self._carry_approval(job):
             return ReviewResultSummary(head_sha, "APPROVE", False)
@@ -228,6 +288,11 @@ class ReviewWorker:
                 f"review did not complete for {repo}#{pr_number}@{head_sha}: {detail}"
             )
         return ReviewResultSummary(head_sha, done.verdict, False)
+
+
+def _short_reason(exc: Exception) -> str:
+    lines = str(exc).strip().splitlines()
+    return (lines[0] if lines else type(exc).__name__)[:_MAX_REASON_CHARS]
 
 
 @dataclass(frozen=True)

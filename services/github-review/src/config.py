@@ -6,6 +6,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+KNOWN_PROVIDERS = ("codex", "claude")
+
 
 class ConfigError(ValueError):
     pass
@@ -19,6 +21,8 @@ class RepoPolicy(BaseModel):
     repo: str = Field(default="")
     project: str = Field(default="")
     provider: str
+    # Tried in order when `provider` cannot review; see ReviewWorker._review_with_chain.
+    fallback_providers: list[str] = Field(default_factory=list)
     enabled: bool = True
     review_drafts: bool = False
     review_bots: bool = False
@@ -98,8 +102,12 @@ class ReviewConfig:
 
         repos: dict[str, RepoPolicy] = {}
         for name, repo in raw.repos.items():
-            if repo.provider not in ("codex", "claude"):
-                raise ConfigError(f"unknown provider for {name}: {repo.provider}")
+            chain = [repo.provider, *repo.fallback_providers]
+            for provider in chain:
+                if provider not in KNOWN_PROVIDERS:
+                    raise ConfigError(f"unknown provider for {name}: {provider}")
+            if len(set(chain)) != len(chain):
+                raise ConfigError(f"{name} lists a provider twice in its chain: {chain}")
             if repo.tool_profile not in raw.tool_profiles:
                 raise ConfigError(f"unknown tool_profile for {name}: {repo.tool_profile}")
             profile = raw.tool_profiles[repo.tool_profile]

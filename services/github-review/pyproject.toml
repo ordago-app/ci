@@ -1,7 +1,7 @@
 [project]
 name = "homelab-github-review"
 version = "0.1.0"
-description = "Polls selected GitHub repositories and runs Codex reviewer jobs for new PR head SHAs"
+description = "Polls selected GitHub repositories and runs reviewer jobs for new PR head SHAs"
 requires-python = ">=3.12"
 dependencies = [
   "docker>=7.1",

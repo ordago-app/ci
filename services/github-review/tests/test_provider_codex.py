@@ -4,9 +4,10 @@ from unittest.mock import MagicMock
 import pytest
 from src.config import ToolProfile
 from src.job_store import JobStatus, ReviewJob
-from src.provider import SessionRef
+from src.provider import ProviderUnavailableError, SessionRef, parse_verdict
 from src.providers import codex as codex_mod
 from src.providers.codex import CodexReviewProvider
+from src.providers.container import PROMPT_PATH
 
 
 def _provider() -> CodexReviewProvider:
@@ -135,11 +136,11 @@ def test_run_review_sends_prompt_through_a_file_not_argv() -> None:
 
     cmd = container.exec_run.call_args.args[0]
     assert all(len(part) < 1_000 for part in cmd)
-    assert cmd[-1].endswith(f"- < {codex_mod.PROMPT_PATH}")
+    assert cmd[-1].endswith(f"- < {PROMPT_PATH}")
     target_dir, archive = container.put_archive.call_args.args
-    assert target_dir == str(Path(codex_mod.PROMPT_PATH).parent)
+    assert target_dir == str(Path(PROMPT_PATH).parent)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        member = tar.getmember(Path(codex_mod.PROMPT_PATH).name)
+        member = tar.getmember(Path(PROMPT_PATH).name)
         assert member.mode == 0o644
         extracted = tar.extractfile(member)
         assert extracted is not None
@@ -272,7 +273,8 @@ def test_parse_review_approve_sets_event_and_strips_verdict() -> None:
             '{"type":"agent_message","text":"No findings.\\nVERDICT: APPROVE"}}',
         ]
     )
-    body, event = _provider()._parse_review(out)
+    result = parse_verdict(_provider()._extract_review_body(out))
+    body, event = result.body, result.event
     assert event == "APPROVE"
     assert "VERDICT:" not in body
     assert body == "No findings."
@@ -285,14 +287,63 @@ def test_parse_review_request_changes_when_findings() -> None:
             '{"type":"agent_message","text":"- [P1] bug at foo.py:1\\nVERDICT: REQUEST_CHANGES"}}',
         ]
     )
-    body, event = _provider()._parse_review(out)
+    result = parse_verdict(_provider()._extract_review_body(out))
+    body, event = result.body, result.event
     assert event == "REQUEST_CHANGES"
     assert body.startswith("- [P1]")
 
 
 def test_parse_review_missing_verdict_defaults_to_request_changes() -> None:
     out = '{"type":"item.completed","item":{"type":"agent_message","text":"Looks fine to me."}}'
-    body, event = _provider()._parse_review(out)
+    result = parse_verdict(_provider()._extract_review_body(out))
+    body, event = result.body, result.event
     # Never auto-approve without an explicit APPROVE token.
     assert event == "REQUEST_CHANGES"
     assert body == "Looks fine to me."
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "You've hit your usage limit. Resets in 2 hours.",
+        "You're out of extra usage",
+        '{"type":"turn.failed","error":{"message":"rate limit reached"}}',
+        "failed to refresh available models: unknown variant",
+    ],
+)
+def test_quota_and_vendor_failures_are_unavailable(line: str) -> None:
+    provider = _provider()
+    container = MagicMock()
+    container.exec_run.return_value = MagicMock(exit_code=1, output=line.encode())
+    provider._docker.containers.get.return_value = container
+
+    with pytest.raises(ProviderUnavailableError):
+        provider.run_review(SessionRef(id="3", container="c", worktree=Path("/w")), "p", 60)
+
+
+def test_a_reviewed_file_mentioning_a_limit_is_not_a_quota_failure() -> None:
+    # A review reads code, and code talks about usage limits. Only what codex
+    # itself reports counts, never the output of a command it ran.
+    provider = _provider()
+    container = MagicMock()
+    event = '{"type":"item.completed","item":{"type":"command_execution","output":"usage limit"}}'
+    container.exec_run.return_value = MagicMock(exit_code=1, output=f"{event}\nsegfault".encode())
+    provider._docker.containers.get.return_value = container
+
+    with pytest.raises(RuntimeError) as exc:
+        provider.run_review(SessionRef(id="3", container="c", worktree=Path("/w")), "p", 60)
+
+    assert not isinstance(exc.value, ProviderUnavailableError)
+
+
+def test_auth_not_onboarded_is_unavailable(tmp_path: Path) -> None:
+    provider = CodexReviewProvider(
+        docker_client=MagicMock(),
+        projects_root=tmp_path / "projects",
+        codex_state_root=tmp_path / "no-auth-here",
+        router_url="http://claude-router:8000",
+        model="gpt-5.5",
+    )
+
+    with pytest.raises(ProviderUnavailableError, match="not onboarded"):
+        provider.start_review_session(job(), tmp_path, profile())

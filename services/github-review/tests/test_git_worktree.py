@@ -84,3 +84,28 @@ def test_git_commands_carry_safe_directory_guard(
     assert git_calls, "expected git to be invoked"
     for cmd in git_calls:
         assert f"safe.directory={repo_dir}" in cmd, f"git call missing safe.directory guard: {cmd}"
+
+
+def test_pr_diff_is_what_the_head_changes_since_the_merge_base(
+    repo_dir: Path, tmp_path: Path
+) -> None:
+    manager = GitWorktreeManager(projects_root=tmp_path / "projects")
+    git = ["git", "-C", str(repo_dir)]
+    head = subprocess.run([*git, "rev-parse", "feature"], capture_output=True, text=True).stdout
+    subprocess.run([*git, "checkout", "-q", "main"], check=True)
+    (repo_dir / "moved.txt").write_text("base moved on\n")
+    subprocess.run([*git, "add", "moved.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "base moved"], check=True)
+    base = subprocess.run([*git, "rev-parse", "main"], capture_output=True, text=True).stdout
+
+    diff = manager.pr_diff(repo_dir=repo_dir, base_sha=base.strip(), head_sha=head.strip())
+
+    assert "+head" in diff
+    assert "moved.txt" not in diff
+
+
+def test_pr_diff_raises_when_a_commit_is_gone(repo_dir: Path, tmp_path: Path) -> None:
+    manager = GitWorktreeManager(projects_root=tmp_path / "projects")
+
+    with pytest.raises(GitWorktreeError):
+        manager.pr_diff(repo_dir=repo_dir, base_sha="0" * 40, head_sha="1" * 40)
