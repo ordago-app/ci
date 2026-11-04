@@ -104,6 +104,18 @@ def test_pr_diff_is_what_the_head_changes_since_the_merge_base(
     assert "moved.txt" not in diff
 
 
+def test_pr_diff_survives_a_file_that_is_not_utf8(repo_dir: Path, tmp_path: Path) -> None:
+    git = ["git", "-C", str(repo_dir)]
+    base = sha(repo_dir, "main")
+    (repo_dir / "README.md").write_bytes("caf\xe9 latin-1\n".encode("latin-1"))
+    subprocess.run([*git, "commit", "-qam", "latin-1"], check=True)
+    manager = GitWorktreeManager(projects_root=tmp_path / "projects")
+
+    diff = manager.pr_diff(repo_dir=repo_dir, base_sha=base, head_sha=sha(repo_dir, "feature"))
+
+    assert "latin-1" in diff
+
+
 def test_pr_diff_raises_when_a_commit_is_gone(repo_dir: Path, tmp_path: Path) -> None:
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
 

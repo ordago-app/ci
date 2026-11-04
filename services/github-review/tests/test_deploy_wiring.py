@@ -84,3 +84,13 @@ def test_role_provisions_what_the_claude_provider_needs() -> None:
     ]
     assert images[0]["name"] == "homelab/claude-review"
     assert images[0]["build"]["path"].endswith("github-review/claude-review")
+
+
+def test_the_claude_image_build_is_opt_in() -> None:
+    # An operator not using the claude provider must not need what this build needs.
+    role = SERVICE_ROOT.parents[1] / "roles/github_review"
+    tasks = yaml.safe_load((role / "tasks/main.yml").read_text())
+    build = next(t for t in tasks if "community.docker.docker_image" in t)
+    assert build["when"] == "github_review_build_claude_image | bool"
+    defaults = yaml.safe_load((role / "defaults/main.yml").read_text())
+    assert defaults["github_review_build_claude_image"] is False

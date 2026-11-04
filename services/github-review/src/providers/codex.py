@@ -14,7 +14,7 @@ from ..job_store import ReviewJob
 from ..provider import ProviderUnavailableError, ReviewResult, SessionRef, parse_verdict
 from .container import (
     PROMPT_PATH,
-    copy_prompt,
+    copy_text_file,
     exec_with_deadline,
     remove_existing,
     remove_quietly,
@@ -139,7 +139,7 @@ class CodexReviewProvider:
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
         container = self._docker.containers.get(session.container)
-        copy_prompt(container, prompt)
+        copy_text_file(container, PROMPT_PATH, prompt)
         codex = "codex exec --json --dangerously-bypass-approvals-and-sandbox -"
         result = exec_with_deadline(
             container,
@@ -213,15 +213,22 @@ class CodexReviewProvider:
 
 
 def _reported_by_codex(output: str) -> str:
-    """The output without its `item.*` events, which carry what the session read and
-    ran. A review reads code, and code talks about usage limits."""
+    """What codex itself said went wrong. `item.*` events carry what the session read
+    and ran (a review reads code, and code talks about usage limits), and lifecycle
+    events like `thread.started` say nothing, so only error messages and plain text
+    lines count."""
     reported: list[str] = []
     for line in output.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            event = None
-        if isinstance(event, dict) and str(event.get("type", "")).startswith("item."):
+            reported.append(line)
             continue
-        reported.append(line)
+        if not isinstance(event, dict) or str(event.get("type", "")).startswith("item."):
+            continue
+        error = event.get("error")
+        message = error.get("message") if isinstance(error, dict) else error
+        message = message or event.get("message")
+        if message:
+            reported.append(str(message))
     return "\n".join(reported).strip()

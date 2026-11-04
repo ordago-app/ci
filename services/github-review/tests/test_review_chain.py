@@ -10,7 +10,12 @@ from pathlib import Path
 
 from src.config import ReviewConfig
 from src.job_store import JobStatus, ReviewJob, ReviewJobStore
-from src.provider import ProviderUnavailableError, ReviewResult, SessionRef
+from src.provider import (
+    ProviderUnavailableError,
+    ReviewBudgetExceededError,
+    ReviewResult,
+    SessionRef,
+)
 from src.worker import ReviewWorker
 
 from .test_worker_flow import FakeGitHub, FakeWorktrees
@@ -237,3 +242,44 @@ def test_run_pr_review_uses_the_repo_chain(tmp_path: Path) -> None:
     assert summary.verdict == "APPROVE"
     assert claude.runs == 1
     assert github.posted[0][3] == "APPROVE"
+
+
+class CountingWorktrees(FakeWorktrees):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.events: list[str] = []
+
+    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+        self.events.append("prepare")
+        return super().prepare(
+            repo_dir=repo_dir, project=project, pr_number=pr_number, head_sha=head_sha
+        )
+
+    def cleanup(self, worktree: Path) -> None:
+        self.events.append("cleanup")
+
+
+def test_each_provider_reads_a_fresh_worktree(tmp_path: Path) -> None:
+    # A codex session mounts its worktree read-write, so a fallback must not inherit it.
+    codex = ScriptedProvider(ProviderUnavailableError("quota"))
+    claude = ScriptedProvider(APPROVE)
+    worktrees = CountingWorktrees(tmp_path / "worktree")
+    worker, _, _ = _worker(tmp_path, codex, claude)
+    worker._worktrees = worktrees
+
+    worker.tick()
+
+    assert worktrees.events == ["prepare", "cleanup", "prepare", "cleanup"]
+
+
+def test_hitting_the_budget_gives_up_instead_of_spending_it_again(tmp_path: Path) -> None:
+    codex = ScriptedProvider(ProviderUnavailableError("quota"), ProviderUnavailableError("quota"))
+    claude = ScriptedProvider(ReviewBudgetExceededError("Reached maximum budget"), APPROVE)
+    worker, github, store = _worker(tmp_path, codex, claude)
+
+    worker.tick()
+    worker.tick()
+
+    assert claude.runs == 1
+    assert github.posted == []
+    assert "maximum budget" in (_only_job(store, JobStatus.SKIPPED).last_error or "")

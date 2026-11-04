@@ -19,15 +19,15 @@ from docker.errors import NotFound
 PROMPT_PATH = "/tmp/review-prompt.md"
 
 
-def copy_prompt(container: Any, prompt: str) -> None:
-    data = prompt.encode("utf-8")
-    info = tarfile.TarInfo(Path(PROMPT_PATH).name)
+def copy_text_file(container: Any, path: str, text: str) -> None:
+    data = text.encode("utf-8")
+    info = tarfile.TarInfo(Path(path).name)
     info.size = len(data)
     info.mode = 0o644
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as tar:
         tar.addfile(info, io.BytesIO(data))
-    container.put_archive(str(Path(PROMPT_PATH).parent), archive.getvalue())
+    container.put_archive(str(Path(path).parent), archive.getvalue())
 
 
 def exec_with_deadline(

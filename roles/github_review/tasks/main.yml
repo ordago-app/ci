@@ -109,8 +109,11 @@
   become_user: "{{ operator_user }}"
 
 # Spawned by the service rather than run by compose, so no `up` would build it.
-# force_source so a bumped CLI pin rebuilds; an unchanged Dockerfile is a cache hit.
+# Opt-in: an operator not using the claude provider needs neither this build nor
+# what it needs from the host. force_source so a bumped CLI pin rebuilds; an
+# unchanged Dockerfile is a cache hit.
 - name: claude-review image is built
+  when: github_review_build_claude_image | bool
   community.docker.docker_image:
     name: homelab/claude-review
     tag: latest

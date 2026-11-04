@@ -93,7 +93,9 @@ class GitWorktreeManager:
         return hashlib.sha256(raw.stdout.encode()).hexdigest()
 
     def pr_diff(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str:
-        """What `head_sha` changes since its merge base with `base_sha`, as a patch."""
+        """What `head_sha` changes since its merge base with `base_sha`, as a patch.
+
+        A PR can touch files that are not UTF-8, and that must not stop it being read."""
         kwargs = self._subprocess_kwargs()
         merge_base = subprocess.run(self._git(repo_dir, "merge-base", base_sha, head_sha), **kwargs)
         if merge_base.returncode != 0:
@@ -101,7 +103,8 @@ class GitWorktreeManager:
                 f"no merge base for {base_sha} and {head_sha}: {merge_base.stderr.strip()!r}"
             )
         diff = subprocess.run(
-            self._git(repo_dir, "diff", merge_base.stdout.strip(), head_sha), **kwargs
+            self._git(repo_dir, "diff", merge_base.stdout.strip(), head_sha),
+            **{**kwargs, "errors": "replace"},
         )
         if diff.returncode != 0:
             raise GitWorktreeError(f"diff of {head_sha} failed: {diff.stderr.strip()!r}")

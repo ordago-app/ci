@@ -47,6 +47,15 @@ def main() -> None:
         run_as_uid=int(os.environ.get("WORKTREE_RUN_AS_UID", "1000")),
         run_as_gid=int(os.environ.get("WORKTREE_RUN_AS_GID", "1000")),
     )
+    claude_provider = ClaudeReviewProvider(
+        docker_client=docker_client,
+        worktrees=worktrees,
+        projects_root=projects_root,
+        api_key_file=claude_api_key_file,
+        model=claude_model,
+        max_budget_usd=claude_max_budget_usd,
+    )
+    claude_provider.reap_orphans()
     worker = ReviewWorker(
         config=cfg,
         store=store,
@@ -60,14 +69,7 @@ def main() -> None:
                 router_url=router_url,
                 model=codex_model,
             ),
-            "claude": ClaudeReviewProvider(
-                docker_client=docker_client,
-                worktrees=worktrees,
-                projects_root=projects_root,
-                api_key_file=claude_api_key_file,
-                model=claude_model,
-                max_budget_usd=claude_max_budget_usd,
-            ),
+            "claude": claude_provider,
         },
         projects_root=projects_root,
         reviewer_bot=reviewer_bot,

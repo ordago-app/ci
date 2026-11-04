@@ -11,3 +11,8 @@
 # compose.yml mounts it read-only, so it must already exist on the target
 # host before this role runs.
 github_review_repos_config: "{{ personal_root }}/repos.yml"
+
+# Build the image the `claude` review provider runs in. Set it where a repo in your
+# agent-review.yml names `claude`; without the image that provider reports itself
+# unavailable.
+github_review_build_claude_image: false

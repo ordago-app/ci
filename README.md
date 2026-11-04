@@ -55,12 +55,12 @@ cannot be asserted from inside a role.
   `fallback_providers: [claude]` in `agent-review.yml`. A fallback runs when the
   provider reports it cannot run (quota, credit, not onboarded) or on a job's
   last attempt, never because it requested changes. The `claude` provider needs
-  an Anthropic API key in `{{ personal_root }}/claude-review-state/api-key`,
-  which the role does not place: create it readable only by root and the
-  operator. It has to be an API key, because the provider runs `claude --bare`,
-  which does not read a subscription token. Model and per-review spending cap
-  are `CLAUDE_REVIEW_MODEL` and `CLAUDE_REVIEW_MAX_BUDGET_USD` in the service's
-  `compose.yml`.
+  `github_review_build_claude_image: true` and an Anthropic API key in
+  `{{ personal_root }}/claude-review-state/api-key`, which the role does not
+  place: create it readable only by root and the operator. Model and per-review
+  spending cap are `CLAUDE_REVIEW_MODEL` and `CLAUDE_REVIEW_MAX_BUDGET_USD` in
+  the service's `compose.yml`. A review that hits the cap is given up on, not
+  retried, and the head stays unreviewed.
 
 - **`ordago.ci.ci_lane_host`** — offers CI capacity from any machine (scoped
   Docker socket proxy + fabric sidecar). Does **not** provision the host

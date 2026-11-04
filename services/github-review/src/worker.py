@@ -8,7 +8,12 @@ from .config import RepoPolicy, ReviewConfig, ToolProfile
 from .job_store import JobStatus, ReviewJob, ReviewJobStore
 from .poller import ReviewPoller
 from .prompt import build_review_prompt
-from .provider import ProviderUnavailableError, ReviewProvider, ReviewResult
+from .provider import (
+    ProviderUnavailableError,
+    ReviewBudgetExceededError,
+    ReviewProvider,
+    ReviewResult,
+)
 
 # Opens the body of a carried approval. pr-land (agent-skills) matches it to keep
 # these out of its round count, so the two strings must stay identical.
@@ -125,19 +130,11 @@ class ReviewWorker:
         )
         profile = self._config.profile_for(repo_policy)
         self._store.mark_running(job.id)
-        worktree = None
         try:
             pr = self._github.get_pull_request(job.repo, job.pr_number)
             if pr.head_sha != job.head_sha:
                 self._store.mark_skipped(job.id, f"head moved to {pr.head_sha}")
                 return
-            repo_dir = self._projects_root / job.project / "repo"
-            worktree = self._worktrees.prepare(
-                repo_dir=repo_dir,
-                project=job.project,
-                pr_number=job.pr_number,
-                head_sha=job.head_sha,
-            )
             prompt = build_review_prompt(
                 job=job,
                 pr=pr,
@@ -147,24 +144,23 @@ class ReviewWorker:
                 if repo_policy.run_ci_first
                 else "not requested",
             )
-            result = self._review_with_chain(job, repo_policy, profile, worktree, prompt)
+            result = self._review_with_chain(job, repo_policy, profile, prompt)
             self._github.post_review(
                 job.repo, job.pr_number, result.body, result.event, commit_id=job.head_sha
             )
             self._store.mark_posted(job.id, verdict=result.event)
+        except ReviewBudgetExceededError as exc:
+            self._store.mark_skipped(job.id, str(exc))
+            self._report_failure(job, exc)
         except Exception as exc:
             self._store.mark_failed(job.id, str(exc))
             self._report_failure(job, exc)
-        finally:
-            if worktree is not None:
-                self._worktrees.cleanup(worktree)
 
     def _review_with_chain(
         self,
         job: ReviewJob,
         repo_policy: RepoPolicy,
         profile: ToolProfile,
-        worktree: Path,
         prompt: str,
     ) -> ReviewResult:
         """The first answer from the repo's chain. An answer is any verdict: a fallback
@@ -173,18 +169,29 @@ class ReviewWorker:
         A fallback spends real credit and a later tick's retry does not, so only two
         things move down the chain: a provider that says it cannot run, and any failure
         on the job's last attempt. Anything else re-raises for the normal retry, which
-        starts again from the primary."""
+        starts again from the primary.
+
+        Each provider gets its own worktree: a codex session mounts its read-write, so
+        the next provider must not read what a failed one left behind."""
         last_attempt = job.attempts + 1 >= self._max_attempts
         chain = [job.provider, *repo_policy.fallback_providers]
         failures: list[tuple[str, Exception]] = []
         for name in chain:
             provider = self._providers[name]
+            worktree = self._worktrees.prepare(
+                repo_dir=self._projects_root / job.project / "repo",
+                project=job.project,
+                pr_number=job.pr_number,
+                head_sha=job.head_sha,
+            )
             session = None
             try:
                 session = provider.start_review_session(job, worktree, profile)
                 result = provider.run_review(
                     session, prompt, timeout_seconds=profile.max_runtime_minutes * 60
                 )
+            except ReviewBudgetExceededError:
+                raise
             except ProviderUnavailableError as exc:
                 failures.append((name, exc))
                 continue
@@ -196,6 +203,7 @@ class ReviewWorker:
             finally:
                 if session is not None:
                     provider.cleanup(session)
+                self._worktrees.cleanup(worktree)
             return self._attributed(job, name, failures, result)
         if len(failures) == 1:
             raise failures[0][1]

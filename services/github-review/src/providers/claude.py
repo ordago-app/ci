@@ -12,24 +12,33 @@ from docker.errors import ImageNotFound
 from ..config import ToolProfile
 from ..git_worktree import GitWorktreeManager
 from ..job_store import ReviewJob
-from ..provider import ProviderUnavailableError, ReviewResult, SessionRef, parse_verdict
+from ..provider import (
+    ProviderUnavailableError,
+    ReviewBudgetExceededError,
+    ReviewResult,
+    SessionRef,
+    parse_verdict,
+)
 from .container import (
     PROMPT_PATH,
-    copy_prompt,
+    copy_text_file,
     exec_with_deadline,
     remove_existing,
     remove_quietly,
 )
 
 CLAUDE_REVIEW_IMAGE = "homelab/claude-review:latest"
+CONTAINER_NAME_PREFIX = "claude-review-"
 
-# The image's `node` user, which also owns the worktree the review mounts.
+# The image's `node` user.
 AGENT_UID = 1000
 AGENT_GID = 1000
 
-# Written into the worktree before it is mounted. The container has no git to ask:
-# a worktree's .git points at a clone outside the mount, and Bash is not a tool here.
-DIFF_FILENAME = ".pr-review.diff"
+# Copied into the container, not written into the worktree: the worktree is the code
+# under review, this service runs as root, and a PR can commit any path as a symlink.
+# The container has no git to ask: a worktree's .git points at a clone outside the
+# mount, and Bash is not a tool here.
+DIFF_PATH = "/tmp/pr-review.diff"
 
 MAX_TURNS = 60
 
@@ -45,9 +54,9 @@ _UNAVAILABLE_RE = re.compile(
 
 def review_prompt(prompt: str) -> str:
     return (
-        f"The PR's full diff, from its merge base to its head, is at "
-        f"/workspace/{DIFF_FILENAME}. Read it first. Your tools are Read, Glob and Grep "
-        "over /workspace: there is no shell, git or network tool here.\n\n"
+        f"The PR's full diff, from its merge base to its head, is at {DIFF_PATH}. Read it "
+        "first. Your tools are Read, Glob and Grep over /workspace: there is no shell, git "
+        "or network tool here.\n\n"
         f"{prompt}"
     )
 
@@ -79,15 +88,13 @@ class ClaudeReviewProvider:
         except ImageNotFound as exc:
             raise ProviderUnavailableError(f"image {CLAUDE_REVIEW_IMAGE} is not built") from exc
 
-        (worktree / DIFF_FILENAME).write_text(
-            self._worktrees.pr_diff(
-                repo_dir=self._projects_root / job.project / "repo",
-                base_sha=job.base_sha,
-                head_sha=job.head_sha,
-            )
+        diff = self._worktrees.pr_diff(
+            repo_dir=self._projects_root / job.project / "repo",
+            base_sha=job.base_sha,
+            head_sha=job.head_sha,
         )
 
-        name = f"claude-review-{job.id}"
+        name = f"{CONTAINER_NAME_PREFIX}{job.id}"
         remove_existing(self._docker, name)
         try:
             container = self._docker.containers.run(
@@ -106,6 +113,7 @@ class ClaudeReviewProvider:
                 environment={"ANTHROPIC_API_KEY": api_key},
                 volumes={str(worktree): {"bind": "/workspace", "mode": "ro"}},
             )
+            copy_text_file(container, DIFF_PATH, diff)
         except BaseException:
             remove_quietly(self._docker, name)
             raise
@@ -113,14 +121,18 @@ class ClaudeReviewProvider:
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
         container = self._docker.containers.get(session.container)
-        copy_prompt(container, review_prompt(prompt))
-        # --bare skips the checkout's own hooks and MCP servers, and it is why this
-        # provider takes an API key: --bare does not read a subscription token.
-        # dontAsk denies whatever would otherwise prompt, which is every read
-        # outside the working directory.
+        copy_text_file(container, PROMPT_PATH, review_prompt(prompt))
+        # The checkout is the code under review, and its .claude/settings.json could
+        # point the CLI at another API endpoint and read this key straight off the wire.
+        # --setting-sources "" and --strict-mcp-config ignore everything in it. --bare is
+        # NOT enough: it skips hooks but still applies a project's `env`, and it drops
+        # Glob and Grep. dontAsk denies whatever would otherwise prompt, which is every
+        # read outside the working directory and --add-dir.
         claude = (
-            "claude --bare -p --output-format json --no-session-persistence "
+            "claude -p --output-format json --no-session-persistence "
             "--tools Read,Glob,Grep --permission-mode dontAsk "
+            "--setting-sources '' --strict-mcp-config "
+            f"--add-dir {shlex.quote(str(Path(DIFF_PATH).parent))} "
             f"--model {shlex.quote(self._model)} --max-turns {MAX_TURNS} "
             f"--max-budget-usd {self._max_budget_usd}"
         )
@@ -143,6 +155,15 @@ class ClaudeReviewProvider:
 
     def cleanup(self, session: SessionRef) -> None:
         remove_quietly(self._docker, session.container)
+
+    def reap_orphans(self) -> None:
+        """Remove review containers a restart left behind: each one holds the API key
+        in its environment, sleeping forever. Only safe before the first tick."""
+        for container in self._docker.containers.list(
+            all=True, filters={"name": CONTAINER_NAME_PREFIX}
+        ):
+            if container.name.startswith(CONTAINER_NAME_PREFIX):
+                remove_quietly(self._docker, container.name)
 
     def _read_api_key(self) -> str:
         try:
@@ -175,6 +196,8 @@ class ClaudeReviewProvider:
 
     def _raise_failure(self, payload: dict[str, Any], text: str) -> NoReturn:
         detail = text or "; ".join(str(e) for e in payload.get("errors") or []) or str(payload)
+        if payload.get("subtype") == "error_max_budget_usd":
+            raise ReviewBudgetExceededError(detail)
         if payload.get("api_error_status") in _UNAVAILABLE_STATUSES or _UNAVAILABLE_RE.search(
             detail
         ):

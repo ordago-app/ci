@@ -1,11 +1,14 @@
+import io
 import json
+import shlex
+import tarfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 from docker.errors import ImageNotFound
 from src.job_store import JobStatus, ReviewJob
-from src.provider import ProviderUnavailableError, SessionRef
+from src.provider import ProviderUnavailableError, ReviewBudgetExceededError, SessionRef
 from src.providers import claude as claude_mod
 from src.providers.claude import ClaudeReviewProvider
 
@@ -124,26 +127,63 @@ def test_key_never_reaches_argv(tmp_path: Path) -> None:
     assert "sk-test-key" not in " ".join(container.exec_run.call_args.args[0])
 
 
-def test_the_pr_diff_is_written_where_the_prompt_says(tmp_path: Path) -> None:
+def _archived_files(container: MagicMock) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for call in container.put_archive.call_args_list:
+        target_dir, archive = call.args
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            for member in tar.getmembers():
+                extracted = tar.extractfile(member)
+                assert extracted is not None
+                files[f"{target_dir}/{member.name}"] = extracted.read().decode()
+    return files
+
+
+def test_the_pr_diff_goes_into_the_container_where_the_prompt_says(tmp_path: Path) -> None:
     provider = _provider(tmp_path)
-    worktree = _worktree(tmp_path)
-    container = provider._docker.containers.get.return_value
-    container.exec_run.return_value = _exec_result(_success("VERDICT: APPROVE"))
+    container = provider._docker.containers.run.return_value
 
-    provider.start_review_session(job(), worktree, profile())
-    provider.run_review(SESSION, "the prompt", 60)
+    provider.start_review_session(job(), _worktree(tmp_path), profile())
 
-    assert (worktree / claude_mod.DIFF_FILENAME).read_text() == "diff --git a/a.py b/a.py\n"
+    assert _archived_files(container)[claude_mod.DIFF_PATH] == "diff --git a/a.py b/a.py\n"
     provider._worktrees.pr_diff.assert_called_once_with(
         repo_dir=tmp_path / "projects" / "homelab" / "repo", base_sha="base", head_sha="head"
     )
-    assert f"/workspace/{claude_mod.DIFF_FILENAME}" in claude_mod.review_prompt("the prompt")
+    assert claude_mod.DIFF_PATH in claude_mod.review_prompt("the prompt")
     assert claude_mod.review_prompt("the prompt").endswith("the prompt")
 
 
-def test_run_review_is_bare_read_only_and_bounded(tmp_path: Path) -> None:
-    # --bare is what keeps the checkout's own .claude/settings.json hooks and
-    # .mcp.json from running: the checkout is the code under review.
+def test_a_symlink_committed_by_the_pr_is_never_written_through(tmp_path: Path) -> None:
+    # Regression: the diff used to be written into the worktree, by a service running
+    # as root, at a path the PR could commit as a symlink to anywhere on the host.
+    victim = tmp_path / "victim"
+    victim.write_text("untouched")
+    worktree = _worktree(tmp_path)
+    for name in (Path(claude_mod.DIFF_PATH).name, ".pr-review.diff"):
+        (worktree / name).symlink_to(victim)
+
+    _provider(tmp_path).start_review_session(job(), worktree, profile())
+
+    assert victim.read_text() == "untouched"
+
+
+def test_a_failed_diff_copy_leaves_no_container_behind(tmp_path: Path) -> None:
+    provider = _provider(tmp_path)
+    container = provider._docker.containers.get.return_value
+    provider._docker.containers.run.return_value.put_archive.side_effect = RuntimeError("copy")
+
+    with pytest.raises(RuntimeError, match="copy"):
+        provider.start_review_session(job(), _worktree(tmp_path), profile())
+
+    container.remove.assert_called_with(force=True)
+
+
+def test_run_review_ignores_the_checkouts_own_config_and_is_bounded(tmp_path: Path) -> None:
+    # Regression: under --bare a PR's .claude/settings.json `env` still applied, so it
+    # could set ANTHROPIC_BASE_URL, collect the API key and answer with an APPROVE.
+    # These exact flags were checked against the pinned CLI and a local fake API with a
+    # hostile checkout: no call reached its endpoint, its hook and .mcp.json did not
+    # run, its allow rules were ignored, and Read left the workspace only for DIFF_PATH.
     provider = _provider(tmp_path)
     container = provider._docker.containers.get.return_value
     container.exec_run.return_value = _exec_result(_success("VERDICT: APPROVE"))
@@ -152,14 +192,52 @@ def test_run_review_is_bare_read_only_and_bounded(tmp_path: Path) -> None:
 
     cmd = container.exec_run.call_args.args[0]
     assert all(len(part) < 1_000 for part in cmd)
-    command = cmd[-1]
-    assert command.startswith("claude --bare -p ")
-    assert "--tools Read,Glob,Grep " in command
-    assert "--permission-mode dontAsk " in command
-    assert "--model claude-model " in command
-    assert "--max-budget-usd 3.0" in command
-    assert command.endswith(f"< {claude_mod.PROMPT_PATH}")
+    argv = shlex.split(cmd[-1])
+    assert argv[:2] == ["claude", "-p"]
+    assert "--bare" not in argv
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep"
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--add-dir") + 1] == str(Path(claude_mod.DIFF_PATH).parent)
+    assert argv[argv.index("--model") + 1] == "claude-model"
+    assert argv[argv.index("--max-budget-usd") + 1] == "3.0"
+    assert cmd[-1].endswith(f"< {claude_mod.PROMPT_PATH}")
     assert container.exec_run.call_args.kwargs["demux"] is True
+
+
+def test_the_budget_stop_observed_from_the_cli_is_its_own_error(tmp_path: Path) -> None:
+    provider = _provider(tmp_path)
+    container = provider._docker.containers.get.return_value
+    container.exec_run.return_value = _exec_result(
+        {
+            "subtype": "error_max_budget_usd",
+            "is_error": True,
+            "api_error_status": None,
+            "terminal_reason": "budget_exhausted",
+            "result": None,
+            "errors": ["Reached maximum budget ($3.0)"],
+        },
+        exit_code=1,
+    )
+
+    with pytest.raises(ReviewBudgetExceededError, match="maximum budget"):
+        provider.run_review(SESSION, "prompt", 60)
+
+
+def test_reap_orphans_removes_only_this_providers_containers(tmp_path: Path) -> None:
+    provider = _provider(tmp_path)
+    orphan = MagicMock()
+    orphan.name = "claude-review-7"
+    near_miss = MagicMock()
+    near_miss.name = "not-claude-review-7"
+    provider._docker.containers.list.return_value = [orphan, near_miss]
+    provider._docker.containers.get.side_effect = {orphan.name: orphan}.__getitem__
+
+    provider.reap_orphans()
+
+    orphan.remove.assert_called_once_with(force=True)
+    near_miss.remove.assert_not_called()
 
 
 @pytest.mark.parametrize(
