@@ -44,15 +44,15 @@
       /opt/personal/repos.yml mount.
 
 # DELIBERATELY no secrets-file assert here, unlike ci_controller. Ruling 7:
-# services/github-review/compose.yml declares no `env_file:` at all — only
-# three plain, non-secret environment variables (AGENT_REVIEW_CONFIG,
-# STATE_DIR, PROJECTS_ROOT) — and the service's own src/main.py reads no
-# token/secret env var either. It authenticates to GitHub only indirectly, by
-# calling claude-router over ROUTER_INTERNAL_URL; claude-router's own stack
-# (not part of this ported range) holds the GitHub App credentials. This
-# stack holds no credential to leak, so it takes no secrets directory and
-# asserts on no secret file. Do not restore a stat-loop assert here without
-# first re-checking services/github-review/compose.yml for a new env_file.
+# services/github-review/compose.yml declares no `env_file:` at all, and the
+# service's own src/main.py reads no token/secret env var. It authenticates to
+# GitHub only indirectly, by calling claude-router over ROUTER_INTERNAL_URL;
+# claude-router's own stack (not part of this ported range) holds the GitHub App
+# credentials. The one credential this stack can hold is optional: the Anthropic
+# API key an operator places by hand to use the `claude` provider. With no key
+# that provider reports itself unavailable, so a missing file must not fail this
+# role. Do not restore a stat-loop assert here without first re-checking
+# services/github-review/compose.yml for a new env_file.
 
 - name: github-review service dir
   ansible.builtin.file:
@@ -69,6 +69,16 @@
     owner: "{{ operator_user }}"
     group: "{{ operator_user }}"
     mode: "0750"
+
+# compose.yml mounts this directory, and an absent bind-mount source makes Docker
+# fabricate a root-owned one. The key inside it is placed by the operator.
+- name: claude-review key dir exists
+  ansible.builtin.file:
+    path: "{{ personal_root }}/claude-review-state"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0700"
 
 - name: place agent-review.yml on host
   ansible.builtin.copy:
@@ -97,6 +107,22 @@
       - "--no-times"
   become: true
   become_user: "{{ operator_user }}"
+
+# Spawned by the service rather than run by compose, so no `up` would build it.
+# Opt-in: an operator not using the claude provider needs neither this build nor
+# what it needs from the host. force_source so a bumped CLI pin rebuilds; an
+# unchanged Dockerfile is a cache hit.
+- name: claude-review image is built
+  when: github_review_build_claude_image | bool
+  community.docker.docker_image:
+    name: homelab/claude-review
+    tag: latest
+    source: build
+    force_source: true
+    state: present
+    build:
+      path: "{{ services_root }}/github-review/claude-review"
+      pull: false
 
 - name: github-review stack up
   community.docker.docker_compose_v2:

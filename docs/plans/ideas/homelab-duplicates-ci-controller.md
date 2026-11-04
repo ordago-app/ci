@@ -26,6 +26,15 @@ The SHA pin in that repo's `ansible/requirements.yml` governs only the
 collection, and the collection's `ci_controller` role is not what deploys the
 dispatcher there. Nothing in the path reads this repository.
 
+**`services/github-review/` has already drifted, with no port to catch it.** Per
+ordago-apps' `docs/ops/ai-review.md` and its commit `acd4914c3` (2026-10-17), the
+reviewer serving that repo polls every 60 s, posts failures and spent budgets as
+PR comments, enqueues asynchronously from `POST /reviews`, enforces
+`MAX_REVIEW_RUNS` and honours `review_dependency_bots`. None of that is in this
+tree, which still polls every 900 s. This is read from the consumer's docs, not
+from the deployed code. A provider chain was also running there before this tree
+had one, so a change landed here must be reconciled with it, not just copied.
+
 ## Why it matters
 
 1. **Changes landed here do not ship.** Discovered on 2026-08-31 while deploying

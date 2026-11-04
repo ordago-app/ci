@@ -51,6 +51,18 @@ cannot be asserted from inside a role.
     "must already exist" contract as `ci_controller_repos_config`. Defaults
     to `{{ personal_root }}/repos.yml`.
 
+  A repo can name providers to try when its `provider` cannot review:
+  `fallback_providers: [claude]` in `agent-review.yml`. A fallback runs when the
+  provider reports it cannot run (quota, credit, not onboarded) or on a job's
+  last attempt, never because it requested changes. The `claude` provider needs
+  `github_review_build_claude_image: true` and an Anthropic API key in
+  `{{ personal_root }}/claude-review-state/api-key`, which the role does not
+  place: create it readable only by root and the operator. Model and per-review
+  spending cap are `CLAUDE_REVIEW_MODEL` and `CLAUDE_REVIEW_MAX_BUDGET_USD` in
+  the service's `compose.yml`. A review that hits the cap or its turn limit is
+  given up on, not retried: the head stays unreviewed and shows in `/status`
+  as stuck.
+
 - **`ordago.ci.ci_lane_host`** — offers CI capacity from any machine (scoped
   Docker socket proxy + fabric sidecar). Does **not** provision the host
   itself — base OS and Docker are the machine owner's responsibility.

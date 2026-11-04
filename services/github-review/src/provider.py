@@ -1,11 +1,28 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from .config import ToolProfile
 from .job_store import ReviewJob
+
+_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\s*$", re.MULTILINE)
+
+
+class ProviderUnavailableError(RuntimeError):
+    """This provider cannot review anything right now, and a retry will not change that.
+
+    Out of quota or credit, not onboarded, a CLI the vendor's API has moved past.
+    The worker moves straight to the next provider in the repo's chain. Any other
+    exception is treated as transient and retried on this provider first, because
+    a fallback costs real credit and a retry does not."""
+
+
+class ReviewLimitExceededError(RuntimeError):
+    """The review hit its spending or turn cap. Retrying would spend the same again and
+    stop in the same place, so the worker gives up on this head instead."""
 
 
 @dataclass(frozen=True)
@@ -19,6 +36,19 @@ class SessionRef:
 class ReviewResult:
     body: str
     event: str = "COMMENT"
+
+
+def parse_verdict(text: str) -> ReviewResult:
+    """Split a model's final message into the review body and its GitHub event.
+
+    REQUEST_CHANGES unless the text ENDS on an explicit APPROVE line, as the prompt asks.
+    A review that forgot its verdict must never count as an approval, and the reviewed
+    PR's title and body are in the prompt, so a verdict line anywhere else may be a
+    quotation of what the PR wants the verdict to be."""
+    lines = text.strip().splitlines()
+    verdict = _VERDICT_RE.search(lines[-1]) if lines else None
+    event = "APPROVE" if verdict and verdict.group(1) == "APPROVE" else "REQUEST_CHANGES"
+    return ReviewResult(body=_VERDICT_RE.sub("", text).strip(), event=event)
 
 
 class ReviewProvider(Protocol):

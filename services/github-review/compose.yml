@@ -16,6 +16,9 @@ services:
       - AGENT_ROLE=reviewer
       - CODEX_STATE_ROOT=/opt/personal/codex-code-state
       - CODEX_MODEL=gpt-5.5
+      - CLAUDE_REVIEW_API_KEY_FILE=/opt/personal/claude-review-state/api-key
+      - CLAUDE_REVIEW_MODEL=claude-sonnet-5-5
+      - CLAUDE_REVIEW_MAX_BUDGET_USD=3
       - REVIEWER_BOT_LOGIN=homelab-claude-reviewer[bot]
       - POLL_INTERVAL_SECONDS=900
       - MAX_REVIEW_ATTEMPTS=3
@@ -24,6 +27,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:rw
       - /opt/personal/projects:/opt/personal/projects:rw
       - /opt/personal/codex-code-state:/opt/personal/codex-code-state:rw
+      - /opt/personal/claude-review-state:/opt/personal/claude-review-state:ro
       - /opt/personal/state/github-review:/var/lib/github-review:rw
       - /opt/personal/agent-review.yml:/etc/github-review/agent-review.yml:ro
       # Resolved from beside agent-review.yml; see ReviewConfig.load.

@@ -163,7 +163,9 @@ class Worktrees:
     def diff_fingerprint(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
         return self.fingerprints.get(head_sha)
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+    def prepare(
+        self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str, fetch: bool = True
+    ) -> Path:
         self.tmp.mkdir(parents=True, exist_ok=True)
         return self.tmp
 

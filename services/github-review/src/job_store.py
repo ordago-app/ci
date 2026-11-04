@@ -208,6 +208,16 @@ class ReviewJobStore:
     def mark_failed(self, job_id: int, error: str) -> None:
         self._finish(job_id, JobStatus.FAILED, error)
 
+    def mark_given_up(self, job_id: int, error: str, *, max_attempts: int) -> None:
+        """Failed with no retries left, whatever attempts it had used: a retry would only
+        spend again. It counts in count_stuck, so a PR waiting on it shows in /status."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE review_jobs SET status = ?, finished_at = ?, last_error = ?, "
+                "attempts = MAX(attempts, ?) WHERE id = ?",
+                (JobStatus.FAILED, time.time(), error, max_attempts, job_id),
+            )
+
     def get_posted(self, repo: str, pr_number: int, head_sha: str) -> ReviewJob | None:
         with self._connect() as conn:
             row = conn.execute(

@@ -1,21 +1,24 @@
 from __future__ import annotations
 
-import concurrent.futures
-import io
 import json
 import os
 import re
 import shlex
 import sys
-import tarfile
 from pathlib import Path
 
 from docker import DockerClient
-from docker.errors import NotFound
 
 from ..config import ToolProfile
 from ..job_store import ReviewJob
-from ..provider import ReviewResult, SessionRef
+from ..provider import ProviderUnavailableError, ReviewResult, SessionRef, parse_verdict
+from .container import (
+    PROMPT_PATH,
+    copy_text_file,
+    exec_with_deadline,
+    remove_existing,
+    remove_quietly,
+)
 
 # The codex-code agent image runs as this non-root user; the worktree and
 # CODEX_HOME it mounts must be owned by it or codex can't write (os error 13).
@@ -29,12 +32,12 @@ AGENT_GID = 1000
 # reads code from the local worktree and the github MCP, never `gh` writes).
 CODEX_GH_ROLE = "reviewer-readonly"
 
-# The prompt carries the whole PR diff, so it goes into the container as a file
-# and reaches `codex exec -` on stdin: as one argv element it failed every large
-# PR with "argument list too long" (the kernel caps a single argument at 128 KiB).
-PROMPT_PATH = "/tmp/review-prompt.md"
-
-_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\s*$", re.MULTILINE)
+# Retrying cannot fix any of these. The long usage cap resets days out, and the
+# models-API failure is a CLI the vendor has moved past until its pin is bumped.
+_UNAVAILABLE_RE = re.compile(
+    r"usage limit|rate limit|out of (extra )?usage|quota|failed to refresh available models",
+    re.IGNORECASE,
+)
 
 
 def render_codex_config(*, caller: str, mcps: dict[str, list[str]], model: str) -> str:
@@ -74,7 +77,9 @@ class CodexReviewProvider:
     ) -> SessionRef:
         auth = self._codex_state_root / "auth.json"
         if not auth.exists():
-            raise RuntimeError("Codex auth is not onboarded; run `make codex-onboard host=<host>`")
+            raise ProviderUnavailableError(
+                "Codex auth is not onboarded; run `make codex-onboard host=<host>`"
+            )
 
         image = self._docker.images.get(f"homelab/codex-code-{job.project}:latest")
         codex_home = self._projects_root / job.project / "review-sessions" / str(job.id)
@@ -98,11 +103,11 @@ class CodexReviewProvider:
         # the name first (safe: a job is claimed by exactly one worker, this one)
         # and remove the container if create or start raises.
         name = f"codex-review-{job.id}"
-        self._remove_existing(name)
+        remove_existing(self._docker, name)
         try:
             container = self._start_container(job, image.id, name, worktree, codex_home)
         except BaseException:
-            self._remove_quietly(name)
+            remove_quietly(self._docker, name)
             raise
         return SessionRef(id=str(job.id), container=container.name, worktree=worktree)
 
@@ -134,67 +139,27 @@ class CodexReviewProvider:
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
         container = self._docker.containers.get(session.container)
-        self._copy_prompt(container, prompt)
+        copy_text_file(container, PROMPT_PATH, prompt)
         codex = "codex exec --json --dangerously-bypass-approvals-and-sandbox -"
-        cmd = ["sh", "-c", f"{codex} < {shlex.quote(PROMPT_PATH)}"]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(container.exec_run, cmd, stdout=True, stderr=True)
-            try:
-                result = future.result(timeout=timeout_seconds)
-            except concurrent.futures.TimeoutError as exc:
-                self.cleanup(session)
-                raise RuntimeError("codex review timed out") from exc
+        result = exec_with_deadline(
+            container,
+            ["sh", "-c", f"{codex} < {shlex.quote(PROMPT_PATH)}"],
+            timeout_seconds=timeout_seconds,
+            on_timeout=lambda: self.cleanup(session),
+            label="codex",
+            stdout=True,
+            stderr=True,
+        )
         output = result.output.decode("utf-8", errors="replace")
         if result.exit_code != 0:
+            reported = _reported_by_codex(output)
+            if _UNAVAILABLE_RE.search(reported):
+                raise ProviderUnavailableError(reported)
             raise RuntimeError(f"codex review failed: {output.strip()}")
-        body, event = self._parse_review(output)
-        return ReviewResult(body=body, event=event)
-
-    def _copy_prompt(self, container, prompt: str) -> None:
-        data = prompt.encode("utf-8")
-        info = tarfile.TarInfo(Path(PROMPT_PATH).name)
-        info.size = len(data)
-        info.mode = 0o644
-        archive = io.BytesIO()
-        with tarfile.open(fileobj=archive, mode="w") as tar:
-            tar.addfile(info, io.BytesIO(data))
-        container.put_archive(str(Path(PROMPT_PATH).parent), archive.getvalue())
+        return parse_verdict(self._extract_review_body(output))
 
     def cleanup(self, session: SessionRef) -> None:
-        self._remove_quietly(session.container)
-
-    def _remove_existing(self, name: str) -> None:
-        """Remove the container if it exists, raising if that fails: a session must
-        not start while a container under its name may still be there."""
-        try:
-            container = self._docker.containers.get(name)
-        except NotFound:
-            return
-        container.remove(force=True)
-
-    def _remove_quietly(self, name: str) -> None:
-        # Runs in the worker's finally, so it must not raise. But it must not
-        # silently swallow failures either: a hidden remove() error leaks one
-        # codex container per review and eventually exhausts the host.
-        try:
-            container = self._docker.containers.get(name)
-        except NotFound:
-            return
-        except Exception as exc:
-            print(
-                f"[github-review] could not look up review container {name} for cleanup: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return
-        try:
-            container.remove(force=True)
-        except Exception as exc:
-            print(
-                f"[github-review] failed to remove review container {name}: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
+        remove_quietly(self._docker, session.container)
 
     def _make_agent_writable(self, *paths: Path) -> None:
         for path in paths:
@@ -216,14 +181,6 @@ class CodexReviewProvider:
             # the container github-review is root, so a failure there is real.
             if os.geteuid() == 0:
                 raise
-
-    def _parse_review(self, output: str) -> tuple[str, str]:
-        raw = self._extract_review_body(output)
-        match = _VERDICT_RE.search(raw)
-        # Default REQUEST_CHANGES: never approve without an explicit APPROVE token.
-        event = "APPROVE" if (match and match.group(1) == "APPROVE") else "REQUEST_CHANGES"
-        body = _VERDICT_RE.sub("", raw).strip()
-        return body, event
 
     def _extract_review_body(self, output: str) -> str:
         # codex `exec --json` emits JSONL events; the review is the final
@@ -253,3 +210,25 @@ class CodexReviewProvider:
             tail = output.strip()[-1500:] or "<empty>"
             raise RuntimeError(f"codex produced no review body; raw tail: {tail}")
         return body
+
+
+def _reported_by_codex(output: str) -> str:
+    """What codex itself said went wrong. `item.*` events carry what the session read
+    and ran (a review reads code, and code talks about usage limits), and lifecycle
+    events like `thread.started` say nothing, so only error messages and plain text
+    lines count."""
+    reported: list[str] = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            reported.append(line)
+            continue
+        if not isinstance(event, dict) or str(event.get("type", "")).startswith("item."):
+            continue
+        error = event.get("error")
+        message = error.get("message") if isinstance(error, dict) else error
+        message = message or event.get("message")
+        if message:
+            reported.append(str(message))
+    return "\n".join(reported).strip()

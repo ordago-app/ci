@@ -235,3 +235,50 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path: Path) -> 
 # `personal/repos.yml` ship consistently. That is a fact about a DEPLOYMENT, not
 # about this platform, and those files live in the consumer's repo. It stays
 # with the consumer; re-adding it here would only ever fail.
+
+
+def _fallback_config(tmp_path: Path, fallbacks: str) -> Path:
+    path = tmp_path / "agent-review.yml"
+    path.write_text(
+        f"""
+        repos:
+          homelab:
+            provider: codex
+            fallback_providers: {fallbacks}
+            tool_profile: reviewer
+        tool_profiles:
+          reviewer: {{}}
+        """
+    )
+    return path
+
+
+def test_fallback_providers_default_to_none(tmp_path: Path) -> None:
+    path = tmp_path / "agent-review.yml"
+    path.write_text(
+        """
+        repos:
+          homelab:
+            provider: codex
+            tool_profile: reviewer
+        tool_profiles:
+          reviewer: {}
+        """
+    )
+    assert ReviewConfig.load(path).repos["homelab"].fallback_providers == []
+
+
+def test_fallback_providers_load(tmp_path: Path) -> None:
+    cfg = ReviewConfig.load(_fallback_config(tmp_path, "[claude]"))
+    assert cfg.repos["homelab"].fallback_providers == ["claude"]
+
+
+def test_rejects_unknown_fallback_provider(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="gemini"):
+        ReviewConfig.load(_fallback_config(tmp_path, "[gemini]"))
+
+
+@pytest.mark.parametrize("fallbacks", ["[codex]", "[claude, claude]"])
+def test_rejects_a_provider_listed_twice_in_a_chain(tmp_path: Path, fallbacks: str) -> None:
+    with pytest.raises(ConfigError, match="twice"):
+        ReviewConfig.load(_fallback_config(tmp_path, fallbacks))
