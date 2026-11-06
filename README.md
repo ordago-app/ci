@@ -80,6 +80,8 @@ an operator's personal reviewer and Órdago's — side by side on one host or no
 host's Docker socket to start each review's sandbox, and mounts its clones at
 the same path they have on the host (the daemon resolves sandbox mounts by host
 path). Any machine running Docker works: a homelab box, a VPS, a cloud VM.
+It needs Docker Compose 2.24 or later, for the `env_file` `path:`/`required:`
+form the compose file uses.
 
 ### Deploying an instance
 
