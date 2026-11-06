@@ -138,6 +138,13 @@ def create_app(
             # dashboard that predates the field renders one card fewer, not a
             # broken page.
             "reviewer_quota": worker.reviewer_quota(),
+            # Reported run cost per account, over the last day and 30 days. An
+            # api_key account spends somebody's credit, and this is where the
+            # owner reads how much.
+            "spend": {
+                "day": store.spend_by_account(time.time() - 86400),
+                "month": store.spend_by_account(time.time() - 30 * 86400),
+            },
             "active": [
                 {
                     "id": job.id,

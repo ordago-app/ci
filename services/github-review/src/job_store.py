@@ -130,6 +130,24 @@ class ReviewJobStore:
                 )
             if "review_body" not in cols:
                 conn.execute("ALTER TABLE review_jobs ADD COLUMN review_body TEXT")
+            # One row per paid provider run, so spend is answerable per account:
+            # each account is somebody's credit, and a failover spends two of
+            # them on one job. Starts empty on an upgraded DB; earlier runs
+            # recorded no cost.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS review_runs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  job_id INTEGER NOT NULL REFERENCES review_jobs(id),
+                  account TEXT NOT NULL,
+                  finished_at REAL NOT NULL,
+                  cost_usd REAL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS review_runs_finished_at ON review_runs(finished_at)"
+            )
 
     def enqueue(
         self,
@@ -469,13 +487,43 @@ class ReviewJobStore:
             ).fetchone()
         return int(row[0])
 
-    def record_provider_run(self, job_id: int) -> None:
-        """A provider read the diff for this job — paid, whether or not a review posted."""
+    def record_provider_run(self, job_id: int, account: str, cost_usd: float | None = None) -> None:
+        """A provider read the diff for this job — paid, whether or not a review posted.
+
+        `cost_usd` is what the run reported spending; None when it reported
+        nothing, which is unknown rather than free."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE review_jobs SET provider_runs = provider_runs + 1 WHERE id = ?",
                 (job_id,),
             )
+            conn.execute(
+                "INSERT INTO review_runs (job_id, account, finished_at, cost_usd) "
+                "VALUES (?, ?, ?, ?)",
+                (job_id, account, time.time(), cost_usd),
+            )
+
+    def spend_by_account(self, since: float) -> list[dict[str, object]]:
+        """Paid runs and their reported cost per account since `since`, costliest first.
+
+        `priced_runs` counts the runs that reported a cost, so a reader can tell
+        "$0.00 over 40 runs" from "no figure for 40 runs"."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account, COUNT(*) AS runs, COUNT(cost_usd) AS priced_runs, "
+                "COALESCE(SUM(cost_usd), 0) AS cost_usd FROM review_runs "
+                "WHERE finished_at >= ? GROUP BY account ORDER BY cost_usd DESC, account",
+                (since,),
+            ).fetchall()
+        return [
+            {
+                "account": str(row["account"]),
+                "runs": int(row["runs"]),
+                "priced_runs": int(row["priced_runs"]),
+                "cost_usd": round(float(row["cost_usd"]), 4),
+            }
+            for row in rows
+        ]
 
     def runs_for(self, repo: str, pr_number: int) -> int:
         """Provider invocations on this PR, whatever came of them — the spend the run cap bounds.

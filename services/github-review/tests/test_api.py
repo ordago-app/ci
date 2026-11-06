@@ -154,6 +154,18 @@ def test_status_reports_counts_and_active_jobs(status_client, store) -> None:
     assert all("last_error" in j for j in body["active"])
 
 
+def test_status_reports_spend_per_account(status_client, store) -> None:
+    job = store.enqueue("o/r", "r", "claude-a", 7, "a" * 40, "b" * 40)
+    store.record_provider_run(job.id, "claude-a", 0.42)
+
+    spend = status_client.get("/status").json()["spend"]
+
+    for window in ("day", "month"):
+        assert spend[window] == [
+            {"account": "claude-a", "runs": 1, "priced_runs": 1, "cost_usd": 0.42}
+        ]
+
+
 def test_status_surfaces_last_error_and_drops_terminal_jobs(status_client, store) -> None:
     job = store.enqueue("o/r", "r", "codex", 9, "e" * 40, "f" * 40)
     store.mark_failed(job.id, "codex exited 1")

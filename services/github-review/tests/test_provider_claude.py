@@ -18,7 +18,13 @@ import pytest
 from docker.errors import ImageNotFound
 from src.config import ClaudeAccount, CredentialSource
 from src.job_store import JobStatus, ReviewJob
-from src.provider import ProviderUnavailable, ReviewLimitExceeded, SessionRef
+from src.provider import (
+    ProviderUnavailable,
+    ReviewFailed,
+    ReviewLimitExceeded,
+    SessionRef,
+    run_cost,
+)
 from src.providers._agent_container import INSTANCE_LABEL, PROMPT_PATH
 from src.providers.claude import DIFF_PATH, ClaudeReviewProvider, review_prompt
 
@@ -693,3 +699,62 @@ def test_an_outage_says_whether_the_model_already_ran(
         _run(tmp_path, output, exit_code=1)
 
     assert caught.value.read_diff is spent
+
+
+# ── cost ───────────────────────────────────────────────────────────────────
+
+
+def test_a_review_carries_the_cost_the_cli_reported(tmp_path: Path) -> None:
+    result = _run(tmp_path, _result("No findings.\nVERDICT: APPROVE", total_cost_usd=0.4213))
+
+    assert result.event == "APPROVE"
+    assert result.cost_usd == pytest.approx(0.4213)
+
+
+def test_a_run_that_reports_no_cost_is_unknown_not_free(tmp_path: Path) -> None:
+    assert _run(tmp_path, _result("No findings.\nVERDICT: APPROVE")).cost_usd is None
+
+
+def test_every_paid_failure_still_carries_its_cost(tmp_path: Path) -> None:
+    """A run that read the diff and then failed was paid for, so its cost must
+    reach the ledger whichever way it failed."""
+    capped = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_max_budget_usd",
+            "is_error": True,
+            "errors": ["Reached maximum budget ($3.0)"],
+            "total_cost_usd": 3.02,
+        }
+    )
+    with pytest.raises(ReviewLimitExceeded) as limit:
+        _run(tmp_path, capped, exit_code=1)
+    assert run_cost(limit.value) == pytest.approx(3.02)
+
+    exhausted = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 429,
+            "result": "Too many",
+            "num_turns": 4,
+            "total_cost_usd": 0.8,
+        }
+    )
+    with pytest.raises(ProviderUnavailable) as outage:
+        _run(tmp_path, exhausted, exit_code=1)
+    assert run_cost(outage.value) == pytest.approx(0.8)
+
+    broken = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": "boom",
+            "total_cost_usd": 0.1,
+        }
+    )
+    with pytest.raises(ReviewFailed) as failed:
+        _run(tmp_path, broken, exit_code=1)
+    assert run_cost(failed.value) == pytest.approx(0.1)

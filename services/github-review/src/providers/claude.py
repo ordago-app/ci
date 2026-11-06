@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from ..job_store import ReviewJob
 from ..provider import (
     ProviderUnavailable,
     QuotaReading,
+    ReviewFailed,
     ReviewLimitExceeded,
     ReviewResult,
     SessionRef,
@@ -226,6 +228,7 @@ class ClaudeReviewProvider:
 
     def _judge(self, output: str, exit_code: int, prompt: str) -> ReviewResult:
         event = _result_event(output)
+        cost = _total_cost(event)
         if event is None:
             # No result event: the CLI died before it got going, or mid-stream.
             # Only the non-JSON lines are diagnostics; the JSON ones are the
@@ -240,7 +243,7 @@ class ClaudeReviewProvider:
             errored = bool(event.get("is_error")) or subtype != "success"
 
         if subtype in _LIMIT_SUBTYPES:
-            raise ReviewLimitExceeded(self._account, _error_detail(event, text))
+            raise ReviewLimitExceeded(self._account, _error_detail(event, text), cost_usd=cost)
 
         # Only error text is ever classified. When `errored` is false, `text` is
         # the review itself — and a review of a PR about rate limiting quotes
@@ -252,21 +255,29 @@ class ClaudeReviewProvider:
             status = event.get("api_error_status") if event is not None else None
             if status in _UNAVAILABLE_STATUSES:
                 raise ProviderUnavailable(
-                    self._account, _UNAVAILABLE_STATUSES[status], detail, read_diff=spent
+                    self._account,
+                    _UNAVAILABLE_STATUSES[status],
+                    detail,
+                    read_diff=spent,
+                    cost_usd=cost,
                 )
             probe = "\n".join(x for x in (detail, diagnostic_lines(output, prompt)) if x)
             reason = classify_unavailable(probe)
             if reason is not None:
                 raise ProviderUnavailable(
-                    self._account, reason, probe.strip()[-800:], read_diff=spent
+                    self._account, reason, probe.strip()[-800:], read_diff=spent, cost_usd=cost
                 )
         if errored or exit_code != 0:
-            raise RuntimeError(f"{self._account} review failed: {(text or output).strip()[-1500:]}")
-        if not text.strip():
-            raise RuntimeError(
-                f"{self._account} produced no review body; raw tail: {output.strip()[-1500:]}"
+            raise ReviewFailed(
+                f"{self._account} review failed: {(text or output).strip()[-1500:]}",
+                cost_usd=cost,
             )
-        return parse_verdict(text)
+        if not text.strip():
+            raise ReviewFailed(
+                f"{self._account} produced no review body; raw tail: {output.strip()[-1500:]}",
+                cost_usd=cost,
+            )
+        return replace(parse_verdict(text), cost_usd=cost)
 
     def _capture_quota(self, output: str) -> None:
         """Record the last `rate_limit_event` in a stream-json run, if any.
@@ -334,6 +345,16 @@ def _result_event(output: str) -> dict[str, Any] | None:
         if payload.get("type") == "result":
             return payload
     return None
+
+
+def _total_cost(event: dict[str, Any] | None) -> float | None:
+    """The run's spend as the CLI totals it in its `result` event.
+
+    The CLI reports it whatever pays: on a subscription it is what the run
+    would have cost at API prices, which is still the number that says how
+    heavy a review is."""
+    cost = event.get("total_cost_usd") if event is not None else None
+    return float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None
 
 
 def _took_turns(event: dict[str, Any] | None, output: str) -> bool:

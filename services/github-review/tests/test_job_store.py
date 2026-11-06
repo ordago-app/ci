@@ -94,7 +94,7 @@ def test_rounds_count_disagreements_and_runs_count_every_review(tmp_path: Path) 
     for sha, verdict in (("a", "REQUEST_CHANGES"), ("b", "APPROVE"), ("c", None)):
         job = store.enqueue("alvaro/homelab", "homelab", "codex", 7, sha, "base")
         begin_attempt(store, job.id)
-        store.record_provider_run(job.id)
+        store.record_provider_run(job.id, "codex")
         store.mark_posted(job.id, verdict=verdict)
     carried = store.enqueue("alvaro/homelab", "homelab", "codex", 7, "d", "base")
     store.mark_carried(carried.id, "b", "codex")
@@ -102,7 +102,7 @@ def test_rounds_count_disagreements_and_runs_count_every_review(tmp_path: Path) 
     failed = store.enqueue("alvaro/homelab", "homelab", "codex", 7, "e", "base")
     for _ in range(2):
         begin_attempt(store, failed.id)
-        store.record_provider_run(failed.id)
+        store.record_provider_run(failed.id, "codex")
         store.mark_failed(failed.id, "post_review: 502")
     # A legacy NULL verdict reads as REQUEST_CHANGES; a carry is neither a round nor a run.
     assert store.rounds_for("alvaro/homelab", 7) == 2
@@ -147,7 +147,7 @@ def test_requeue_resets_attempts_but_not_the_run_count(tmp_path: Path) -> None:
     job = store.enqueue("alvaro/homelab", "homelab", "codex", 7, "abc", "base")
     for _ in range(3):
         begin_attempt(store, job.id)
-        store.record_provider_run(job.id)
+        store.record_provider_run(job.id, "codex")
         store.mark_failed(job.id, "boom")
 
     store.requeue(job.id)
@@ -542,3 +542,37 @@ def test_init_adds_refund_and_ci_columns_to_the_live_schema_in_place(tmp_path: P
     assert store.recover_interrupted(1, 2, "interrupted by a restart") == (
         InterruptedOutcome.REQUEUED
     )
+
+
+def test_spend_is_kept_per_account_and_unpriced_runs_are_counted_apart(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    job = store.enqueue("o/r", "r", "claude-a", 1, "a" * 40, "b" * 40)
+
+    # A failover: one account spent and gave out, the next one reviewed.
+    store.record_provider_run(job.id, "claude-a", 0.5)
+    store.record_provider_run(job.id, "claude-b", 1.25)
+    store.record_provider_run(job.id, "claude-b", 0.25)
+    store.record_provider_run(job.id, "codex", None)
+
+    assert store.spend_by_account(0) == [
+        {"account": "claude-b", "runs": 2, "priced_runs": 2, "cost_usd": 1.5},
+        {"account": "claude-a", "runs": 1, "priced_runs": 1, "cost_usd": 0.5},
+        {"account": "codex", "runs": 1, "priced_runs": 0, "cost_usd": 0.0},
+    ]
+    assert store.spend_by_account(time.time() + 60) == []
+    assert store.runs_for("o/r", 1) == 4
+
+
+def test_the_run_ledger_is_added_to_a_db_that_predates_it(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.db"
+    ReviewJobStore(path).init()
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE review_runs")
+    store = ReviewJobStore(path)
+    store.init()
+    job = store.enqueue("o/r", "r", "codex", 1, "a" * 40, "b" * 40)
+
+    store.record_provider_run(job.id, "codex", 0.2)
+
+    assert store.spend_by_account(0)[0]["cost_usd"] == 0.2
