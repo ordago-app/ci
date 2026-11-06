@@ -519,7 +519,9 @@ class ReviewWorker:
                 session = provider.start_review_session(job, worktree, timeout_seconds)
                 try:
                     result = provider.run_review(session, prompt, timeout_seconds=timeout_seconds)
-                except ProviderUnavailable:
+                except ProviderUnavailable as exc:
+                    if exc.read_diff:
+                        self._store.record_provider_run(job.id)
                     raise
                 except Exception:
                     self._store.record_provider_run(job.id)

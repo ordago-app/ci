@@ -486,3 +486,58 @@ def test_a_large_prompt_reaches_codex_on_stdin_not_argv() -> None:
     assert cmd[:3] == ["sh", "-c", f'exec "$@" < {PROMPT_PATH}']
     assert cmd[4:] == ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "-"]
     assert _archived_prompt(container) == prompt
+
+
+@pytest.mark.parametrize(
+    ("output", "spent"),
+    [
+        (
+            json.dumps({"type": "thread.started", "thread_id": "t"})
+            + "\ncodex: You've hit your usage limit. try again at Sep 7th, 2026 3:31 AM.",
+            False,
+        ),
+        (
+            "\n".join(
+                [
+                    _msg("partial thoughts"),
+                    json.dumps({"type": "turn.failed", "error": {"message": _QUOTA}}),
+                ]
+            ),
+            True,
+        ),
+    ],
+)
+def test_an_outage_says_whether_the_model_already_ran(output: str, spent: bool) -> None:
+    with pytest.raises(ProviderUnavailable) as caught:
+        _run(output, exit_code=1)
+
+    assert caught.value.read_diff is spent
+
+
+def test_a_leftover_session_dir_is_cleared_before_root_writes_into_it(tmp_path: Path) -> None:
+    """A crashed review leaves its session dir behind, writable by the container
+    that ran in it. A symlink planted there must not redirect the service's own
+    writes, which run as root, onto a host path."""
+    raw = MagicMock()
+    provider = _session_provider(tmp_path, raw)
+    target = tmp_path / "host-file"
+    target.write_text("untouched")
+    home = _session_dir(tmp_path) / "home"
+    home.mkdir(parents=True)
+    (home / "config.toml").symlink_to(target)
+
+    provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
+
+    assert target.read_text() == "untouched"
+    assert not (home / "config.toml").is_symlink()
+
+
+def test_the_job_dir_goes_with_its_last_session(tmp_path: Path) -> None:
+    raw = MagicMock()
+    provider = _session_provider(tmp_path, raw)
+    session = provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
+
+    provider.cleanup(session)
+
+    assert not _session_dir(tmp_path).parent.exists()
+    assert (tmp_path / "projects" / "homelab" / "review-sessions").exists()

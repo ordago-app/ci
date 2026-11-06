@@ -227,9 +227,11 @@ class ClaudeReviewProvider:
     def _judge(self, output: str, exit_code: int, prompt: str) -> ReviewResult:
         event = _result_event(output)
         if event is None:
-            # Not one result event: the CLI failed before it got going. The raw
-            # text is the only diagnostic there is, so it is classified as such.
-            text, subtype, errored = output, None, True
+            # No result event: the CLI died before it got going, or mid-stream.
+            # Only the non-JSON lines are diagnostics; the JSON ones are the
+            # transcript, the model's prose and the diff it read, and a PR about
+            # rate limits would classify its own crash as an outage.
+            text, subtype, errored = "", None, True
         else:
             text = str(event.get("result") or "")
             subtype = event.get("subtype")
@@ -245,14 +247,19 @@ class ClaudeReviewProvider:
         # every signature in the table, so classifying it would manufacture an
         # outage from an ordinary non-zero exit.
         if errored:
-            detail = _error_detail(event, text)
+            detail = _error_detail(event, text) if event is not None else ""
+            spent = _took_turns(event, output)
             status = event.get("api_error_status") if event is not None else None
             if status in _UNAVAILABLE_STATUSES:
-                raise ProviderUnavailable(self._account, _UNAVAILABLE_STATUSES[status], detail)
+                raise ProviderUnavailable(
+                    self._account, _UNAVAILABLE_STATUSES[status], detail, read_diff=spent
+                )
             probe = "\n".join(x for x in (detail, diagnostic_lines(output, prompt)) if x)
             reason = classify_unavailable(probe)
             if reason is not None:
-                raise ProviderUnavailable(self._account, reason, probe.strip()[-800:])
+                raise ProviderUnavailable(
+                    self._account, reason, probe.strip()[-800:], read_diff=spent
+                )
         if errored or exit_code != 0:
             raise RuntimeError(f"{self._account} review failed: {(text or output).strip()[-1500:]}")
         if not text.strip():
@@ -327,6 +334,14 @@ def _result_event(output: str) -> dict[str, Any] | None:
         if payload.get("type") == "result":
             return payload
     return None
+
+
+def _took_turns(event: dict[str, Any] | None, output: str) -> bool:
+    """Whether the model answered at all before the run failed: then it was paid."""
+    turns = event.get("num_turns") if event is not None else None
+    if isinstance(turns, int) and turns > 0:
+        return True
+    return any(e.get("type") == "assistant" for e in _events_newest_first(output))
 
 
 def _error_detail(event: dict[str, Any] | None, text: str) -> str:

@@ -10,6 +10,7 @@ token in it (codex_auth.py).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import sys
@@ -56,6 +57,25 @@ def render_codex_config(*, model: str) -> str:
     # whatever the ChatGPT subscription currently serves. Pinning an explicit
     # id broke twice when OpenAI rotated the allowlist.
     return f'model = "{model}"\n' if model else ""
+
+
+def _remove_session_dir(path: Path) -> None:
+    """The account's session dir, and the job's once no account is left in it."""
+    shutil.rmtree(path, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        path.parent.rmdir()
+
+
+def _took_turns(output: str) -> bool:
+    """Whether codex produced any item before it failed: then the run was paid."""
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and str(event.get("type", "")).startswith("item."):
+            return True
+    return False
 
 
 class CodexReviewProvider:
@@ -105,6 +125,11 @@ class CodexReviewProvider:
             ) from exc
         name = self._container_name(job)
         session_dir = self._session_dir(job)
+        # Root writes into it below. Whatever an earlier session left there was
+        # writable by its container, so a planted symlink would redirect them.
+        shutil.rmtree(session_dir, ignore_errors=True)
+        if session_dir.exists():
+            raise RuntimeError(f"could not clear the leftover session dir {session_dir}")
         with self._sessions_lock:
             self._sessions[name] = session_dir
         try:
@@ -178,7 +203,9 @@ class CodexReviewProvider:
         if probe and (failure or result.exit_code != 0):
             reason = classify_unavailable(probe)
             if reason is not None:
-                raise ProviderUnavailable(self._account, reason, probe.strip()[-800:])
+                raise ProviderUnavailable(
+                    self._account, reason, probe.strip()[-800:], read_diff=_took_turns(output)
+                )
 
         # `failure` with no recognised signature is still a failed turn — codex
         # said so itself. Whatever trailing agent_message it left is a partial
@@ -219,7 +246,7 @@ class CodexReviewProvider:
 
     def discard(self, job: ReviewJob) -> None:
         remove_container_strict(self._docker, self._container_name(job))
-        shutil.rmtree(self._session_dir(job), ignore_errors=True)
+        _remove_session_dir(self._session_dir(job))
 
     def _session_dir(self, job: ReviewJob) -> Path:
         return self._projects_root / job.project / "review-sessions" / str(job.id) / self._account
@@ -229,7 +256,7 @@ class CodexReviewProvider:
         with self._sessions_lock:
             path = self._sessions.pop(container, None)
         if path is not None:
-            shutil.rmtree(path, ignore_errors=True)
+            _remove_session_dir(path)
 
     def _container_name(self, job: ReviewJob) -> str:
         return container_name(self._instance, self._account, job.id)
