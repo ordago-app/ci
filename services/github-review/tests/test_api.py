@@ -1,12 +1,16 @@
 import asyncio
+import sqlite3
+import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from fastapi.testclient import TestClient
 from src.api import _safe_tick, create_app
 from src.job_store import ReviewJobStore
-from src.worker import ReviewResultSummary, ReviewWorker
+from src.worker import ReviewWorker
+
+from tests.helpers import begin_attempt
 
 
 @pytest.fixture()
@@ -23,7 +27,11 @@ def status_client(store: ReviewJobStore) -> TestClient:
     # A real int, not the MagicMock the attribute would otherwise be: /status passes it
     # into a SQL comparison, and a mock binds as an unsupported type.
     worker.max_attempts = 3
-    return TestClient(create_app(worker))
+    client = TestClient(create_app(worker))
+    # The app closes over this mock, so a test that needs to drive /status has
+    # no other handle on it.
+    client.worker = worker
+    return client
 
 
 def test_safe_tick_swallows_tick_errors() -> None:
@@ -31,26 +39,94 @@ def test_safe_tick_swallows_tick_errors() -> None:
     # permanently and polling silently stops until the container restarts.
     worker = MagicMock()
     worker.tick.side_effect = RuntimeError("boom")
-    asyncio.run(_safe_tick(worker, asyncio.Lock()))
+    asyncio.run(_safe_tick(worker))
     worker.tick.assert_called_once()
 
 
-def test_post_reviews_runs_and_returns_verdict() -> None:
+def test_post_reviews_enqueues_and_returns_at_once(status_client, store) -> None:
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 5, "deadbeef", "base")
+    status_client.worker.request_review.return_value = job
+    status_client.worker.reviewer_bot = "powerreviewer[bot]"
+
+    resp = status_client.post("/reviews", json={"repo": "alvaro/homelab", "pr_number": 5})
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert (body["head_sha"], body["status"], body["done"]) == ("deadbeef", "queued", False)
+    status_client.worker.request_review.assert_called_once_with("alvaro/homelab", 5)
+
+
+def test_post_reviews_404s_for_a_repo_with_no_policy(status_client) -> None:
+    status_client.worker.request_review.side_effect = KeyError("no policy for 'x/y'")
+    resp = status_client.post("/reviews", json={"repo": "x/y", "pr_number": 1})
+    assert resp.status_code == 404
+
+
+def test_get_review_state_reads_the_head_from_the_store(status_client, store) -> None:
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 5, "deadbeef", "base")
+    begin_attempt(store, job.id)
+    store.mark_posted(job.id, verdict="APPROVE", provider="claude-work")
+
+    body = status_client.get("/reviews/alvaro/homelab/5/deadbeef").json()
+
+    assert body["done"] is True
+    assert body["verdict"] == "APPROVE"
+    assert body["provider"] == "claude-work"
+    assert body["budget_exhausted"] is False
+
+
+def test_get_review_state_404s_for_an_unrequested_head(status_client) -> None:
+    assert status_client.get("/reviews/alvaro/homelab/5/nope").status_code == 404
+
+
+def test_a_budget_skip_is_done_and_says_so(status_client, store) -> None:
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 5, "deadbeef", "base")
+    store.mark_skipped(job.id, "max review rounds (5) reached")
+
+    body = status_client.get("/reviews/alvaro/homelab/5/deadbeef").json()
+
+    assert (body["done"], body["budget_exhausted"], body["verdict"]) == (True, True, None)
+
+
+def test_a_head_moved_skip_is_not_a_budget_skip(status_client, store) -> None:
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 5, "deadbeef", "base")
+    store.mark_skipped(job.id, "head moved to cafe")
+
+    body = status_client.get("/reviews/alvaro/homelab/5/deadbeef").json()
+
+    assert (body["done"], body["budget_exhausted"]) == (True, False)
+
+
+def test_a_failure_with_retries_left_is_not_done(status_client, store) -> None:
+    job = store.enqueue("alvaro/homelab", "homelab", "codex", 5, "deadbeef", "base")
+    begin_attempt(store, job.id)
+    store.mark_failed(job.id, "transient")
+    assert status_client.get("/reviews/alvaro/homelab/5/deadbeef").json()["done"] is False
+
+    for _ in range(2):
+        begin_attempt(store, job.id)
+        store.mark_failed(job.id, "boom")
+    assert status_client.get("/reviews/alvaro/homelab/5/deadbeef").json()["done"] is True
+
+
+def test_an_enqueue_wakes_the_poll_loop_instead_of_waiting_out_the_interval(store) -> None:
     worker = MagicMock()
-    worker.run_pr_review.return_value = ReviewResultSummary("deadbeef", "APPROVE", False)
-    worker.reviewer_bot = "powerreviewer[bot]"
-    client = TestClient(create_app(worker))
+    worker.store = store
+    worker.max_attempts = 3
+    worker.reviewer_bot = "bot"
+    worker.request_review.return_value = store.enqueue("o/r", "r", "codex", 1, "a" * 40, "b")
+    with TestClient(create_app(worker, poll_interval=3600)) as client:
+        deadline = time.time() + 5
+        while worker.tick.call_count < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        assert worker.tick.call_count == 1, "the loop ticks once at startup"
 
-    resp = client.post("/reviews", json={"repo": "alvaro/homelab", "pr_number": 5})
+        client.post("/reviews", json={"repo": "o/r", "pr_number": 1})
 
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "head_sha": "deadbeef",
-        "verdict": "APPROVE",
-        "escalated": False,
-        "reviewer": "powerreviewer[bot]",
-    }
-    worker.run_pr_review.assert_called_once_with("alvaro/homelab", 5)
+        deadline = time.time() + 5
+        while worker.tick.call_count < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert worker.tick.call_count == 2, "the enqueue must not wait an hour for the next tick"
 
 
 def test_healthz() -> None:
@@ -64,22 +140,10 @@ def test_app_starts_without_background_poll() -> None:
         assert client.get("/healthz").status_code == 200
 
 
-def test_post_reviews_returns_503_on_worker_error() -> None:
-    worker = MagicMock()
-    worker.run_pr_review.side_effect = RuntimeError("review did not complete: boom")
-    worker.reviewer_bot = "powerreviewer[bot]"
-    client = TestClient(create_app(worker), raise_server_exceptions=False)
-
-    resp = client.post("/reviews", json={"repo": "alvaro/homelab", "pr_number": 5})
-
-    assert resp.status_code == 503
-    assert "review did not complete: boom" in resp.json()["detail"]
-
-
 def test_status_reports_counts_and_active_jobs(status_client, store) -> None:
     store.enqueue("o/r", "r", "codex", 7, "a" * 40, "b" * 40)
     job = store.enqueue("o/r", "r", "codex", 8, "c" * 40, "d" * 40)
-    store.mark_running(job.id)
+    begin_attempt(store, job.id)
 
     body = status_client.get("/status").json()
 
@@ -129,12 +193,12 @@ def test_status_reports_stuck_reviews_separately_from_the_lifetime_total(
     role: it is a lifetime total, so it never falls back to zero once anything has ever
     failed, and a badge that is permanently lit is one nobody reads."""
     retryable = store.enqueue("o/r", "r", "codex", 1, "a" * 40, "b" * 40)
-    store.mark_running(retryable.id)  # attempts -> 1, still under the limit
+    begin_attempt(store, retryable.id)  # attempts -> 1, still under the limit
     store.mark_failed(retryable.id, "transient")
 
     exhausted = store.enqueue("o/r", "r", "codex", 2, "c" * 40, "d" * 40)
     for _ in range(3):
-        store.mark_running(exhausted.id)
+        begin_attempt(store, exhausted.id)
         store.mark_failed(exhausted.id, "boom")
 
     body = status_client.get("/status").json()
@@ -146,3 +210,165 @@ def test_status_reports_stuck_reviews_separately_from_the_lifetime_total(
 def test_status_reports_no_stuck_reviews_on_a_healthy_store(status_client, store) -> None:
     store.enqueue("o/r", "r", "codex", 3, "e" * 40, "f" * 40)
     assert status_client.get("/status").json()["stuck"] == 0
+
+
+def test_status_carries_the_reviewer_quota_rows(status_client) -> None:
+    """The dashboard's Reviewer quota card reads this field and nothing else.
+
+    Asserted at the endpoint, not only on the worker: the worker builds the rows
+    and the dashboard normalizes them, but neither notices if the `/status` line
+    carrying them between the two is dropped. The card would render empty
+    against a service reporting itself perfectly healthy — the quiet failure
+    this whole change exists to end.
+    """
+    rows = [
+        {"provider": "codex", "quota": None, "outage": None, "last_ok": 1788516000.0},
+        {
+            "provider": "claude-work",
+            "quota": {
+                "account": "claude-work",
+                "status": "allowed_warning",
+                "limit_type": "overage",
+                "utilization": 18.67,
+                "resets_at": 1790812800.0,
+                "observed_at": 1788516000.0,
+            },
+            "outage": None,
+            "last_ok": 1788516000.0,
+        },
+    ]
+    status_client.worker.reviewer_quota.return_value = rows
+
+    body = status_client.get("/status").json()
+
+    assert body["reviewer_quota"] == rows
+
+
+def test_status_serves_the_quota_rows_verbatim(status_client) -> None:
+    """No filtering, reshaping or defaulting on the way out. Every nullable
+    field means something specific — a null `quota` is 'this provider has no
+    quota API', a null `utilization` is 'the CLI reported no number' — and an
+    endpoint that helpfully dropped or zero-filled either would hand the card a
+    number nobody measured."""
+    status_client.worker.reviewer_quota.return_value = [
+        {"provider": "codex", "quota": None, "outage": None, "last_ok": None}
+    ]
+
+    row = status_client.get("/status").json()["reviewer_quota"][0]
+
+    assert row == {"provider": "codex", "quota": None, "outage": None, "last_ok": None}
+
+
+def test_status_does_not_report_an_old_failure_as_stuck(status_client, store) -> None:
+    """End-to-end version of the bug the window exists for: a terminal failure from two
+    months ago is history, not a task, and must not keep the badge lit. Shipped without
+    the window, production reported 15 of exactly this shape."""
+    old = store.enqueue("o/r", "r", "codex", 9, "e" * 40, "f" * 40)
+    for _ in range(3):
+        begin_attempt(store, old.id)
+        store.mark_failed(old.id, "boom")
+    with sqlite3.connect(store._path) as conn:
+        stale = time.time() - 50 * 24 * 3600
+        conn.execute(
+            "UPDATE review_jobs SET finished_at = ?, queued_at = ? WHERE id = ?",
+            (stale, stale, old.id),
+        )
+
+    body = status_client.get("/status").json()
+
+    assert body["counts"]["failed"] == 1  # the lifetime total still carries it
+    assert body["stuck"] == 0  # ...and the live signal does not
+
+
+def test_the_stuck_window_is_configurable(store) -> None:
+    """So the threshold is a decision at the edge, not a constant buried in a query."""
+    worker = MagicMock()
+    worker.store = store
+    worker.max_attempts = 3
+    job = store.enqueue("o/r", "r", "codex", 10, "g" * 40, "h" * 40)
+    for _ in range(3):
+        begin_attempt(store, job.id)
+        store.mark_failed(job.id, "boom")
+
+    wide = TestClient(create_app(worker, stuck_window_seconds=3600))
+    narrow = TestClient(create_app(worker, stuck_window_seconds=0))
+
+    assert wide.get("/status").json()["stuck"] == 1
+    assert narrow.get("/status").json()["stuck"] == 0
+
+
+def test_the_poll_loop_starts_the_review_runners_first(store) -> None:
+    worker = MagicMock()
+    worker.store = store
+    with TestClient(create_app(worker, poll_interval=3600)):
+        deadline = time.time() + 5
+        while worker.tick.call_count < 1 and time.time() < deadline:
+            time.sleep(0.01)
+    worker.start.assert_called_once_with()
+    assert worker.method_calls.index(call.start()) < worker.method_calls.index(call.tick())
+
+
+def _heads(client: TestClient, *shas: str, repo: str = "alvaro/homelab") -> dict:
+    return client.get("/heads", params={"repo": repo, "sha": list(shas)}).json()["heads"]
+
+
+def test_heads_maps_every_review_outcome_to_one_state(status_client, store) -> None:
+    def job(pr: int, sha: str) -> int:
+        return store.enqueue("alvaro/homelab", "homelab", "codex", pr, sha, "base").id
+
+    job(1, "queued")
+    begin_attempt(store, job(2, "running"))
+    approved = job(3, "approved")
+    store.mark_posted(approved, verdict="APPROVE")
+    rejected = job(4, "rejected")
+    store.mark_posted(rejected, verdict="REQUEST_CHANGES")
+    legacy = job(5, "legacy")
+    store.mark_posted(legacy)
+    retrying = job(6, "retrying")
+    begin_attempt(store, retrying)
+    store.mark_failed(retrying, "transient")
+    exhausted = job(7, "exhausted")
+    for _ in range(3):
+        begin_attempt(store, exhausted)
+        store.mark_failed(exhausted, "boom")
+    store.mark_skipped(job(8, "skipped"), "head moved to cafe")
+
+    assert _heads(
+        status_client,
+        "queued",
+        "running",
+        "approved",
+        "rejected",
+        "legacy",
+        "retrying",
+        "exhausted",
+        "skipped",
+    ) == {
+        "queued": "pending",
+        "running": "running",
+        "approved": "approved",
+        "rejected": "changes_requested",
+        "legacy": "changes_requested",
+        "retrying": "pending",
+        "exhausted": "failed",
+        "skipped": "skipped",
+    }
+
+
+def test_heads_leaves_out_heads_it_has_never_seen_and_other_repos(status_client, store) -> None:
+    store.enqueue("alvaro/other", "other", "codex", 1, "elsewhere", "base")
+
+    assert _heads(status_client, "elsewhere", "unknown") == {}
+
+
+def test_heads_reads_the_newest_review_of_a_head(status_client, store) -> None:
+    first = store.enqueue("alvaro/homelab", "homelab", "codex", 1, "shared", "base")
+    store.mark_posted(first.id, verdict="REQUEST_CHANGES")
+    second = store.enqueue("alvaro/homelab", "homelab", "codex", 2, "shared", "base")
+    store.mark_posted(second.id, verdict="APPROVE")
+
+    assert _heads(status_client, "shared") == {"shared": "approved"}
+
+
+def test_heads_requires_at_least_one_sha(status_client) -> None:
+    assert status_client.get("/heads", params={"repo": "alvaro/homelab"}).status_code == 422

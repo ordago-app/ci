@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
-
-KNOWN_PROVIDERS = ("codex", "claude")
 
 
 class ConfigError(ValueError):
@@ -20,15 +19,24 @@ class RepoPolicy(BaseModel):
     name: str = Field(default="")
     repo: str = Field(default="")
     project: str = Field(default="")
-    provider: str
-    # Tried in order when `provider` cannot review; see ReviewWorker._review_with_chain.
-    fallback_providers: list[str] = Field(default_factory=list)
+    # Ordered failover chain, not a single choice. The first entry does the
+    # review; a later one is tried only when the one before it could not run at
+    # all (ProviderUnavailable). A one-entry list is a repo that opts out of
+    # failover, which is a config decision rather than a code path.
+    providers: list[str] = Field(min_length=1)
     enabled: bool = True
     review_drafts: bool = False
-    review_bots: bool = False
+    review_dependency_bots: bool = False
     run_ci_first: bool = True
     review_mode: str = "all"
     tool_profile: str
+
+    @field_validator("providers")
+    @classmethod
+    def providers_are_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("providers must not repeat — a chain retries accounts, not itself")
+        return value
 
     @field_validator("review_mode")
     @classmethod
@@ -88,10 +96,19 @@ class ReviewConfig:
     tool_profiles: dict[str, ToolProfile]
 
     @classmethod
-    def load(cls, path: Path, repos_path: Path | None = None) -> ReviewConfig:
+    def load(
+        cls,
+        path: Path,
+        repos_path: Path | None = None,
+        known_providers: Iterable[str] | None = None,
+    ) -> ReviewConfig:
         """`repos_path` defaults to repos.yml beside the review config, which is
         how both the container (`/etc/github-review/`) and the operator checkout
         (`personal/`) lay them out."""
+        # Validated against what main.py actually built, so a typo'd or
+        # unwired provider fails at startup with the name in the message —
+        # rather than at 2am, on the failover nobody has exercised.
+        known = set(known_providers) if known_providers is not None else None
         registry_path = repos_path or path.parent / "repos.yml"
         project_repos = _load_project_repos(registry_path)
         try:
@@ -102,12 +119,13 @@ class ReviewConfig:
 
         repos: dict[str, RepoPolicy] = {}
         for name, repo in raw.repos.items():
-            chain = [repo.provider, *repo.fallback_providers]
-            for provider in chain:
-                if provider not in KNOWN_PROVIDERS:
-                    raise ConfigError(f"unknown provider for {name}: {provider}")
-            if len(set(chain)) != len(chain):
-                raise ConfigError(f"{name} lists a provider twice in its chain: {chain}")
+            if known is not None:
+                unknown = [p for p in repo.providers if p not in known]
+                if unknown:
+                    raise ConfigError(
+                        f"unknown provider(s) for {name}: {', '.join(unknown)} "
+                        f"(configured: {', '.join(sorted(known))})"
+                    )
             if repo.tool_profile not in raw.tool_profiles:
                 raise ConfigError(f"unknown tool_profile for {name}: {repo.tool_profile}")
             profile = raw.tool_profiles[repo.tool_profile]

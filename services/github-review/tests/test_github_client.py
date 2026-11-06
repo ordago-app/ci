@@ -1,4 +1,5 @@
 import httpx
+import pytest
 import respx
 from src.github_client import GitHubClient
 
@@ -161,3 +162,68 @@ def test_post_review_also_retries_once_on_401() -> None:
     )
     _client().post_review("acme/ordago-apps", 1, "ok", "COMMENT", commit_id="deadbeef")
     assert route.call_count == 2
+
+
+@respx.mock
+def test_post_comment_goes_to_the_pr_conversation() -> None:
+    respx.get(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
+    )
+    route = respx.post("https://api.github.com/repos/acme/ordago-apps/issues/7/comments").mock(
+        return_value=httpx.Response(201, json={})
+    )
+    _client().post_comment("acme/ordago-apps", 7, "no review")
+    assert route.call_count == 1
+    assert route.calls.last.request.content == b'{"body":"no review"}'
+
+
+def _check_runs(*runs: tuple[str, str | None]) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "total_count": len(runs),
+            "check_runs": [
+                {"name": f"job{i}", "status": status, "conclusion": conclusion}
+                for i, (status, conclusion) in enumerate(runs)
+            ],
+        },
+    )
+
+
+@respx.mock
+def test_head_ci_green_needs_every_run_finished_and_passing() -> None:
+    respx.get("http://claude-router:8000/internal/github-token").mock(
+        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
+    )
+    url = "https://api.github.com/repos/alvaro/homelab/commits/{}/check-runs"
+    respx.get(url.format("green")).mock(
+        return_value=_check_runs(
+            ("completed", "success"), ("completed", "skipped"), ("completed", "neutral")
+        )
+    )
+    respx.get(url.format("running")).mock(
+        return_value=_check_runs(("completed", "success"), ("in_progress", None))
+    )
+    respx.get(url.format("red")).mock(
+        return_value=_check_runs(("completed", "success"), ("completed", "failure"))
+    )
+    respx.get(url.format("none")).mock(return_value=_check_runs())
+    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+
+    assert client.head_ci_green("alvaro/homelab", "green")
+    assert not client.head_ci_green("alvaro/homelab", "running")
+    assert not client.head_ci_green("alvaro/homelab", "red")
+    assert not client.head_ci_green("alvaro/homelab", "none"), "no CI reported is not green"
+
+
+@respx.mock
+def test_head_ci_green_raises_when_checks_are_not_readable() -> None:
+    respx.get("http://claude-router:8000/internal/github-token").mock(
+        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
+    )
+    respx.get("https://api.github.com/repos/alvaro/homelab/commits/deadbeef/check-runs").mock(
+        return_value=httpx.Response(403, json={"message": "Resource not accessible by integration"})
+    )
+    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+    with pytest.raises(httpx.HTTPStatusError):
+        client.head_ci_green("alvaro/homelab", "deadbeef")

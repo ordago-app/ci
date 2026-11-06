@@ -1,11 +1,9 @@
 import os
-import re
 from pathlib import Path
 
 import yaml
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
-SERVICES_PLAYBOOK = SERVICE_ROOT.parents[1] / "ansible" / "playbooks" / "services.yml"
 
 
 def test_credential_helper_vendored_and_executable() -> None:
@@ -47,50 +45,10 @@ def test_compose_runs_an_init_to_reap_zombies() -> None:
     assert svc.get("init") is True, "compose must set init: true so PID 1 reaps git helper zombies"
 
 
-# `test_project_clone_worktrees_dir_is_owned_by_the_operator` is NOT here, for
-# the same reason: it asserted on `ansible/playbooks/services.yml`, which belongs
-# to whoever deploys this, not to this repo. The other four tests in this file
-# assert on THIS service's own Dockerfile and compose, so they stayed.
-
-
-def test_compose_mounts_the_claude_key_read_only() -> None:
+def test_compose_loads_the_reviewer_env_file() -> None:
     compose = yaml.safe_load((SERVICE_ROOT / "compose.yml").read_text())
-    svc = compose["services"]["github-review"]
-    key_file = next(
-        env.split("=", 1)[1]
-        for env in svc["environment"]
-        if env.startswith("CLAUDE_REVIEW_API_KEY_FILE=")
+    files = compose["services"]["github-review"].get("env_file") or []
+    paths = [f["path"] if isinstance(f, dict) else f for f in files]
+    assert any("github-review.env" in p for p in paths), (
+        "compose must load the env file, or both Claude tokens are absent at runtime"
     )
-    state_dir = str(Path(key_file).parent)
-    assert f"{state_dir}:{state_dir}:ro" in svc["volumes"]
-    assert not any("ANTHROPIC_API_KEY" in env for env in svc["environment"])
-
-
-def test_claude_review_image_is_pinned_and_unprivileged() -> None:
-    dockerfile = (SERVICE_ROOT / "claude-review" / "Dockerfile").read_text()
-    assert re.search(r"@anthropic-ai/claude-code@\d+\.\d+\.\d+", dockerfile)
-    assert re.search(r"^USER node$", dockerfile, re.MULTILINE)
-
-
-def test_role_provisions_what_the_claude_provider_needs() -> None:
-    tasks = yaml.safe_load(
-        (SERVICE_ROOT.parents[1] / "roles/github_review/tasks/main.yml").read_text()
-    )
-    state_dirs = [t for t in tasks if "claude-review-state" in str(t.get("ansible.builtin.file"))]
-    assert len(state_dirs) == 1
-    assert state_dirs[0]["ansible.builtin.file"]["mode"] == "0700"
-    images = [
-        t["community.docker.docker_image"] for t in tasks if "community.docker.docker_image" in t
-    ]
-    assert images[0]["name"] == "homelab/claude-review"
-    assert images[0]["build"]["path"].endswith("github-review/claude-review")
-
-
-def test_the_claude_image_build_is_opt_in() -> None:
-    # An operator not using the claude provider must not need what this build needs.
-    role = SERVICE_ROOT.parents[1] / "roles/github_review"
-    tasks = yaml.safe_load((role / "tasks/main.yml").read_text())
-    build = next(t for t in tasks if "community.docker.docker_image" in t)
-    assert build["when"] == "github_review_build_claude_image | bool"
-    defaults = yaml.safe_load((role / "defaults/main.yml").read_text())
-    assert defaults["github_review_build_claude_image"] is False

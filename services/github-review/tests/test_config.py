@@ -19,7 +19,7 @@ def test_loads_codex_repo_and_profile(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            provider: codex
+            providers: [codex]
             enabled: true
             review_drafts: false
             run_ci_first: true
@@ -41,7 +41,7 @@ def test_loads_codex_repo_and_profile(tmp_path: Path) -> None:
     repo = cfg.enabled_repos()[0]
     assert repo.name == "homelab"
     assert repo.repo == "alvaro-francisco-gil/homelab"
-    assert repo.provider == "codex"
+    assert repo.providers == ["codex"]
     assert cfg.profile_for(repo).github_role == "reviewer"
 
 
@@ -51,7 +51,7 @@ def test_rejects_unknown_provider(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            provider: other
+            providers: [codex, other]
             enabled: true
             review_drafts: false
             run_ci_first: true
@@ -69,7 +69,7 @@ def test_rejects_unknown_provider(tmp_path: Path) -> None:
         """,
     )
     with pytest.raises(ConfigError, match="unknown provider"):
-        ReviewConfig.load(cfg_path)
+        ReviewConfig.load(cfg_path, known_providers={"codex"})
 
 
 def test_rejects_missing_profile(tmp_path: Path) -> None:
@@ -78,7 +78,7 @@ def test_rejects_missing_profile(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            provider: codex
+            providers: [codex]
             enabled: true
             review_drafts: false
             run_ci_first: true
@@ -93,7 +93,7 @@ def test_rejects_missing_profile(tmp_path: Path) -> None:
 REVIEW_MODE_UNSET_YAML = """
     repos:
       homelab:
-        provider: codex
+        providers: [codex]
         enabled: true
         review_drafts: false
         run_ci_first: true
@@ -113,7 +113,7 @@ REVIEW_MODE_UNSET_YAML = """
 REVIEW_MODE_BAD_YAML = """
     repos:
       homelab:
-        provider: codex
+        providers: [codex]
         enabled: true
         review_drafts: false
         run_ci_first: true
@@ -150,7 +150,7 @@ def test_rejects_git_push_for_reviewer(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            provider: codex
+            providers: [codex]
             enabled: true
             review_drafts: false
             run_ci_first: true
@@ -179,7 +179,7 @@ def test_repo_is_resolved_from_the_shared_registry(tmp_path: Path) -> None:
         """
         repos:
           homelab:
-            provider: codex
+            providers: [codex]
             tool_profile: default-reviewer
         tool_profiles:
           default-reviewer:
@@ -201,7 +201,7 @@ def test_a_project_missing_from_the_registry_is_rejected(tmp_path: Path) -> None
         """
         repos:
           homelab:
-            provider: codex
+            providers: [codex]
             tool_profile: default-reviewer
         tool_profiles:
           default-reviewer:
@@ -219,7 +219,7 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path: Path) -> 
         """
         repos:
           homelab:
-            provider: codex
+            providers: [codex]
             tool_profile: default-reviewer
         tool_profiles:
           default-reviewer:
@@ -228,57 +228,3 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path: Path) -> 
     )
     with pytest.raises(ConfigError, match="owner/name"):
         ReviewConfig.load(cfg_path)
-
-
-# `test_the_committed_config_and_registry_agree` is NOT here, deliberately. It
-# asserted that one operator's `personal/agent-review.yml` and
-# `personal/repos.yml` ship consistently. That is a fact about a DEPLOYMENT, not
-# about this platform, and those files live in the consumer's repo. It stays
-# with the consumer; re-adding it here would only ever fail.
-
-
-def _fallback_config(tmp_path: Path, fallbacks: str) -> Path:
-    path = tmp_path / "agent-review.yml"
-    path.write_text(
-        f"""
-        repos:
-          homelab:
-            provider: codex
-            fallback_providers: {fallbacks}
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer: {{}}
-        """
-    )
-    return path
-
-
-def test_fallback_providers_default_to_none(tmp_path: Path) -> None:
-    path = tmp_path / "agent-review.yml"
-    path.write_text(
-        """
-        repos:
-          homelab:
-            provider: codex
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer: {}
-        """
-    )
-    assert ReviewConfig.load(path).repos["homelab"].fallback_providers == []
-
-
-def test_fallback_providers_load(tmp_path: Path) -> None:
-    cfg = ReviewConfig.load(_fallback_config(tmp_path, "[claude]"))
-    assert cfg.repos["homelab"].fallback_providers == ["claude"]
-
-
-def test_rejects_unknown_fallback_provider(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="gemini"):
-        ReviewConfig.load(_fallback_config(tmp_path, "[gemini]"))
-
-
-@pytest.mark.parametrize("fallbacks", ["[codex]", "[claude, claude]"])
-def test_rejects_a_provider_listed_twice_in_a_chain(tmp_path: Path, fallbacks: str) -> None:
-    with pytest.raises(ConfigError, match="twice"):
-        ReviewConfig.load(_fallback_config(tmp_path, fallbacks))

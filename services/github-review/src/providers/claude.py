@@ -1,208 +1,317 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
-import re
-import shlex
+import time
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Literal
 
 from docker import DockerClient
-from docker.errors import ImageNotFound
 
 from ..config import ToolProfile
-from ..git_worktree import GitWorktreeManager
 from ..job_store import ReviewJob
 from ..provider import (
-    ProviderUnavailableError,
-    ReviewLimitExceededError,
+    ProviderUnavailable,
+    QuotaReading,
     ReviewResult,
     SessionRef,
+    classify_unavailable,
+)
+from ._agent_container import (
+    REVIEWER_GH_ROLE,
+    diagnostic_lines,
+    make_agent_writable,
     parse_verdict,
-)
-from .container import (
-    PROMPT_PATH,
-    copy_text_file,
-    exec_with_deadline,
-    remove_existing,
-    remove_quietly,
+    prompt_on_stdin,
+    remove_container,
+    remove_container_strict,
+    repo_git_volume,
+    run_session_container,
 )
 
-CLAUDE_REVIEW_IMAGE = "homelab/claude-review:latest"
-CONTAINER_NAME_PREFIX = "claude-review-"
+GATEWAY_BASE_URL = "http://mcp-gateway:8000"
 
-# The image's `node` user.
-AGENT_UID = 1000
-AGENT_GID = 1000
-
-# Copied into the container, not written into the worktree: the worktree is the code
-# under review, this service runs as root, and a PR can commit any path as a symlink.
-# The container has no git to ask: a worktree's .git points at a clone outside the
-# mount, and Bash is not a tool here.
-DIFF_PATH = "/tmp/pr-review.diff"
-
-MAX_TURNS = 60
-
-# `is_error` is the signal. `subtype` said "success" on every failure observed from
-# claude 2.1, and no exit code or field is documented for "out of credit", so these
-# statuses and messages are matched against what the CLI's errors page lists.
-_UNAVAILABLE_STATUSES = {401, 403, 429}
-_UNAVAILABLE_RE = re.compile(
-    r"usage limit|session limit|spend limit|credit balance|failed to authenticate|invalid api key",
-    re.IGNORECASE,
-)
+# The variable decides who pays: a subscription's limits, or a Console
+# organisation's API credits. A container gets exactly one of them.
+ClaudeCredentialEnv = Literal["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
 
 
-_LIMIT_SUBTYPES = {"error_max_budget_usd", "error_max_turns"}
+def render_mcp_json(*, caller: str, mcps: dict[str, list[str]]) -> str:
+    """Body for the container's `.claude/.mcp.json`.
 
+    Mirrors claude-router's `mcp_renderer.render_mcp_json`; it cannot be
+    imported, because that lives in a different service and image.
 
-def review_prompt(prompt: str) -> str:
-    return (
-        f"The PR's full diff, from its merge base to its head, is at {DIFF_PATH}. Read it "
-        "first. Your tools are Read, Glob and Grep over /workspace: there is no shell, git "
-        "or network tool here.\n\n"
-        f"{prompt}"
-    )
+    The transport field is named `type`, not `transport`. The wrong key yields
+    a syntactically valid config that claude treats as having no servers at
+    all — a reviewer that quietly cannot see GitHub.
+    """
+    servers: dict[str, dict[str, object]] = {}
+    for mcp_name, caps in mcps.items():
+        if not caps:
+            continue
+        single_cap = len(caps) == 1
+        for cap in caps:
+            key = mcp_name if single_cap else f"{mcp_name}-{cap}"
+            servers[key] = {
+                "type": "http",
+                "url": f"{GATEWAY_BASE_URL}/mcp/{mcp_name}/{cap}/mcp",
+                "headers": {"X-MCP-Caller": caller},
+            }
+    return json.dumps({"mcpServers": servers}, indent=2)
 
 
 class ClaudeReviewProvider:
+    """A review on one Claude account: a subscription, or a Console API key.
+
+    One instance per account, not per model: each holds its own quota, and the
+    whole point of the next one is that it is still available when the last is
+    spent. `account` names which one, and it appears in the posted review — a
+    review nobody can attribute is a review nobody can trust.
+    """
+
     def __init__(
         self,
         *,
+        account: str,
+        credential_env: ClaudeCredentialEnv,
+        credential: str,
         docker_client: DockerClient,
-        worktrees: GitWorktreeManager,
         projects_root: Path,
-        api_key_file: Path,
+        router_url: str,
         model: str,
-        max_budget_usd: float,
     ) -> None:
+        self._account = account
+        self._credential_env = credential_env
+        self._credential = credential
         self._docker = docker_client
-        self._worktrees = worktrees
         self._projects_root = projects_root
-        self._api_key_file = api_key_file
+        self._router_url = router_url
         self._model = model
-        self._max_budget_usd = max_budget_usd
+        # Last quota reading seen from this account, or None until it has run
+        # once. In memory to match `_outages` in the worker: it describes now,
+        # and after a restart the number should be re-earned by a real review
+        # rather than replayed from disk at whatever staleness.
+        self._last_quota: QuotaReading | None = None
+
+    @property
+    def account(self) -> str:
+        return self._account
+
+    @property
+    def last_quota(self) -> QuotaReading | None:
+        """The most recent `rate_limit_event` this account reported."""
+        return self._last_quota
 
     def start_review_session(
         self, job: ReviewJob, worktree: Path, profile: ToolProfile
     ) -> SessionRef:
-        api_key = self._read_api_key()
-        try:
-            image = self._docker.images.get(CLAUDE_REVIEW_IMAGE)
-        except ImageNotFound as exc:
-            raise ProviderUnavailableError(f"image {CLAUDE_REVIEW_IMAGE} is not built") from exc
+        if not self._credential:
+            raise ProviderUnavailable(
+                self._account,
+                "auth",
+                f"no credential for {self._credential_env}; "
+                "see secrets/secrets.example.yml and set it in secrets.prod.yml",
+            )
 
-        diff = self._worktrees.pr_diff(
-            repo_dir=self._projects_root / job.project / "repo",
-            base_sha=job.base_sha,
-            head_sha=job.head_sha,
+        image = self._docker.images.get(f"homelab/claude-code-{job.project}:latest")
+
+        # Per-account config dir, never shared. Two accounts under one
+        # CLAUDE_CONFIG_DIR make the CLI reuse the first account's cached
+        # credentials, so the fallback would spend the very window it fled.
+        config_dir = (
+            self._projects_root / job.project / "review-sessions" / str(job.id) / self._account
+        )
+        (config_dir / "projects").mkdir(parents=True, exist_ok=True)
+
+        # Into the config dir, NEVER the worktree. claude does not
+        # auto-discover this path, so run_review passes it explicitly with
+        # --mcp-config — which is exactly what lets it live somewhere safe.
+        #
+        # The worktree is a checkout of the PR head, i.e. ground the branch
+        # under review controls, and this service runs as root OUTSIDE the
+        # review container. A branch that commits `.claude` as a symlink gets
+        # `mkdir(exist_ok=True)` to succeed (is_dir follows it) and this write
+        # to land wherever the link points; committing it as a regular file
+        # raises FileExistsError, which is not ProviderUnavailable and so fails
+        # the job without failing over. Both verified. claude-router writes into
+        # its worktree, but that worktree is the agent's own — not an arbitrary
+        # contributor branch.
+        (config_dir / ".mcp.json").write_text(
+            render_mcp_json(caller=f"claude-code-server-{job.project}", mcps=profile.mcps)
         )
 
-        name = f"{CONTAINER_NAME_PREFIX}{job.id}"
-        remove_existing(self._docker, name)
-        try:
-            container = self._docker.containers.run(
-                image=image.id,
-                name=name,
-                command=["sleep", "infinity"],
-                detach=True,
-                # It only needs Anthropic's API: no MCP gateway, no github token.
-                # The checkout is the code under review, so it stays off the
-                # operator's service network and cannot write to its own mount.
-                network="bridge",
-                user=f"{AGENT_UID}:{AGENT_GID}",
-                working_dir="/workspace",
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges"],
-                environment={"ANTHROPIC_API_KEY": api_key},
-                volumes={str(worktree): {"bind": "/workspace", "mode": "ro"}},
-            )
-            copy_text_file(container, DIFF_PATH, diff)
-        except BaseException:
-            remove_quietly(self._docker, name)
-            raise
+        # github-review runs as root; the agent container runs as uid 1000.
+        make_agent_writable(worktree, config_dir)
+
+        container = run_session_container(
+            self._docker,
+            self._container_name(job),
+            image=image.id,
+            command=["sleep", "infinity"],
+            detach=True,
+            network="homelab",
+            environment={
+                "SESSION_ID": f"review-{job.id}",
+                "ROUTER_INTERNAL_URL": self._router_url,
+                self._credential_env: self._credential,
+                "CLAUDE_CONFIG_DIR": "/home/agent/.claude",
+                # The overlay's gh / git-credential wrappers read CLAUDE_ROLE
+                # (not AGENT_ROLE, which is codex's name for the same thing).
+                "CLAUDE_ROLE": REVIEWER_GH_ROLE,
+                "GITHUB_REPO": job.repo,
+                # The container is already the trust boundary; the extra
+                # bubblewrap Bash sandbox adds overhead, not safety. Same call
+                # the router makes for every agent session.
+                "CLAUDE_CODE_BUBBLEWRAP": "0",
+            },
+            volumes={
+                str(worktree): {"bind": "/workspace", "mode": "rw"},
+                str(config_dir): {"bind": "/home/agent/.claude", "mode": "rw"},
+                **repo_git_volume(self._projects_root, job.project),
+            },
+        )
         return SessionRef(id=str(job.id), container=container.name, worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
         container = self._docker.containers.get(session.container)
-        copy_text_file(container, PROMPT_PATH, review_prompt(prompt))
-        # The checkout is the code under review, and its .claude/settings.json could
-        # point the CLI at another API endpoint and read this key straight off the wire.
-        # --setting-sources "" and --strict-mcp-config ignore everything in it. --bare is
-        # NOT enough: it skips hooks but still applies a project's `env`, and it drops
-        # Glob and Grep. dontAsk denies whatever would otherwise prompt, which is every
-        # read outside the working directory and --add-dir.
-        claude = (
-            "claude -p --output-format json --no-session-persistence "
-            "--tools Read,Glob,Grep --permission-mode dontAsk "
-            "--setting-sources '' --strict-mcp-config "
-            f"--add-dir {shlex.quote(str(Path(DIFF_PATH).parent))} "
-            f"--model {shlex.quote(self._model)} --max-turns {MAX_TURNS} "
-            f"--max-budget-usd {self._max_budget_usd}"
-        )
-        result = exec_with_deadline(
-            container,
-            ["sh", "-c", f"{claude} < {shlex.quote(PROMPT_PATH)}"],
-            timeout_seconds=timeout_seconds,
-            on_timeout=lambda: self.cleanup(session),
-            label="claude",
-            stdout=True,
-            stderr=True,
-            demux=True,
-        )
-        stdout, stderr = result.output
-        return self._parse_output(
-            (stdout or b"").decode("utf-8", errors="replace"),
-            (stderr or b"").decode("utf-8", errors="replace"),
-            result.exit_code,
-        )
+        argv = [
+            "claude",
+            "-p",
+            "--model",
+            self._model,
+            # JSONL rather than one object, for one reason: only the stream
+            # emits `rate_limit_event`, which is how this account's remaining
+            # quota reaches the dashboard. `--output-format json` carries token
+            # counts and cost but no rate-limit field at all (verified against
+            # the CLI, 2026-09-04). Nothing is reassembled to pay for it — the
+            # stream still ends in the same single `result` event this already
+            # read, so `_extract_result` is unchanged.
+            "--output-format",
+            "stream-json",
+            # stream-json refuses to run without it.
+            "--verbose",
+            # Explicit, because claude only auto-discovers ./.mcp.json — and
+            # --strict-mcp-config so ONLY this file is honoured. Without the
+            # second flag the reviewer, running in the PR's own worktree with
+            # --dangerously-skip-permissions, would honour an .mcp.json the
+            # branch under review shipped.
+            "--mcp-config",
+            "/home/agent/.claude/.mcp.json",
+            "--strict-mcp-config",
+            # User settings only: the per-session config dir. The worktree's
+            # `.claude/settings.json` belongs to the branch under review, and
+            # its hooks would run inside a container holding the credential,
+            # and its SessionStart output would ride along on every turn.
+            "--setting-sources",
+            "user",
+            "--dangerously-skip-permissions",
+        ]
+        cmd = prompt_on_stdin(container, prompt, argv)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                container.exec_run, cmd, stdout=True, stderr=True, workdir="/workspace"
+            )
+            try:
+                result = future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError as exc:
+                self.cleanup(session)
+                raise RuntimeError(f"{self._account} review timed out") from exc
+
+        output = result.output.decode("utf-8", errors="replace")
+        # Before any raise: an exhausted account is exactly when its quota is
+        # worth reporting, and every path below this line can throw.
+        self._capture_quota(output)
+        text, errored = self._extract_result(output)
+
+        # Only error text is ever classified. When `errored` is false, `text` is
+        # the review itself — and a review of a PR about rate limiting quotes
+        # every signature in the table, so classifying it would manufacture an
+        # outage from an ordinary non-zero exit.
+        if errored:
+            probe = "\n".join(x for x in (text, diagnostic_lines(output, prompt)) if x)
+            reason = classify_unavailable(probe)
+            if reason is not None:
+                raise ProviderUnavailable(self._account, reason, probe.strip()[-800:])
+        if errored or result.exit_code != 0:
+            raise RuntimeError(f"{self._account} review failed: {(text or output).strip()[-1500:]}")
+
+        if not text.strip():
+            raise RuntimeError(
+                f"{self._account} produced no review body; raw tail: {output.strip()[-1500:]}"
+            )
+        body, event = parse_verdict(text)
+        return ReviewResult(body=body, event=event)
+
+    def _capture_quota(self, output: str) -> None:
+        """Record the last `rate_limit_event` in a stream-json run, if any.
+
+        Best-effort by construction: a run that died before the event, or a CLI
+        that stops emitting it, leaves the previous reading in place and the
+        dashboard renders it with its own age. Losing a quota number must never
+        cost a review, so nothing here raises.
+        """
+        for line in reversed(output.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "rate_limit_event":
+                continue
+            info = payload.get("rate_limit_info")
+            if not isinstance(info, dict):
+                return
+            # `utilization` is absent until a threshold is surpassed. Absent is
+            # "the CLI reported no number", which is NOT zero — coercing it to
+            # 0.0 would render a silent account as a freshly-reset one.
+            raw_utilization = info.get("utilization")
+            self._last_quota = QuotaReading(
+                account=self._account,
+                status=str(info.get("status") or "unknown"),
+                limit_type=str(info.get("rateLimitType") or ""),
+                utilization=(
+                    float(raw_utilization) if isinstance(raw_utilization, int | float) else None
+                ),
+                resets_at=(
+                    float(info["resetsAt"])
+                    if isinstance(info.get("resetsAt"), int | float)
+                    else None
+                ),
+                observed_at=time.time(),
+            )
+            return
 
     def cleanup(self, session: SessionRef) -> None:
-        remove_quietly(self._docker, session.container)
+        remove_container(self._docker, session.container)
 
-    def reap_orphans(self) -> None:
-        """Remove review containers a restart left behind: each one holds the API key
-        in its environment, sleeping forever. Only safe before the first tick."""
-        for container in self._docker.containers.list(
-            all=True, filters={"name": CONTAINER_NAME_PREFIX}
-        ):
-            if container.name.startswith(CONTAINER_NAME_PREFIX):
-                remove_quietly(self._docker, container.name)
+    def discard(self, job: ReviewJob) -> None:
+        remove_container_strict(self._docker, self._container_name(job))
 
-    def _read_api_key(self) -> str:
-        try:
-            api_key = self._api_key_file.read_text().strip()
-        except OSError as exc:
-            raise ProviderUnavailableError(
-                f"no Anthropic API key at {self._api_key_file}: {exc}"
-            ) from exc
-        if not api_key:
-            raise ProviderUnavailableError(
-                f"the Anthropic API key at {self._api_key_file} is empty"
-            )
-        return api_key
+    def _container_name(self, job: ReviewJob) -> str:
+        return f"claude-review-{job.id}-{self._account}"
 
-    def _parse_output(self, stdout: str, stderr: str, exit_code: int) -> ReviewResult:
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"claude review failed with exit {exit_code}: {stderr.strip() or stdout.strip()}"
-            ) from exc
+    def _extract_result(self, output: str) -> tuple[str, bool]:
+        """Return (text, errored) from the run's terminal `result` event.
 
-        text = str(payload.get("result") or "").strip()
-        failed = payload.get("is_error") or exit_code != 0 or payload.get("subtype") != "success"
-        if failed:
-            self._raise_failure(payload, text)
-        if not text:
-            raise RuntimeError(f"claude produced no review body: {stdout.strip()}")
-        return parse_verdict(text)
-
-    def _raise_failure(self, payload: dict[str, Any], text: str) -> NoReturn:
-        detail = text or "; ".join(str(e) for e in payload.get("errors") or []) or str(payload)
-        if payload.get("subtype") in _LIMIT_SUBTYPES:
-            raise ReviewLimitExceededError(detail)
-        if payload.get("api_error_status") in _UNAVAILABLE_STATUSES or _UNAVAILABLE_RE.search(
-            detail
-        ):
-            raise ProviderUnavailableError(detail)
-        raise RuntimeError(f"claude review failed ({payload.get('subtype')}): {detail}")
+        Claude Code ends both `--output-format json` and the stream-json JSONL
+        with the same object, carrying `result` and `is_error`; scanning in
+        reverse for it reads either.
+        A body that is not JSON at all is the CLI failing before it ever got
+        going — hand the raw text back so the caller can classify it, rather
+        than swallowing the only diagnostic there is.
+        """
+        for line in reversed(output.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "result":
+                continue
+            return str(payload.get("result") or ""), bool(payload.get("is_error"))
+        return output, True

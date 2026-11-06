@@ -5,6 +5,14 @@ from typing import Any
 
 import httpx
 
+# A skipped or neutral run does not block a merge; anything else that finished did.
+_PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+
+
+# Authors whose PRs are version bumps: reviewed only where the repo opts in, and
+# then with the dependency task rather than the code review.
+DEPENDENCY_BOTS = frozenset({"dependabot[bot]", "renovate[bot]"})
+
 
 @dataclass(frozen=True)
 class PullRequest:
@@ -61,19 +69,13 @@ class GitHubClient:
         return f"{changed} files changed, {additions} insertions(+), {deletions} deletions(-)"
 
     def ci_summary(self, repo: str, head_sha: str) -> str:
-        # CI status is auxiliary prompt context, not the review itself. The
-        # reviewer App is intentionally minimal (Pull requests / Contents /
-        # Metadata) and lacks Checks: Read, so this endpoint 403s. Surface the
+        # CI status is auxiliary prompt context, not the review itself. Without
+        # Checks: Read on the reviewer App this endpoint 403s: surface the
         # limitation in the prompt rather than aborting the whole review.
         try:
-            body = self._github_get(
-                f"https://api.github.com/repos/{repo}/commits/{head_sha}/check-runs",
-                repo=repo,
-                params={},
-            )
+            runs = self._check_runs(repo, head_sha)
         except httpx.HTTPStatusError as exc:
             return f"CI status unavailable (HTTP {exc.response.status_code})"
-        runs = body.get("check_runs", []) if isinstance(body, dict) else []
         if not runs:
             return "no check runs reported"
         parts = [
@@ -81,12 +83,41 @@ class GitHubClient:
         ]
         return "; ".join(parts)
 
+    def head_ci_green(self, repo: str, head_sha: str) -> bool:
+        """True when the head has check runs and every one finished without failing.
+
+        Raises on any HTTP error (403 without Checks: Read): the caller decides
+        what unreadable CI means."""
+        runs = self._check_runs(repo, head_sha)
+        return bool(runs) and all(
+            run.get("status") == "completed" and run.get("conclusion") in _PASSING_CONCLUSIONS
+            for run in runs
+        )
+
+    def _check_runs(self, repo: str, head_sha: str) -> list[dict[str, Any]]:
+        body = self._github_get(
+            f"https://api.github.com/repos/{repo}/commits/{head_sha}/check-runs",
+            repo=repo,
+            params={"per_page": "100"},
+        )
+        runs = body.get("check_runs", []) if isinstance(body, dict) else []
+        return [run for run in runs if isinstance(run, dict)]
+
     def post_review(self, repo: str, number: int, body: str, event: str, commit_id: str) -> None:
         resp = self._repo_request(
             "POST",
             f"https://api.github.com/repos/{repo}/pulls/{number}/reviews",
             repo=repo,
             json={"body": body, "event": event, "commit_id": commit_id},
+        )
+        resp.raise_for_status()
+
+    def post_comment(self, repo: str, number: int, body: str) -> None:
+        resp = self._repo_request(
+            "POST",
+            f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+            repo=repo,
+            json={"body": body},
         )
         resp.raise_for_status()
 

@@ -11,9 +11,10 @@ from pathlib import Path
 from src.git_worktree import GitWorktreeManager
 from src.github_client import PullRequest
 from src.job_store import JobStatus, ReviewJobStore
-from src.provider import ReviewResult, SessionRef
-from src.worker import CARRIED_REVIEW_MARKER, ReviewWorker
+from src.provider import ProviderUnavailable, ReviewResult, SessionRef
+from src.worker import CARRIED_REVIEW_MARKER, NO_REVIEW_MARKER, ReviewWorker
 
+from tests.helpers import tick_and_drain
 from tests.test_worker_flow import config
 
 REPO = "alvaro-francisco-gil/homelab"
@@ -116,6 +117,7 @@ class PRs:
         self.head = "h1"
         self.base = "b1"
         self.posted: list[tuple[str, str, str]] = []
+        self.comments: list[str] = []
 
     def _pr(self) -> PullRequest:
         return PullRequest(
@@ -149,6 +151,9 @@ class PRs:
     def post_review(self, repo: str, number: int, body: str, event: str, commit_id: str) -> None:
         self.posted.append((body, event, commit_id))
 
+    def post_comment(self, repo: str, number: int, body: str) -> None:
+        self.comments.append(body)
+
 
 class Worktrees:
     """fingerprints keyed by head; the base is irrelevant to the fake."""
@@ -163,13 +168,17 @@ class Worktrees:
     def diff_fingerprint(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
         return self.fingerprints.get(head_sha)
 
-    def prepare(
-        self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str, fetch: bool = True
-    ) -> Path:
+    def pr_diff(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
+        return None
+
+    def diff_since(self, *, repo_dir: Path, previous_head_sha: str, head_sha: str) -> str | None:
+        return None
+
+    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
         self.tmp.mkdir(parents=True, exist_ok=True)
         return self.tmp
 
-    def cleanup(self, worktree: Path) -> None:
+    def cleanup(self, *, repo_dir: Path, worktree: Path) -> None:
         pass
 
 
@@ -209,29 +218,31 @@ def test_an_approval_carries_onto_a_rebased_head_without_a_review_run(tmp_path: 
     gh = PRs()
     provider = CountingProvider("APPROVE")
     w, store = worker(tmp_path, gh, {"h1": "P", "h2": "P"}, provider)
-    w.tick()
+    tick_and_drain(w)
     assert provider.runs == 1
 
     gh.head, gh.base = "h2", "b2"
-    w.tick()
+    tick_and_drain(w)
 
     assert provider.runs == 1, "the rebased head must not buy a second review run"
     body, event, commit = gh.posted[-1]
     assert (event, commit) == ("APPROVE", "h2")
-    assert body.startswith(CARRIED_REVIEW_MARKER), "pr-land keys on this marker"
+    assert body.startswith(CARRIED_REVIEW_MARKER), "marks a carry for the reader"
     assert "h1" in body
-    assert store.rounds_for(REPO, 1) == 1, "a carried approval is not a round"
-    carried = store.get_posted(REPO, 1, "h2")
-    assert carried is not None and carried.carried_from == "h1"
+    assert store.runs_for(REPO, 1) == 1, "a carried approval is not a review run"
+    carried = store.find(REPO, 1, "h2")
+    assert carried is not None and carried.status == JobStatus.POSTED
+    assert carried.carried_from == "h1"
+    assert carried.provider == "codex", "a carried row still answers who reviewed it"
 
 
 def test_a_changed_diff_is_reviewed_again(tmp_path: Path) -> None:
     gh = PRs()
     provider = CountingProvider("APPROVE")
     w, _ = worker(tmp_path, gh, {"h1": "P", "h2": "Q"}, provider)
-    w.tick()
+    tick_and_drain(w)
     gh.head = "h2"
-    w.tick()
+    tick_and_drain(w)
     assert provider.runs == 2
     assert not gh.posted[-1][0].startswith(CARRIED_REVIEW_MARKER)
 
@@ -240,9 +251,9 @@ def test_findings_are_never_carried(tmp_path: Path) -> None:
     gh = PRs()
     provider = CountingProvider("REQUEST_CHANGES")
     w, _ = worker(tmp_path, gh, {"h1": "P", "h2": "P"}, provider)
-    w.tick()
+    tick_and_drain(w)
     gh.head = "h2"
-    w.tick()
+    tick_and_drain(w)
     assert provider.runs == 2, (
         "only an APPROVE carries; findings on an identical diff get a fresh look"
     )
@@ -252,9 +263,9 @@ def test_an_unknown_fingerprint_falls_back_to_a_review(tmp_path: Path) -> None:
     gh = PRs()
     provider = CountingProvider("APPROVE")
     w, _ = worker(tmp_path, gh, {"h1": None, "h2": None}, provider)
-    w.tick()
+    tick_and_drain(w)
     gh.head = "h2"
-    w.tick()
+    tick_and_drain(w)
     assert provider.runs == 2, "no fingerprint is no answer — never read as 'identical'"
 
 
@@ -264,21 +275,108 @@ def test_a_carry_is_allowed_at_the_round_cap(tmp_path: Path) -> None:
     gh = PRs()
     provider = CountingProvider("APPROVE")
     w, store = worker(tmp_path, gh, {"h1": "P", "h2": "P"}, provider, max_rounds=1)
-    assert w.run_pr_review(REPO, 1).verdict == "APPROVE"
+    tick_and_drain(w)
     gh.head = "h2"
-    summary = w.run_pr_review(REPO, 1)
-    assert (summary.verdict, summary.escalated) == ("APPROVE", False)
+    tick_and_drain(w)
+    carried = store.find(REPO, 1, "h2")
+    assert carried is not None and (carried.status, carried.verdict) == (
+        JobStatus.POSTED,
+        "APPROVE",
+    )
     assert provider.runs == 1
-    assert store.get_posted(REPO, 1, "h2") is not None
+    assert gh.comments == []
 
 
-def test_the_cap_still_refuses_a_real_review(tmp_path: Path) -> None:
+def test_the_cap_still_refuses_a_real_review_and_says_so_once(tmp_path: Path) -> None:
+    gh = PRs()
+    provider = CountingProvider("REQUEST_CHANGES")
+    w, store = worker(tmp_path, gh, {"h1": "P", "h2": "Q", "h3": "R"}, provider, max_rounds=1)
+    tick_and_drain(w)
+    gh.head = "h2"
+    tick_and_drain(w)
+    refused = store.find(REPO, 1, "h2")
+    assert refused is not None and refused.status == JobStatus.SKIPPED
+    assert provider.runs == 1
+    assert len(gh.comments) == 1
+    assert gh.comments[0].startswith(NO_REVIEW_MARKER)
+    assert "max review rounds (1) reached" in gh.comments[0]
+
+    gh.head = "h3"
+    tick_and_drain(w)
+    assert len(gh.comments) == 1, "one notice per PR, not one per push"
+
+
+def test_an_approval_does_not_spend_a_round(tmp_path: Path) -> None:
+    # Approve, CI goes red, the author pushes a fix: the fix gets a real review.
+    # Counting the approval as a round is what let a PR the reviewer never
+    # objected to run out of budget.
     gh = PRs()
     provider = CountingProvider("APPROVE")
     w, store = worker(tmp_path, gh, {"h1": "P", "h2": "Q"}, provider, max_rounds=1)
-    w.run_pr_review(REPO, 1)
+    tick_and_drain(w)
     gh.head = "h2"
-    summary = w.run_pr_review(REPO, 1)
-    assert summary.escalated is True
-    assert provider.runs == 1
-    assert store.list_by_status(JobStatus.SKIPPED), "the refused head is recorded, not left queued"
+    tick_and_drain(w)
+    second = store.find(REPO, 1, "h2")
+    assert second is not None and (second.status, second.verdict) == (JobStatus.POSTED, "APPROVE")
+    assert provider.runs == 2
+    assert store.rounds_for(REPO, 1) == 0
+
+
+def test_the_run_cap_bounds_spend_when_every_review_approves(tmp_path: Path) -> None:
+    gh = PRs()
+    provider = CountingProvider("APPROVE")
+    w, store = worker(
+        tmp_path, gh, {"h1": "P", "h2": "Q", "h3": "R"}, provider, max_rounds=5, max_runs=2
+    )
+    for head in ("h1", "h2", "h3"):
+        gh.head = head
+        tick_and_drain(w)
+    assert provider.runs == 2
+    skipped = store.list_by_status(JobStatus.SKIPPED)
+    assert [j.last_error for j in skipped] == ["max review runs (2) reached"]
+
+
+class PostFails(PRs):
+    def post_review(self, repo: str, number: int, body: str, event: str, commit_id: str) -> None:
+        raise RuntimeError("502 from GitHub")
+
+
+def test_a_paid_run_whose_post_fails_still_spends_the_run_cap(tmp_path: Path) -> None:
+    # The provider read the diff and was paid; only the post failed. Counting
+    # postings let every retry of every head run for free against the cap.
+    gh = PostFails()
+    provider = CountingProvider("APPROVE")
+    w, store = worker(tmp_path, gh, {"h1": "P", "h2": "Q"}, provider, max_runs=2, max_attempts=2)
+    for _ in range(2):
+        tick_and_drain(w)
+    assert provider.runs == 2
+    assert store.runs_for(REPO, 1) == 2
+    gh.head = "h2"
+    tick_and_drain(w)
+    assert provider.runs == 2, "the run cap refuses a third paid run"
+
+
+class TimesOut(CountingProvider):
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        self.runs += 1
+        raise RuntimeError("review timed out after 1800s")
+
+
+class Unavailable(CountingProvider):
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        raise ProviderUnavailable("codex", "exhausted", "usage limit")
+
+
+def test_a_run_that_fails_after_reading_the_diff_is_counted(tmp_path: Path) -> None:
+    gh = PRs()
+    w, store = worker(tmp_path, gh, {"h1": "P"}, TimesOut("APPROVE"), max_attempts=3)
+    for _ in range(3):
+        tick_and_drain(w)
+    assert store.runs_for(REPO, 1) == 3
+
+
+def test_a_provider_that_never_ran_is_not_counted(tmp_path: Path) -> None:
+    gh = PRs()
+    w, store = worker(tmp_path, gh, {"h1": "P"}, Unavailable("APPROVE"))
+    tick_and_drain(w)
+    assert store.runs_for(REPO, 1) == 0, "an unavailable provider read nothing and cost nothing"
