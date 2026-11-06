@@ -184,6 +184,7 @@ with another operator, so nothing from the others comes here.
 
 - `../ordago-apps` — the app, and the main consumer of the lanes and the `ai-review` bot.
 - `../business` — the business record: who owns and pays for each account.
+- `../ops` — private: Órdago's instances of the services here (config, encrypted secrets, the pinned SHA). Anything naming a repo, an account or a key goes there, never here.
 - `../ordago-reels` — reels and social posts; Jaime's.
 
 ## Shared agent setup
