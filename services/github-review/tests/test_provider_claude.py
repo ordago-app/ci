@@ -648,3 +648,48 @@ def test_a_large_prompt_reaches_claude_on_stdin_not_argv(tmp_path: Path) -> None
     assert cmd[:5] == ["sh", "-c", f'exec "$@" < {PROMPT_PATH}', "sh", "claude"]
     assert cmd[5] == "-p"
     assert _archived_files(container)[PROMPT_PATH] == review_prompt(prompt)
+
+
+def test_a_stream_cut_short_is_classified_by_its_diagnostics_only(tmp_path: Path) -> None:
+    """With no result event the CLI died mid-stream, and everything it printed
+    before that is the transcript: the model quoting a rate-limiting PR must not
+    turn the crash into an outage that moves the chain onto the spare account."""
+    quota_prose = "You've hit your usage limit. Upgrade to Pro or try again at 1:43 AM."
+    assistant = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": quota_prose}]}}
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        _run(tmp_path, assistant + "\nSegmentation fault\n", exit_code=139)
+
+    assert not isinstance(caught.value, ProviderUnavailable)
+
+
+@pytest.mark.parametrize(
+    ("output", "spent"),
+    [
+        (json.dumps({"type": "result", "is_error": True, "api_error_status": 429}), False),
+        (
+            json.dumps(
+                {"type": "result", "is_error": True, "api_error_status": 429, "num_turns": 4}
+            ),
+            True,
+        ),
+        (
+            json.dumps({"type": "assistant", "message": {"content": []}})
+            + "\nClaude AI usage limit reached. Your limit will reset at 3:31 AM.\n",
+            True,
+        ),
+        ("error: invalid token provided\n", False),
+    ],
+)
+def test_an_outage_says_whether_the_model_already_ran(
+    tmp_path: Path, output: str, spent: bool
+) -> None:
+    """An account that gave out before the first turn cost nothing, so the run
+    cap must not count it, or an outage would use up a PR's runs. One that gave
+    out mid-review was paid for, and the cap must count it."""
+    with pytest.raises(ProviderUnavailable) as caught:
+        _run(tmp_path, output, exit_code=1)
+
+    assert caught.value.read_diff is spent

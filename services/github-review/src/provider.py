@@ -51,10 +51,15 @@ class ProviderUnavailable(RuntimeError):
     each account's chain moves on past it.
     """
 
-    def __init__(self, provider: str, reason: str, detail: str = "") -> None:
+    def __init__(
+        self, provider: str, reason: str, detail: str = "", *, read_diff: bool = False
+    ) -> None:
         self.provider = provider
         self.reason = reason
         self.detail = detail
+        # True when the run got far enough to spend: the model took turns before
+        # the account gave out (a 429 mid-review). The run cap counts it.
+        self.read_diff = read_diff
         super().__init__(f"{provider} unavailable ({reason}): {detail or 'no detail'}")
 
 

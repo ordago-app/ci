@@ -496,3 +496,29 @@ def test_quota_capability_comes_from_the_provider_not_from_having_a_reading() ->
     assert rows["claude-work"]["reports_quota"] is True
     assert rows["claude-work"]["quota"] is None
     assert rows["codex"]["reports_quota"] is False
+
+
+@pytest.mark.parametrize(("read_diff", "counted"), [(False, 0), (True, 1)])
+def test_an_outage_counts_toward_the_run_cap_only_once_the_model_ran(
+    tmp_path: Path, read_diff: bool, counted: int
+) -> None:
+    """Counting every outage would let a down account spend a PR's whole run cap
+    on reviews nobody paid for; counting none would let a quota that runs out
+    mid-review spend on every account in the chain with the cap none the wiser."""
+
+    class GaveOut(ScriptedProvider):
+        def run_review(self, session, prompt, timeout_seconds):
+            self.runs += 1
+            raise ProviderUnavailable(self.name, "exhausted", "429", read_diff=read_diff)
+
+    gh = FakeGitHub()
+    work = ScriptedProvider("claude-work")
+    worker = _worker(
+        tmp_path, {"codex": GaveOut("codex"), "claude-work": work}, "[codex, claude-work]", gh
+    )
+
+    tick_and_drain(worker)
+
+    posted = worker.store.list_by_status(JobStatus.POSTED)[0]
+    assert work.runs == 1
+    assert worker.store.runs_for(posted.repo, posted.pr_number) == counted + 1
