@@ -71,6 +71,7 @@
     owner: "{{ github_review_owner }}"
     group: "{{ github_review_owner }}"
     mode: "0640"
+  register: github_review_config_file
 
 - name: Compose variables for this instance
   ansible.builtin.copy:
@@ -112,6 +113,7 @@
       {% for name, value in github_review_secrets | dictsort %}
       {{ name }}='{{ value }}'
       {% endfor %}
+  register: github_review_env_file
   no_log: true
 
 - name: Credentials named by file are in the secrets dir
@@ -122,6 +124,7 @@
     group: root
     mode: "0600"
   loop: "{{ github_review_secret_files | dict2items }}"
+  register: github_review_secret_file_copies
   no_log: true
 
 - name: Each seeded codex account has a login dir
@@ -169,8 +172,17 @@
     - claude-review
     - codex-review
 
+# Compose recreates the service for a changed image or env file, but not for a
+# changed agent-review.yml: it is a single-file bind mount, and copy replaces the
+# file rather than rewriting it, so the running container keeps reading the old
+# one. A config-only deploy then reported success and changed nothing (ordago,
+# 2026-11-06). Any input the service reads at start forces a recreate.
 - name: github-review stack up
   community.docker.docker_compose_v2:
     project_src: "{{ github_review_root }}/app"
     state: present
     build: always
+    recreate: >-
+      {{ 'always' if (github_review_config_file is changed
+                      or github_review_env_file is changed
+                      or github_review_secret_file_copies is changed) else 'auto' }}
