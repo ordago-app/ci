@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .config import ToolProfile
 from .job_store import ReviewJob
+
+_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\s*$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,20 @@ class ReviewResult:
     event: str = "COMMENT"
 
 
+def parse_verdict(text: str) -> ReviewResult:
+    """Split a model's final message into the review body and its GitHub event.
+
+    REQUEST_CHANGES unless the text ENDS on an explicit APPROVE line, as the
+    prompt asks. A review that forgot its verdict, or was truncated, must never
+    open a merge gate. And the reviewed PR's title, body and diff are all in the
+    prompt, so a verdict line anywhere but the last may be a quotation of what
+    the PR wants its verdict to be."""
+    lines = text.strip().splitlines()
+    verdict = _VERDICT_RE.search(lines[-1]) if lines else None
+    event = "APPROVE" if verdict and verdict.group(1) == "APPROVE" else "REQUEST_CHANGES"
+    return ReviewResult(body=_VERDICT_RE.sub("", text).strip(), event=event)
+
+
 class ProviderUnavailable(RuntimeError):
     """The provider never read the diff — it could not run at all.
 
@@ -32,8 +47,8 @@ class ProviderUnavailable(RuntimeError):
     Raising it is a claim that retrying the same provider is pointless right
     now: an exhausted subscription, a CLI that can no longer parse its own
     models API, missing auth. Every one of those has cost a red `request-review`
-    check that read as a code failure — see
-    docs/plans/ongoing/reviewer-failover-and-alerting.md.
+    check that read as a code failure, which is why
+    each account's chain moves on past it.
     """
 
     def __init__(self, provider: str, reason: str, detail: str = "") -> None:
@@ -43,9 +58,22 @@ class ProviderUnavailable(RuntimeError):
         super().__init__(f"{provider} unavailable ({reason}): {detail or 'no detail'}")
 
 
+class ReviewLimitExceeded(RuntimeError):
+    """The review ran into its own spending or turn cap.
+
+    Neither a retry nor the next account would end differently: each would
+    spend as much again and stop in the same place. So the head is given up on,
+    not failed over or retried."""
+
+    def __init__(self, provider: str, detail: str) -> None:
+        self.provider = provider
+        self.detail = detail
+        super().__init__(f"{provider} stopped at its review cap: {detail}")
+
+
 class ReviewProvider(Protocol):
     def start_review_session(
-        self, job: ReviewJob, worktree: Path, profile: ToolProfile
+        self, job: ReviewJob, worktree: Path, timeout_seconds: int
     ) -> SessionRef: ...
     def run_review(
         self, session: SessionRef, prompt: str, timeout_seconds: int
@@ -117,7 +145,8 @@ _UNAVAILABLE_SIGNATURES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "auth",
         re.compile(
-            r"not onboarded|authentication_error|invalid api key|invalid.{0,12}token|"
+            r"not onboarded|authentication_error|failed to authenticate|invalid api key|"
+            r"invalid.{0,12}token|"
             r"unauthorized|please run [`\"']?/?login",
             re.I,
         ),

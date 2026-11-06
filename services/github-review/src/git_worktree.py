@@ -10,6 +10,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .github_app import TokenSource
+
+# On every git command the service runs. A PR can commit a symlink to any path —
+# `/proc/self/environ` of whatever reads it, a key file on the host — and a
+# review container reading the worktree would follow it. Checked out as plain
+# files holding the link target, a symlink still reads as what it is in the
+# review, and points nowhere.
+_HARDENING = ("-c", "core.symlinks=false")
+
 
 class GitWorktreeError(RuntimeError):
     pass
@@ -22,8 +31,13 @@ class GitWorktreeManager:
         projects_root: Path,
         run_as_uid: int | None = None,
         run_as_gid: int | None = None,
+        tokens: TokenSource | None = None,
+        remote_url: str = "https://github.com/{repo}.git",
     ) -> None:
         self._projects_root = projects_root
+        # Credentials for fetching from GitHub. None in tests, whose clones are local.
+        self._tokens = tokens
+        self._remote_url = remote_url
         # When set (in production the container runs as root), git subprocesses
         # drop to this uid/gid so objects written into the shared clone are
         # owned by the operator (uid 1000), not root. Root-owned objects would
@@ -46,19 +60,42 @@ class GitWorktreeManager:
         with lock:
             yield
 
-    def fetch(self, repo_dir: Path) -> None:
+    def fetch(self, repo_dir: Path, repo: str) -> None:
         with self._repo_lock(repo_dir):
-            self._fetch(repo_dir)
+            self._fetch(repo_dir, repo)
 
-    def _fetch(self, repo_dir: Path) -> None:
-        self._run(self._git(repo_dir, "fetch", "--all", "--prune"))
+    def _fetch(self, repo_dir: Path, repo: str) -> None:
+        """Fetch `repo` into its clone, cloning it first if this instance has none.
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+        The service owns its clones: an instance on a fresh host starts with an
+        empty data directory, and nobody else is there to clone for it. No
+        checkout: reviews read worktrees, never the clone's own tree."""
+        if not (repo_dir / ".git").exists():
+            repo_dir.parent.mkdir(parents=True, exist_ok=True)
+            self._chown_to_operator(repo_dir.parent)
+            self._run(
+                [
+                    "git",
+                    *_HARDENING,
+                    "clone",
+                    "--no-checkout",
+                    self._remote_url.format(repo=repo),
+                    str(repo_dir),
+                ],
+                repo=repo,
+            )
+        self._run(self._git(repo_dir, "fetch", "--all", "--prune"), repo=repo)
+
+    def prepare(
+        self, *, repo_dir: Path, repo: str, project: str, pr_number: int, head_sha: str
+    ) -> Path:
         with self._repo_lock(repo_dir):
-            return self._prepare(repo_dir, project, pr_number, head_sha)
+            return self._prepare(repo_dir, repo, project, pr_number, head_sha)
 
-    def _prepare(self, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
-        self._fetch(repo_dir)
+    def _prepare(
+        self, repo_dir: Path, repo: str, project: str, pr_number: int, head_sha: str
+    ) -> Path:
+        self._fetch(repo_dir, repo)
         present = subprocess.run(
             self._git(repo_dir, "cat-file", "-e", f"{head_sha}^{{commit}}"),
             **self._subprocess_kwargs(),
@@ -150,22 +187,38 @@ class GitWorktreeManager:
         # The container runs git as root over a clone owned by the operator
         # (uid 1000). Without this, git aborts with "detected dubious
         # ownership". Scope the exemption to the repo we operate on.
-        return ["git", "-c", f"safe.directory={repo_dir}", "-C", str(repo_dir), *args]
+        return [
+            "git",
+            *_HARDENING,
+            "-c",
+            f"safe.directory={repo_dir}",
+            "-C",
+            str(repo_dir),
+            *args,
+        ]
 
     def cleanup(self, *, repo_dir: Path, worktree: Path) -> None:
         with self._repo_lock(repo_dir):
             if worktree.exists():
                 shutil.rmtree(worktree)
 
-    def _subprocess_kwargs(self) -> dict[str, Any]:
+    def _subprocess_kwargs(self, repo: str | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"capture_output": True, "text": True, "check": False}
+        env: dict[str, str] = {}
         if self._run_as_uid is not None:
             kwargs["user"] = self._run_as_uid
             if self._run_as_gid is not None:
                 kwargs["group"] = self._run_as_gid
             # git as a non-root uid needs a readable/writable HOME; system git
             # config (the credential helper) still applies, so auth is intact.
-            kwargs["env"] = {**os.environ, "HOME": "/tmp"}
+            env["HOME"] = "/tmp"
+        if repo is not None and self._tokens is not None:
+            # Read by bin/git-credential-helper, which answers only for this
+            # repo: a token in a child's environment never reaches argv or disk.
+            env["GIT_REVIEW_REPO"] = repo
+            env["GIT_REVIEW_TOKEN"] = self._tokens.token(repo)
+        if env:
+            kwargs["env"] = {**os.environ, **env}
         return kwargs
 
     def _chown_to_operator(self, path: Path) -> None:
@@ -174,8 +227,8 @@ class GitWorktreeManager:
                 path, self._run_as_uid, self._run_as_gid if self._run_as_gid is not None else -1
             )
 
-    def _run(self, cmd: list[str]) -> None:
-        result = subprocess.run(cmd, **self._subprocess_kwargs())
+    def _run(self, cmd: list[str], repo: str | None = None) -> None:
+        result = subprocess.run(cmd, **self._subprocess_kwargs(repo))
         if result.returncode != 0:
             raise GitWorktreeError(
                 f"command failed: {' '.join(cmd)} stderr={result.stderr.strip()!r}"

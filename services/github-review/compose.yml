@@ -1,8 +1,15 @@
+# One reviewer instance. Everything that differs between instances and hosts
+# comes from the `.env` beside this file, which roles/github_review renders; a
+# variable left unset stops `docker compose` with its name rather than starting
+# a reviewer pointed at somebody else's paths. Two instances on one host are
+# two directories, two `.env` files and two compose projects.
+name: github-review-${GITHUB_REVIEW_INSTANCE:?}
+
 services:
   github-review:
-    image: homelab/github-review:latest
+    image: ordago-ci/github-review:${GITHUB_REVIEW_INSTANCE:?}
     build: .
-    container_name: github-review
+    container_name: github-review-${GITHUB_REVIEW_INSTANCE:?}
     restart: unless-stopped
     # Run tini as PID 1 so exited children are reaped. The worker shells out to
     # git, whose transient helper processes get reparented to PID 1; without an
@@ -11,51 +18,37 @@ services:
     environment:
       - AGENT_REVIEW_CONFIG=/etc/github-review/agent-review.yml
       - STATE_DIR=/var/lib/github-review
-      - PROJECTS_ROOT=/opt/personal/projects
-      - ROUTER_INTERNAL_URL=http://claude-router:8000
-      - AGENT_ROLE=reviewer
-      - CODEX_STATE_ROOT=/opt/personal/codex-code-state
-      - REVIEWER_BOT_LOGIN=homelab-claude-reviewer[bot]
-      - POLL_INTERVAL_SECONDS=60
-      - MAX_REVIEW_ATTEMPTS=3
-      # A failed review waits this long before its next attempt, independent of
-      # the 60 s poll, so an outage does not spend every attempt in minutes.
-      - RETRY_BACKOFF_SECONDS=900
-      # A review interrupted by a restart gets its attempt back this many times;
-      # after that the interruption counts, so a review that crashes or hangs
-      # the service cannot retry forever.
-      - MAX_RESTART_REFUNDS=2
-      # A job `running` this long with no runner thread holding it is treated as
-      # interrupted. Must exceed max_runtime_minutes x the longest provider chain
-      # (30 min x 4 today); the service refuses to start otherwise.
-      - STUCK_RUNNING_SECONDS=10800
-      - MAX_REVIEW_ROUNDS=5
-      - MAX_REVIEW_RUNS=10
-      # Reviews in flight at once, on any provider account, oldest PR first.
-      # Each is its own agent container (~600 MB); one PR runs one at a time.
-      - REVIEW_CONCURRENCY=3
-    # The Claude credentials (two OAuth tokens, one API key) + the review model. Kept
-    # in a secrets file rather than inline here, the way claude-router's is:
-    # this compose file is world-readable on the host.
+      # The same path inside as on the host: review containers are started on
+      # the host's Docker daemon, which resolves their mounts by HOST path, and
+      # a worktree's .git names its clone by the path it was created at.
+      - PROJECTS_ROOT=${GITHUB_REVIEW_PROJECTS_DIR:?}
+      - WORKTREE_RUN_AS_UID=${GITHUB_REVIEW_RUN_AS_UID:?}
+      - WORKTREE_RUN_AS_GID=${GITHUB_REVIEW_RUN_AS_GID:?}
+      - CLAUDE_REVIEW_IMAGE=ordago-ci/claude-review:${GITHUB_REVIEW_INSTANCE:?}
+      - CODEX_REVIEW_IMAGE=ordago-ci/codex-review:${GITHUB_REVIEW_INSTANCE:?}
+    # The credentials the config names by `env:`. A file, not inline here: this
+    # compose file is world-readable on the host, the secrets file is 0600.
     env_file:
-      - path: /opt/personal/secrets/github-review.env
-        required: false
+      - path: secrets.env
+        required: true
     volumes:
+      # Starts each review's sandbox container. This is why a target must be a
+      # Docker host, not a serverless runtime.
       - /var/run/docker.sock:/var/run/docker.sock:rw
-      - /opt/personal/projects:/opt/personal/projects:rw
-      # rw so github-review can refresh the Codex login. Its review sessions
-      # never can: each gets a read-only copy without the refresh token.
-      - /opt/personal/codex-code-state:/opt/personal/codex-code-state:rw
-      - /opt/personal/state/github-review:/var/lib/github-review:rw
-      - /opt/personal/agent-review.yml:/etc/github-review/agent-review.yml:ro
-      # Resolved from beside agent-review.yml; see ReviewConfig.load.
-      - /opt/personal/repos.yml:/etc/github-review/repos.yml:ro
+      - ${GITHUB_REVIEW_PROJECTS_DIR:?}:${GITHUB_REVIEW_PROJECTS_DIR:?}:rw
+      # jobs.db, and each codex account's login, which the service refreshes.
+      - ${GITHUB_REVIEW_STATE_DIR:?}:/var/lib/github-review:rw
+      # Credentials the config names by `file:`.
+      - ${GITHUB_REVIEW_SECRETS_DIR:?}:/run/secrets/github-review:ro
+      - ./agent-review.yml:/etc/github-review/agent-review.yml:ro
     expose:
       - "8000"
     networks:
-      - homelab
+      - reviewer
 
 networks:
-  homelab:
+  # Where whatever reads /status and /heads (a dashboard, ci-controller) reaches
+  # this service. Review containers are never on it: they get the default bridge.
+  reviewer:
     external: true
-    name: homelab
+    name: ${GITHUB_REVIEW_NETWORK:?}

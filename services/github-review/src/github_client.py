@@ -5,6 +5,8 @@ from typing import Any
 
 import httpx
 
+from .github_app import TokenSource
+
 # A skipped or neutral run does not block a merge; anything else that finished did.
 _PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 
@@ -30,15 +32,8 @@ class PullRequest:
 
 
 class GitHubClient:
-    def __init__(
-        self,
-        *,
-        router_url: str,
-        github_role: str,
-        http: httpx.Client | None = None,
-    ) -> None:
-        self._router_url = router_url.rstrip("/")
-        self._github_role = github_role
+    def __init__(self, *, tokens: TokenSource, http: httpx.Client | None = None) -> None:
+        self._tokens = tokens
         self._http = http or httpx.Client(timeout=20)
 
     def list_open_prs(self, repo: str) -> list[PullRequest]:
@@ -144,13 +139,12 @@ class GitHubClient:
     def _repo_request(self, method: str, url: str, *, repo: str, **kwargs: Any) -> httpx.Response:
         """A repo API call under that repo's installation token, retried once on 401.
 
-        The router caches an installation token for its full hour, so it cannot
-        notice on its own that the installation behind one has died. Moving a
-        repo between accounts requires uninstalling and reinstalling the App,
-        which revokes the live token — and the only signal is the 401 that lands
-        here. So ask the router to drop what it cached for this repo and retry,
-        once. A persistently bad credential is not something to loop on: the
-        second rejection is surfaced."""
+        A token is cached for most of its hour, so the cache cannot notice on its
+        own that the installation behind it has died. Moving a repo between
+        accounts requires uninstalling and reinstalling the App, which revokes the
+        live token — and the only signal is the 401 that lands here. So mint
+        afresh for this repo and retry, once. A persistently bad credential is
+        not something to loop on: the second rejection is surfaced."""
         resp = self._http.request(method, url, headers=self._headers(repo), **kwargs)
         if resp.status_code == 401:
             resp = self._http.request(
@@ -160,18 +154,7 @@ class GitHubClient:
 
     def _headers(self, repo: str, *, refresh: bool = False) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self._token(repo, refresh=refresh)}",
+            "Authorization": f"Bearer {self._tokens.token(repo, refresh=refresh)}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-
-    def _token(self, repo: str, *, refresh: bool = False) -> str:
-        """`repo` is required by the router, which needs it to pick the App
-        installation: the reviewer App has a different installation id under
-        every account that owns a reviewed repo."""
-        params: dict[str, str] = {"role": self._github_role, "repo": repo}
-        if refresh:
-            params["refresh"] = "true"
-        resp = self._http.get(f"{self._router_url}/internal/github-token", params=params)
-        resp.raise_for_status()
-        return str(resp.json()["token"])

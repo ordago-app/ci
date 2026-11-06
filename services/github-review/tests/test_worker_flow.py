@@ -8,7 +8,7 @@ from src.job_store import JobStatus, ReviewJobStore
 from src.provider import ReviewResult, SessionRef
 from src.worker import NO_REVIEW_MARKER, ReviewWorker
 
-from tests.helpers import begin_attempt, tick_and_drain
+from tests.helpers import begin_attempt, tick_and_drain, write_config
 
 
 class FakeGitHub:
@@ -64,7 +64,9 @@ class FakeWorktrees:
     def diff_since(self, *, repo_dir: Path, previous_head_sha: str, head_sha: str) -> str | None:
         return f"+pushed {previous_head_sha}..{head_sha}\n"
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+    def prepare(
+        self, *, repo_dir: Path, repo: str, project: str, pr_number: int, head_sha: str
+    ) -> Path:
         self.path.mkdir(parents=True, exist_ok=True)
         return self.path
 
@@ -73,7 +75,7 @@ class FakeWorktrees:
 
 
 class FakeProvider:
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -85,29 +87,7 @@ class FakeProvider:
 
 
 def config(tmp_path: Path) -> ReviewConfig:
-    path = tmp_path / "agent-review.yml"
-    path.write_text(
-        """
-        repos:
-          homelab:
-            providers: [codex]
-            enabled: true
-            review_drafts: false
-            run_ci_first: true
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer:
-            github_role: reviewer
-            mcps: {}
-            allow_shell: true
-            allow_network: true
-            allow_repo_write: true
-            allow_git_push: false
-            allow_docker: false
-            max_runtime_minutes: 30
-        """
-    )
-    return ReviewConfig.load(path)
+    return write_config(tmp_path)
 
 
 def test_worker_polls_runs_review_and_marks_posted(tmp_path: Path) -> None:
@@ -132,7 +112,7 @@ class FlakyProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -172,7 +152,7 @@ def test_worker_retries_failed_job_on_next_tick(tmp_path: Path) -> None:
 
 
 class FailingProvider:
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -273,7 +253,7 @@ def test_a_review_out_of_attempts_says_so_on_the_pr(tmp_path: Path) -> None:
 
 
 class ApprovingProvider:
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -347,7 +327,7 @@ def test_request_review_rejects_a_repo_with_no_policy(tmp_path: Path) -> None:
 class BombProvider:
     """Raises unconditionally — proves the provider was never invoked."""
 
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         raise AssertionError("provider must not be called")
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:

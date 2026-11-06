@@ -162,7 +162,7 @@ class Worktrees:
         self.tmp = tmp
         self.fingerprints = fingerprints
 
-    def fetch(self, repo_dir: Path) -> None:
+    def fetch(self, repo_dir: Path, repo: str) -> None:
         pass
 
     def diff_fingerprint(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
@@ -174,7 +174,9 @@ class Worktrees:
     def diff_since(self, *, repo_dir: Path, previous_head_sha: str, head_sha: str) -> str | None:
         return None
 
-    def prepare(self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str) -> Path:
+    def prepare(
+        self, *, repo_dir: Path, repo: str, project: str, pr_number: int, head_sha: str
+    ) -> Path:
         self.tmp.mkdir(parents=True, exist_ok=True)
         return self.tmp
 
@@ -187,7 +189,7 @@ class CountingProvider:
         self.event = event
         self.runs = 0
 
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:

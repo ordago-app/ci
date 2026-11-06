@@ -1,0 +1,9 @@
+# The build context is the deployed app dir, which also holds this instance's
+# config and secrets. None of it belongs in an image layer or the build cache.
+.env
+secrets.env
+agent-review.yml
+tests
+.venv
+claude-review
+codex-review

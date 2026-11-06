@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 from src.git_worktree import GitWorktreeError, GitWorktreeManager
 
+REPO = "owner/name"
+
 
 def sha(repo: Path, ref: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), "rev-parse", ref], text=True).strip()
@@ -13,7 +15,9 @@ def sha(repo: Path, ref: str) -> str:
 def test_creates_review_worktree_at_expected_sha(tmp_path: Path, repo_dir: Path) -> None:
     head = sha(repo_dir, "feature")
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
-    worktree = manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=5, head_sha=head)
+    worktree = manager.prepare(
+        repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=5, head_sha=head
+    )
     assert (worktree / "README.md").read_text() == "head\n"
     assert sha(worktree, "HEAD") == head
 
@@ -21,7 +25,9 @@ def test_creates_review_worktree_at_expected_sha(tmp_path: Path, repo_dir: Path)
 def test_rejects_sha_mismatch(tmp_path: Path, repo_dir: Path) -> None:
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
     with pytest.raises(GitWorktreeError, match="not present"):
-        manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=5, head_sha="0" * 40)
+        manager.prepare(
+            repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=5, head_sha="0" * 40
+        )
 
 
 def test_prepare_recovers_from_stale_registered_worktree(tmp_path: Path, repo_dir: Path) -> None:
@@ -31,10 +37,14 @@ def test_prepare_recovers_from_stale_registered_worktree(tmp_path: Path, repo_di
     # must be self-healing across runs.
     head = sha(repo_dir, "feature")
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
-    first = manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=5, head_sha=head)
+    first = manager.prepare(
+        repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=5, head_sha=head
+    )
     # Simulate cleanup(): directory gone, git registration left behind.
     shutil.rmtree(first)
-    second = manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=5, head_sha=head)
+    second = manager.prepare(
+        repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=5, head_sha=head
+    )
     assert (second / "README.md").read_text() == "head\n"
     assert sha(second, "HEAD") == head
 
@@ -78,7 +88,7 @@ def test_git_commands_carry_safe_directory_guard(
 
     monkeypatch.setattr(subprocess, "run", recording_run)
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
-    manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=5, head_sha=head)
+    manager.prepare(repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=5, head_sha=head)
 
     git_calls = [cmd for cmd in calls if cmd and cmd[0] == "git"]
     assert git_calls, "expected git to be invoked"
@@ -102,14 +112,14 @@ def test_concurrent_prepares_on_one_repo_never_overlap_git_writes(
     guard = threading.Lock()
     real_run = manager._run
 
-    def tracked_run(cmd: list[str]) -> None:
+    def tracked_run(cmd: list[str], repo: str | None = None) -> None:
         nonlocal in_flight, overlaps
         with guard:
             in_flight += 1
             overlaps += in_flight > 1
         time.sleep(0.01)
         try:
-            real_run(cmd)
+            real_run(cmd, repo)
         finally:
             with guard:
                 in_flight -= 1
@@ -119,9 +129,11 @@ def test_concurrent_prepares_on_one_repo_never_overlap_git_writes(
 
     def prepare(pr: int) -> None:
         worktrees.append(
-            manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=pr, head_sha=head)
+            manager.prepare(
+                repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=pr, head_sha=head
+            )
         )
-        manager.fetch(repo_dir)
+        manager.fetch(repo_dir, REPO)
 
     threads = [threading.Thread(target=prepare, args=(pr,)) for pr in range(6)]
     for t in threads:
@@ -139,7 +151,9 @@ def test_cleanup_waits_for_other_git_work_on_the_same_clone(tmp_path: Path, repo
 
     head = sha(repo_dir, "feature")
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
-    worktree = manager.prepare(repo_dir=repo_dir, project="homelab", pr_number=1, head_sha=head)
+    worktree = manager.prepare(
+        repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=1, head_sha=head
+    )
     done = threading.Event()
     with manager._repo_lock(repo_dir):
         threading.Thread(
@@ -203,7 +217,86 @@ def test_a_worktree_answers_git_through_the_clone_it_names(repo_dir: Path, tmp_p
     be the clone's own, or git in the container says "not a git repository"."""
     manager = GitWorktreeManager(projects_root=tmp_path / "projects")
     worktree = manager.prepare(
-        repo_dir=repo_dir, project="homelab", pr_number=5, head_sha=sha(repo_dir, "feature")
+        repo_dir=repo_dir,
+        repo=REPO,
+        project="homelab",
+        pr_number=5,
+        head_sha=sha(repo_dir, "feature"),
     )
     gitdir = Path((worktree / ".git").read_text().removeprefix("gitdir: ").strip())
     assert gitdir.parent.parent == repo_dir / ".git"
+
+
+def test_a_committed_symlink_is_checked_out_as_a_plain_file(tmp_path: Path, repo_dir: Path) -> None:
+    """A PR can commit `leak -> /proc/self/environ`. Followed inside a review
+    container, Read would hand the model the process's own environment, the
+    credential with it. Checked out as a plain file, it only names its target."""
+    (repo_dir / "leak").symlink_to("/proc/self/environ")
+    subprocess.run(["git", "-C", str(repo_dir), "add", "leak"], check=True)
+    subprocess.run(["git", "-C", str(repo_dir), "commit", "-qm", "leak"], check=True)
+    manager = GitWorktreeManager(projects_root=tmp_path / "projects")
+
+    worktree = manager.prepare(
+        repo_dir=repo_dir, repo=REPO, project="homelab", pr_number=5, head_sha=sha(repo_dir, "HEAD")
+    )
+
+    assert not (worktree / "leak").is_symlink()
+    assert (worktree / "leak").read_text() == "/proc/self/environ"
+
+
+def test_an_instance_clones_a_repo_it_has_never_seen(tmp_path: Path, repo_dir: Path) -> None:
+    """A fresh host has an empty data directory and nobody to clone for it."""
+    manager = GitWorktreeManager(
+        projects_root=tmp_path / "projects", remote_url=f"{repo_dir.parent}/{{repo}}"
+    )
+    clone = tmp_path / "projects" / "homelab" / "repo"
+
+    worktree = manager.prepare(
+        repo_dir=clone,
+        repo=repo_dir.name,
+        project="homelab",
+        pr_number=5,
+        head_sha=sha(repo_dir, "feature"),
+    )
+
+    assert (clone / ".git").is_dir()
+    assert (worktree / "README.md").read_text() == "head\n"
+
+
+class _Tokens:
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def token(self, repo: str, *, refresh: bool = False) -> str:
+        self.asked.append(repo)
+        return f"tok-{repo}"
+
+
+def test_git_gets_the_token_for_the_repo_it_fetches_in_its_environment(tmp_path: Path) -> None:
+    tokens = _Tokens()
+    mgr = GitWorktreeManager(projects_root=tmp_path, tokens=tokens)
+
+    env = mgr._subprocess_kwargs("o/r")["env"]
+
+    assert (env["GIT_REVIEW_REPO"], env["GIT_REVIEW_TOKEN"]) == ("o/r", "tok-o/r")
+    assert "GIT_REVIEW_TOKEN" not in mgr._subprocess_kwargs().get("env", {})
+
+
+def _helper(stdin: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    helper = Path(__file__).resolve().parents[1] / "bin" / "git-credential-helper"
+    return subprocess.run(
+        [str(helper), "get"], input=stdin, env=env, capture_output=True, text=True, check=False
+    )
+
+
+def test_the_credential_helper_answers_only_for_its_own_repo() -> None:
+    env = {"PATH": "/usr/bin:/bin", "GIT_REVIEW_REPO": "o/r", "GIT_REVIEW_TOKEN": "tok"}
+
+    mine = _helper("protocol=https\nhost=github.com\npath=o/r.git\n\n", env)
+    other = _helper("protocol=https\nhost=github.com\npath=o/other.git\n\n", env)
+    elsewhere = _helper("protocol=https\nhost=evil.example\npath=o/r.git\n\n", env)
+    no_path = _helper("protocol=https\nhost=github.com\n\n", env)
+
+    assert mine.stdout == "username=x-access-token\npassword=tok\n"
+    assert other.stdout == elsewhere.stdout == ""
+    assert no_path.returncode == 78

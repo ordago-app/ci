@@ -1,47 +1,71 @@
 """Shared mechanics for the container-per-review providers.
 
-Codex and Claude are launched the same way — a project-scoped agent image, the
-worktree and a per-session config dir mounted in, both chowned to the image's
-non-root user — and they answer in the same shape: a transcript whose last
-message must carry a VERDICT line. Only the CLI invocation and the config file
-differ, so everything else lives here rather than in two copies that drift.
+Every review runs in a throwaway container this service starts on its own
+Docker host, with the PR's checkout mounted in. That checkout is untrusted —
+anyone who can open a PR wrote it — while the container holds an account's
+credential. So every review container starts from `sandbox_run_kwargs`: the
+image's non-root user, no capabilities, no privilege escalation, the default
+bridge network (outbound only, never this service's network), and the checkout
+mounted read-only.
+
+Codex and Claude differ only in the CLI they run and what else they mount, so
+everything else lives here rather than in two copies that drift.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import os
-import re
 import sys
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
+from docker import DockerClient
 from docker.errors import NotFound
 
-# Both agent images run as this non-root user; anything mounted in must be
-# owned by it or the CLI cannot write (os error 13).
+# Both review images run as this non-root user; anything mounted in that the
+# CLI must write is chowned to it.
 AGENT_UID = 1000
 AGENT_GID = 1000
 
-# The worker is the sole poster. A review container must NOT get a
-# write-capable github role, or the model posts its own review via `gh` and
-# every PR ends up with duplicate reviews.
-REVIEWER_GH_ROLE = "reviewer-readonly"
+# Every review container carries this label with its instance's name: two
+# instances can share one Docker host, and each reaps only its own.
+INSTANCE_LABEL = "ordago.ci.github-review.instance"
 
-_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\s*$", re.MULTILINE)
+WORKSPACE = "/workspace"
 
 
-def parse_verdict(raw: str) -> tuple[str, str]:
-    """Split a review transcript into (body, event).
+def container_name(instance: str, account: str, job_id: int) -> str:
+    """Unique per instance, account and job: two instances on one host number
+    their jobs independently, and one job may try several accounts."""
+    return f"review-{instance}-{account}-{job_id}"
 
-    Defaults to REQUEST_CHANGES: never approve without an explicit APPROVE
-    token, so a truncated or malformed transcript cannot open a merge gate.
-    """
-    match = _VERDICT_RE.search(raw)
-    event = "APPROVE" if (match and match.group(1) == "APPROVE") else "REQUEST_CHANGES"
-    body = _VERDICT_RE.sub("", raw).strip()
-    return body, event
+
+def sandbox_run_kwargs(
+    *, instance: str, image_id: str, worktree: Path, environment: dict[str, str]
+) -> dict[str, Any]:
+    """`containers.run` arguments every review container starts from.
+
+    Callers may add volumes; they must not loosen anything here."""
+    return {
+        "image": image_id,
+        "command": ["sleep", "infinity"],
+        "detach": True,
+        # Outbound only, to the provider's API. Never this service's own network,
+        # where the PR's code could reach the reviewer's API or its neighbours.
+        "network": "bridge",
+        "user": f"{AGENT_UID}:{AGENT_GID}",
+        "working_dir": WORKSPACE,
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges"],
+        "labels": {INSTANCE_LABEL: instance},
+        "environment": environment,
+        "volumes": {str(worktree): {"bind": WORKSPACE, "mode": "ro"}},
+    }
 
 
 def repo_git_volume(projects_root: Path, project: str) -> dict[str, dict[str, str]]:
@@ -49,9 +73,10 @@ def repo_git_volume(projects_root: Path, project: str) -> dict[str, dict[str, st
 
     A review worktree's `.git` is a file naming `<clone>/.git/worktrees/<name>` by
     its host path; without this mount every git command in the container fails
-    with "not a git repository" and the reviewer cannot see the diff. Read-only,
-    because the PR branch under review must not be able to write hooks or config
-    into a clone this service runs git in."""
+    with "not a git repository". Read-only, because the PR branch under review
+    must not be able to write hooks or config into a clone this service runs git
+    in. This is why PROJECTS_ROOT must be mounted at the same path it has on the
+    host."""
     git_dir = str(projects_root / project / "repo" / ".git")
     return {git_dir: {"bind": git_dir, "mode": "ro"}}
 
@@ -79,12 +104,12 @@ def _chown_for_agent(path: Path) -> None:
             raise
 
 
-def remove_container(docker_client, name: str) -> None:
+def remove_container(docker_client: DockerClient, name: str) -> None:
     """Best-effort removal that neither raises nor goes quiet.
 
     Runs in the worker's `finally`, so it must not raise. But a swallowed
-    failure leaks one review container per review and eventually exhausts the
-    host, so every failure is logged.
+    failure leaks one review container per review — each holding a credential —
+    and eventually exhausts the host, so every failure is logged.
     """
     try:
         container = docker_client.containers.get(name)
@@ -107,7 +132,7 @@ def remove_container(docker_client, name: str) -> None:
         )
 
 
-def remove_container_strict(docker_client, name: str) -> None:
+def remove_container_strict(docker_client: DockerClient, name: str) -> None:
     """Remove the container if it exists, raising if that fails. For callers
     that must not proceed while it may still be there."""
     try:
@@ -117,7 +142,19 @@ def remove_container_strict(docker_client, name: str) -> None:
     container.remove(force=True)
 
 
-def run_session_container(docker_client, name: str, **run_kwargs):
+def reap_review_containers(docker_client: DockerClient, instance: str) -> None:
+    """Remove every review container this instance left behind.
+
+    A restart leaves them sleeping forever, each holding a credential in its
+    environment. Only safe before the first review starts: it cannot tell a
+    leftover from a live session."""
+    for container in docker_client.containers.list(
+        all=True, filters={"label": f"{INSTANCE_LABEL}={instance}"}
+    ):
+        remove_container(docker_client, container.name)
+
+
+def run_session_container(docker_client: DockerClient, name: str, **run_kwargs: Any) -> Any:
     """Start a review container under `name`, never leaving one behind on failure.
 
     `containers.run` is create-then-start in two API calls. On a loaded host the
@@ -137,6 +174,22 @@ def run_session_container(docker_client, name: str, **run_kwargs):
         raise
 
 
+def copy_text_file(container: Any, path: str, text: str) -> None:
+    """Write `text` to `path` inside the container, readable by its user.
+
+    Copied in rather than mounted or written into the worktree: the worktree is
+    the code under review and this service runs as root outside it, so a PR
+    that commits the target path as a symlink would redirect a host-side write."""
+    data = text.encode("utf-8")
+    info = tarfile.TarInfo(Path(path).name)
+    info.size = len(data)
+    info.mode = 0o644
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        tar.addfile(info, io.BytesIO(data))
+    container.put_archive(str(Path(path).parent), archive.getvalue())
+
+
 # The review prompt embeds the whole PR diff. As one argv element it fails every
 # PR whose diff passes the kernel's 128 KiB single-argument cap ("argument list
 # too long"), so it travels into the container as a file and reaches the CLI on
@@ -144,18 +197,31 @@ def run_session_container(docker_client, name: str, **run_kwargs):
 PROMPT_PATH = "/tmp/review-prompt.md"
 
 
-def prompt_on_stdin(container, prompt: str, argv: list[str]) -> list[str]:
+def prompt_on_stdin(container: Any, prompt: str, argv: list[str]) -> list[str]:
     """Copy `prompt` into the container and return `argv` wrapped to read it on
     stdin. Each argument stays its own element; only the prompt leaves argv."""
-    data = prompt.encode("utf-8")
-    info = tarfile.TarInfo(Path(PROMPT_PATH).name)
-    info.size = len(data)
-    info.mode = 0o644
-    archive = io.BytesIO()
-    with tarfile.open(fileobj=archive, mode="w") as tar:
-        tar.addfile(info, io.BytesIO(data))
-    container.put_archive(str(Path(PROMPT_PATH).parent), archive.getvalue())
+    copy_text_file(container, PROMPT_PATH, prompt)
     return ["sh", "-c", f'exec "$@" < {PROMPT_PATH}', "sh", *argv]
+
+
+def exec_with_deadline(
+    container: Any,
+    cmd: list[str],
+    *,
+    timeout_seconds: int,
+    on_timeout: Callable[[], None],
+    label: str,
+    **exec_kwargs: Any,
+) -> Any:
+    """`exec_run` has no timeout of its own. `on_timeout` must end the exec (by
+    removing the container), or leaving the executor below blocks until it ends."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(container.exec_run, cmd, **exec_kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            on_timeout()
+            raise RuntimeError(f"{label} review timed out") from exc
 
 
 def diagnostic_lines(output: str, prompt: str) -> str:

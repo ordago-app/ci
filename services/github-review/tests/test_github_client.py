@@ -4,11 +4,17 @@ import respx
 from src.github_client import GitHubClient
 
 
+class FakeTokens:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bool]] = []
+
+    def token(self, repo: str, *, refresh: bool = False) -> str:
+        self.calls.append((repo, refresh))
+        return "ghs_test"
+
+
 @respx.mock
-def test_fetches_token_from_router_and_lists_open_prs() -> None:
-    respx.get("http://claude-router:8000/internal/github-token").mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
+def test_lists_open_prs_under_the_repos_token() -> None:
     route = respx.get("https://api.github.com/repos/alvaro/homelab/pulls").mock(
         return_value=httpx.Response(
             200,
@@ -27,7 +33,7 @@ def test_fetches_token_from_router_and_lists_open_prs() -> None:
             ],
         )
     )
-    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+    client = GitHubClient(tokens=FakeTokens())
     prs = client.list_open_prs("alvaro/homelab")
     assert prs[0].number == 5
     assert prs[0].head_sha == "head"
@@ -40,13 +46,10 @@ def test_ci_summary_degrades_when_checks_not_readable() -> None:
     # Regression: the reviewer App has no `Checks: Read` permission, so the
     # check-runs endpoint 403s. CI status is auxiliary prompt context — a review
     # must not abort over it. Surface the limitation instead of raising.
-    respx.get("http://claude-router:8000/internal/github-token").mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     respx.get("https://api.github.com/repos/alvaro/homelab/commits/deadbeef/check-runs").mock(
         return_value=httpx.Response(403, json={"message": "Resource not accessible by integration"})
     )
-    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+    client = GitHubClient(tokens=FakeTokens())
     summary = client.ci_summary("alvaro/homelab", "deadbeef")
     assert "unavailable" in summary.lower()
     assert "403" in summary
@@ -54,13 +57,10 @@ def test_ci_summary_degrades_when_checks_not_readable() -> None:
 
 @respx.mock
 def test_post_review_sends_commit_id() -> None:
-    respx.get("http://claude-router:8000/internal/github-token").mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     route = respx.post("https://api.github.com/repos/alvaro/homelab/pulls/1/reviews").mock(
         return_value=httpx.Response(200, json={})
     )
-    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+    client = GitHubClient(tokens=FakeTokens())
     client.post_review("alvaro/homelab", 1, "Looks good.", "COMMENT", commit_id="deadbeef")
     import json
 
@@ -70,74 +70,45 @@ def test_post_review_sends_commit_id() -> None:
     assert sent["event"] == "COMMENT"
 
 
-TOKEN_URL = "http://claude-router:8000/internal/github-token"
-
-
-def _client() -> GitHubClient:
-    return GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+def _client(tokens: FakeTokens | None = None) -> GitHubClient:
+    return GitHubClient(tokens=tokens or FakeTokens())
 
 
 @respx.mock
-def test_token_request_names_the_repo_being_acted_on() -> None:
-    """The reviewer App has a different installation id under every account that
-    owns a reviewed repo, so the router cannot pick one without being told."""
-    token = respx.get(TOKEN_URL).mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
-    respx.get("https://api.github.com/repos/acme/ordago-apps/pulls").mock(
-        return_value=httpx.Response(200, json=[])
-    )
-    _client().list_open_prs("acme/ordago-apps")
-    params = token.calls.last.request.url.params
-    assert params["repo"] == "acme/ordago-apps"
-    assert params["role"] == "reviewer"
-
-
-@respx.mock
-def test_each_repo_gets_a_token_minted_for_its_own_owner() -> None:
+def test_each_repo_is_called_with_a_token_for_that_repo() -> None:
     """One process polls several owners; two repos must not share a token."""
-    token = respx.get(TOKEN_URL).mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     respx.get("https://api.github.com/repos/acme/ordago-apps/pulls").mock(
         return_value=httpx.Response(200, json=[])
     )
     respx.get("https://api.github.com/repos/personal/homelab/pulls").mock(
         return_value=httpx.Response(200, json=[])
     )
-    client = _client()
+    tokens = FakeTokens()
+    client = _client(tokens)
     client.list_open_prs("acme/ordago-apps")
     client.list_open_prs("personal/homelab")
-    asked = [c.request.url.params["repo"] for c in token.calls]
-    assert asked == ["acme/ordago-apps", "personal/homelab"]
+    assert tokens.calls == [("acme/ordago-apps", False), ("personal/homelab", False)]
 
 
 @respx.mock
-def test_a_401_refreshes_the_cached_installation_and_retries_once() -> None:
-    """Moving a repo between accounts revokes a token the router has cached for
-    its full hour. The 401 lands here, so this is the only place that can tell
-    the router to drop it — otherwise every call fails for the rest of the hour,
-    which is exactly the hour the operator is watching."""
-    token = respx.get(TOKEN_URL).mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
+def test_a_401_mints_afresh_and_retries_once() -> None:
+    """Moving a repo between accounts revokes a token cached for most of its
+    hour. The 401 lands here, so this is the only place that can drop it —
+    otherwise every call fails for the rest of the hour."""
     prs = respx.get("https://api.github.com/repos/acme/ordago-apps/pulls").mock(
         side_effect=[
             httpx.Response(401, json={"message": "Bad credentials"}),
             httpx.Response(200, json=[]),
         ]
     )
-    assert _client().list_open_prs("acme/ordago-apps") == []
+    tokens = FakeTokens()
+    assert _client(tokens).list_open_prs("acme/ordago-apps") == []
     assert prs.call_count == 2
-    assert token.calls[0].request.url.params.get("refresh") is None
-    assert token.calls[1].request.url.params["refresh"] == "true"
+    assert tokens.calls == [("acme/ordago-apps", False), ("acme/ordago-apps", True)]
 
 
 @respx.mock
 def test_a_persistent_401_is_surfaced_not_retried_forever() -> None:
-    respx.get(TOKEN_URL).mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     prs = respx.get("https://api.github.com/repos/acme/ordago-apps/pulls").mock(
         return_value=httpx.Response(401, json={"message": "Bad credentials"})
     )
@@ -154,9 +125,6 @@ def test_a_persistent_401_is_surfaced_not_retried_forever() -> None:
 def test_post_review_also_retries_once_on_401() -> None:
     """post_review is the one call that matters most: a review lost to a stale
     token is a PR that silently never gets one."""
-    respx.get(TOKEN_URL).mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     route = respx.post("https://api.github.com/repos/acme/ordago-apps/pulls/1/reviews").mock(
         side_effect=[httpx.Response(401, json={}), httpx.Response(200, json={})]
     )
@@ -166,9 +134,6 @@ def test_post_review_also_retries_once_on_401() -> None:
 
 @respx.mock
 def test_post_comment_goes_to_the_pr_conversation() -> None:
-    respx.get(TOKEN_URL).mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     route = respx.post("https://api.github.com/repos/acme/ordago-apps/issues/7/comments").mock(
         return_value=httpx.Response(201, json={})
     )
@@ -192,9 +157,6 @@ def _check_runs(*runs: tuple[str, str | None]) -> httpx.Response:
 
 @respx.mock
 def test_head_ci_green_needs_every_run_finished_and_passing() -> None:
-    respx.get("http://claude-router:8000/internal/github-token").mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     url = "https://api.github.com/repos/alvaro/homelab/commits/{}/check-runs"
     respx.get(url.format("green")).mock(
         return_value=_check_runs(
@@ -208,7 +170,7 @@ def test_head_ci_green_needs_every_run_finished_and_passing() -> None:
         return_value=_check_runs(("completed", "success"), ("completed", "failure"))
     )
     respx.get(url.format("none")).mock(return_value=_check_runs())
-    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+    client = GitHubClient(tokens=FakeTokens())
 
     assert client.head_ci_green("alvaro/homelab", "green")
     assert not client.head_ci_green("alvaro/homelab", "running")
@@ -218,12 +180,9 @@ def test_head_ci_green_needs_every_run_finished_and_passing() -> None:
 
 @respx.mock
 def test_head_ci_green_raises_when_checks_are_not_readable() -> None:
-    respx.get("http://claude-router:8000/internal/github-token").mock(
-        return_value=httpx.Response(200, json={"token": "ghs_test", "expires_at": 123.0})
-    )
     respx.get("https://api.github.com/repos/alvaro/homelab/commits/deadbeef/check-runs").mock(
         return_value=httpx.Response(403, json={"message": "Resource not accessible by integration"})
     )
-    client = GitHubClient(router_url="http://claude-router:8000", github_role="reviewer")
+    client = GitHubClient(tokens=FakeTokens())
     with pytest.raises(httpx.HTTPStatusError):
         client.head_ci_green("alvaro/homelab", "deadbeef")

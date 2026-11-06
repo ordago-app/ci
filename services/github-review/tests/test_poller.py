@@ -7,6 +7,8 @@ from src.github_client import PullRequest
 from src.job_store import JobStatus, ReviewJobStore
 from src.poller import CiGreenCache, ReviewPoller
 
+from tests.helpers import write_config
+
 
 class FakeGitHub:
     def __init__(self, prs: list[PullRequest]) -> None:
@@ -23,32 +25,17 @@ def config(
     review_dependency_bots: bool = False,
     review_mode: str = "all",
 ) -> ReviewConfig:
-    path = tmp_path / "agent-review.yml"
-    path.write_text(
-        f"""
-        repos:
-          homelab:
-            repo: alvaro/homelab
-            providers: [codex]
-            enabled: true
-            review_drafts: {str(review_drafts).lower()}
-            review_dependency_bots: {str(review_dependency_bots).lower()}
-            run_ci_first: true
-            review_mode: {review_mode}
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer:
-            github_role: reviewer
-            mcps: {{}}
-            allow_shell: true
-            allow_network: true
-            allow_repo_write: true
-            allow_git_push: false
-            allow_docker: false
-            max_runtime_minutes: 30
-        """
+    return write_config(
+        tmp_path,
+        {
+            "homelab": {
+                "providers": ["codex"],
+                "review_drafts": review_drafts,
+                "review_dependency_bots": review_dependency_bots,
+                "review_mode": review_mode,
+            }
+        },
     )
-    return ReviewConfig.load(path)
 
 
 def pr(

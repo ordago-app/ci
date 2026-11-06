@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 from docker.errors import APIError, NotFound
 from requests.exceptions import ReadTimeout
+from src.config import ClaudeAccount, CodexAccount, CredentialSource
 from src.providers.claude import ClaudeReviewProvider
 from src.providers.codex import CodexReviewProvider
 
@@ -22,7 +23,6 @@ from tests.helpers import login
 
 from .test_provider_claude import job as claude_job
 from .test_provider_codex import job as codex_job
-from .test_provider_codex import profile
 
 
 class FakeDaemon:
@@ -65,24 +65,35 @@ def _codex(tmp_path: Path, daemon: FakeDaemon):
     state.mkdir(exist_ok=True)
     (state / "auth.json").write_text(login())
     provider = CodexReviewProvider(
+        account="codex",
+        settings=CodexAccount(
+            kind="codex", credential=CredentialSource(file=str(state / "auth.json"))
+        ),
         docker_client=daemon,
         projects_root=tmp_path / "projects",
-        codex_state_root=state,
-        router_url="http://claude-router:8000",
-        model="",
+        image="ordago-ci/codex-review:test",
+        instance="test",
     )
     return provider, codex_job()
 
 
 def _claude(tmp_path: Path, daemon: FakeDaemon):
+    worktrees = MagicMock()
+    worktrees.pr_diff.return_value = "diff"
     provider = ClaudeReviewProvider(
         account="claude-work",
-        credential_env="CLAUDE_CODE_OAUTH_TOKEN",
-        credential="sk-ant-oat01-x",
+        settings=ClaudeAccount(
+            kind="claude",
+            auth="subscription",
+            credential=CredentialSource(env="TOKEN"),
+            model="claude-model",
+        ),
         docker_client=daemon,
+        worktrees=worktrees,
         projects_root=tmp_path / "projects",
-        router_url="http://claude-router:8000",
-        model="claude-opus-5",
+        image="ordago-ci/claude-review:test",
+        instance="test",
+        environ={"TOKEN": "sk-ant-oat01-x"},
     )
     return provider, claude_job()
 
@@ -98,7 +109,7 @@ def test_a_start_that_times_out_leaves_no_container_behind(tmp_path: Path, make)
     (tmp_path / "worktree").mkdir()
 
     with pytest.raises(ReadTimeout):
-        provider.start_review_session(job, tmp_path / "worktree", profile())
+        provider.start_review_session(job, tmp_path / "worktree", 1800)
 
     assert daemon.containers_by_name == {}
 
@@ -110,10 +121,10 @@ def test_the_retry_after_a_failed_start_gets_a_session(tmp_path: Path, make) -> 
     provider, job = make(tmp_path, daemon)
     (tmp_path / "worktree").mkdir()
     with pytest.raises(ReadTimeout):
-        provider.start_review_session(job, tmp_path / "worktree", profile())
+        provider.start_review_session(job, tmp_path / "worktree", 1800)
 
     daemon.start_fails = False
-    session = provider.start_review_session(job, tmp_path / "worktree", profile())
+    session = provider.start_review_session(job, tmp_path / "worktree", 1800)
 
     assert list(daemon.containers_by_name) == [session.container]
 
@@ -129,10 +140,10 @@ def test_a_container_left_under_the_jobs_name_is_replaced_not_conflicted_on(
     daemon = FakeDaemon()
     provider, job = make(tmp_path, daemon)
     (tmp_path / "worktree").mkdir()
-    name = provider.start_review_session(job, tmp_path / "worktree", profile()).container
+    name = provider.start_review_session(job, tmp_path / "worktree", 1800).container
     stale = daemon.containers_by_name[name]
 
-    session = provider.start_review_session(job, tmp_path / "worktree", profile())
+    session = provider.start_review_session(job, tmp_path / "worktree", 1800)
 
     stale.remove.assert_called_once_with(force=True)
     assert daemon.containers_by_name[session.container] is not stale
@@ -144,19 +155,19 @@ def test_a_stale_container_that_cannot_be_removed_aborts_the_start(tmp_path: Pat
     daemon = FakeDaemon()
     provider, job = make(tmp_path, daemon)
     (tmp_path / "worktree").mkdir()
-    name = provider.start_review_session(job, tmp_path / "worktree", profile()).container
+    name = provider.start_review_session(job, tmp_path / "worktree", 1800).container
     stale = daemon.containers_by_name[name]
     daemon.remove_fails = True
     runs = daemon.containers.run.call_count
 
     with pytest.raises(APIError, match="already in progress"):
-        provider.start_review_session(job, tmp_path / "worktree", profile())
+        provider.start_review_session(job, tmp_path / "worktree", 1800)
 
     assert daemon.containers.run.call_count == runs
     assert daemon.containers_by_name == {name: stale}
 
     daemon.remove_fails = False
-    session = provider.start_review_session(job, tmp_path / "worktree", profile())
+    session = provider.start_review_session(job, tmp_path / "worktree", 1800)
     assert daemon.containers_by_name[session.container] is not stale
 
 
@@ -171,10 +182,10 @@ def test_a_cleanup_failure_after_a_failed_start_keeps_the_start_error(tmp_path: 
     (tmp_path / "worktree").mkdir()
 
     with pytest.raises(ReadTimeout):
-        provider.start_review_session(job, tmp_path / "worktree", profile())
+        provider.start_review_session(job, tmp_path / "worktree", 1800)
     assert len(daemon.containers_by_name) == 1
 
     daemon.start_fails = False
     daemon.remove_fails = False
-    session = provider.start_review_session(job, tmp_path / "worktree", profile())
+    session = provider.start_review_session(job, tmp_path / "worktree", 1800)
     assert list(daemon.containers_by_name) == [session.container]

@@ -29,7 +29,9 @@ def test_a_fresh_login_is_copied_without_its_refresh_token_and_not_refreshed(
     dest = tmp_path / "session-auth.json"
     with respx.mock(assert_all_called=False) as mock:
         route = mock.post(REFRESH_TOKEN_URL)
-        CodexAuthOwner(state).write_session_copy(dest, valid_for_seconds=2400)
+        CodexAuthOwner(state / "auth.json", "codex").write_session_copy(
+            dest, valid_for_seconds=2400
+        )
     assert not route.called
     copy = json.loads(dest.read_text())
     assert copy["tokens"]["refresh_token"] == ""
@@ -48,7 +50,9 @@ def test_a_token_that_would_expire_mid_review_is_refreshed_once_and_persisted(
         route = mock.post(REFRESH_TOKEN_URL).respond(
             200, json={"access_token": new_access, "refresh_token": "rt-2", "id_token": "id-2"}
         )
-        CodexAuthOwner(state).write_session_copy(tmp_path / "a.json", valid_for_seconds=2400)
+        CodexAuthOwner(state / "auth.json", "codex").write_session_copy(
+            tmp_path / "a.json", valid_for_seconds=2400
+        )
     sent = json.loads(route.calls.last.request.content)
     assert sent == {"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": "rt-1"}
     shared = json.loads((state / "auth.json").read_text())
@@ -67,7 +71,7 @@ def test_concurrent_sessions_spend_the_refresh_token_once(tmp_path: Path) -> Non
     """The race this owner exists for: N sessions starting together on a stale
     token must produce one refresh, not N uses of a single-use token."""
     state = _state(tmp_path, login(expires_in=60))
-    owner = CodexAuthOwner(state)
+    owner = CodexAuthOwner(state / "auth.json", "codex")
     seen: list[str] = []
 
     def refresh(request: httpx.Request) -> httpx.Response:
@@ -102,7 +106,9 @@ def test_a_rejected_refresh_is_an_auth_outage_and_leaves_the_login_alone(
     with respx.mock() as mock:
         mock.post(REFRESH_TOKEN_URL).respond(400, json={"error": "refresh_token_reused"})
         with pytest.raises(ProviderUnavailable) as exc:
-            CodexAuthOwner(state).write_session_copy(tmp_path / "a.json", 2400)
+            CodexAuthOwner(state / "auth.json", "codex").write_session_copy(
+                tmp_path / "a.json", 2400
+            )
     assert exc.value.reason == "auth"
     assert "refresh_token_reused" in exc.value.detail
     assert (state / "auth.json").read_text() == before
@@ -118,9 +124,9 @@ def test_no_login_is_an_auth_outage_naming_the_fix(tmp_path: Path, content: str 
     if content is not None:
         (state / "auth.json").write_text(content)
     with pytest.raises(ProviderUnavailable) as exc:
-        CodexAuthOwner(state).write_session_copy(tmp_path / "a.json", 2400)
+        CodexAuthOwner(state / "auth.json", "codex").write_session_copy(tmp_path / "a.json", 2400)
     assert exc.value.reason == "auth"
-    assert "codex-onboard" in exc.value.detail
+    assert "codex login" in exc.value.detail
 
 
 def test_a_refresh_that_times_out_is_an_auth_outage_and_changes_nothing(tmp_path: Path) -> None:
@@ -129,7 +135,9 @@ def test_a_refresh_that_times_out_is_an_auth_outage_and_changes_nothing(tmp_path
     with respx.mock() as mock:
         mock.post(REFRESH_TOKEN_URL).mock(side_effect=httpx.ReadTimeout("slow"))
         with pytest.raises(ProviderUnavailable) as exc:
-            CodexAuthOwner(state).write_session_copy(tmp_path / "a.json", 2400)
+            CodexAuthOwner(state / "auth.json", "codex").write_session_copy(
+                tmp_path / "a.json", 2400
+            )
     assert exc.value.reason == "auth"
     assert "slow" in exc.value.detail
     assert (state / "auth.json").read_text() == before
@@ -145,7 +153,9 @@ def test_a_refresh_answer_without_an_access_token_is_an_auth_outage(
     with respx.mock() as mock:
         mock.post(REFRESH_TOKEN_URL).respond(200, text=answer)
         with pytest.raises(ProviderUnavailable) as exc:
-            CodexAuthOwner(state).write_session_copy(tmp_path / "a.json", 2400)
+            CodexAuthOwner(state / "auth.json", "codex").write_session_copy(
+                tmp_path / "a.json", 2400
+            )
     assert exc.value.reason == "auth"
     assert (state / "auth.json").read_text() == before
 
@@ -166,7 +176,9 @@ def test_the_refresh_cutoff_is_the_review_s_whole_runtime(
     state = _state(tmp_path, json.dumps(auth))
     with respx.mock(assert_all_called=False) as mock:
         route = mock.post(REFRESH_TOKEN_URL).respond(200, json={"access_token": jwt(NOW + 864000)})
-        CodexAuthOwner(state).write_session_copy(tmp_path / "a.json", valid_for_seconds=2400)
+        CodexAuthOwner(state / "auth.json", "codex").write_session_copy(
+            tmp_path / "a.json", valid_for_seconds=2400
+        )
     assert route.called is refreshes
 
 
@@ -198,14 +210,16 @@ def test_without_a_readable_expiry_last_refresh_decides(
     state = _state(tmp_path, json.dumps(auth))
     with respx.mock(assert_all_called=False) as mock:
         route = mock.post(REFRESH_TOKEN_URL).respond(200, json={"access_token": "opaque-2"})
-        CodexAuthOwner(state).write_session_copy(tmp_path / "a.json", valid_for_seconds=2400)
+        CodexAuthOwner(state / "auth.json", "codex").write_session_copy(
+            tmp_path / "a.json", valid_for_seconds=2400
+        )
     assert route.called is refreshes
 
 
 def _keep_fresh_once(state: Path) -> None:
     stop = threading.Event()
     stop.set()  # one pass, then the wait returns at once
-    CodexAuthOwner(state).keep_fresh(stop)
+    CodexAuthOwner(state / "auth.json", "codex").keep_fresh(stop)
 
 
 def test_keep_fresh_refreshes_a_login_inside_the_horizon_with_no_review_running(

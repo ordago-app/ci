@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl jq \
+ && apt-get install -y --no-install-recommends ca-certificates git \
  && rm -rf /var/lib/apt/lists/*
 
 # Deps come from the committed uv.lock, so a rebuild installs the exact versions
@@ -26,13 +26,12 @@ COPY src /app/src
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Authenticate git fetches against private repos as the reviewer GitHub App.
-# The helper asks claude-router for a token scoped to BOTH the role
-# (AGENT_ROLE=reviewer) and the repo; the token never lands in argv or logs.
+# The service mints a token scoped to the one repo being fetched and passes it to
+# that git command in its environment; the helper hands it to git, and only for
+# that repo. The token never lands in argv, a config file or a log.
 #
-# useHttpPath true is load-bearing, not a default left alone: this container
-# fetches every reviewed repo, and the App has a different installation id under
-# each owning account. The path is how git tells the helper which repo the
-# request is for, so it can ask for the right installation instead of guessing.
+# useHttpPath true is load-bearing, not a default left alone: the path is how git
+# tells the helper which repo a request is for, and the helper refuses any other.
 COPY bin/git-credential-helper /usr/local/bin/git-credential-helper
 RUN chmod +x /usr/local/bin/git-credential-helper \
  && git config --system credential.helper /usr/local/bin/git-credential-helper \

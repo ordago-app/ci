@@ -435,6 +435,17 @@ class ReviewJobStore:
             ).fetchone()
         return self._from_row(row) if row else None
 
+    def mark_given_up(self, job_id: int, error: str, *, max_attempts: int) -> None:
+        """Failed with no retries left, whatever attempts it had used: a retry would
+        only spend again. It counts in count_stuck, so a PR waiting on it shows in
+        /status, and an explicit request (`requeue`) can still try it afresh."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE review_jobs SET status = ?, finished_at = ?, last_error = ?, "
+                "attempts = MAX(attempts, ?) WHERE id = ?",
+                (JobStatus.FAILED, time.time(), error, max_attempts, job_id),
+            )
+
     def mark_skipped(self, job_id: int, reason: str) -> None:
         self._finish(job_id, JobStatus.SKIPPED, reason)
 

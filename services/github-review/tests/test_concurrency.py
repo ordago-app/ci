@@ -45,7 +45,7 @@ class GatedProvider:
         self.done = 0
         self._lock = threading.Lock()
 
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -163,7 +163,7 @@ def test_start_requeues_reviews_a_restart_interrupted(tmp_path: Path) -> None:
 
 def test_outage_bookkeeping_is_shared_safely_across_runners(tmp_path: Path) -> None:
     class Down:
-        def start_review_session(self, job, worktree, profile) -> SessionRef:
+        def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
             raise ProviderUnavailable("codex", "exhausted", "usage limit")
 
         def run_review(self, session, prompt, timeout_seconds) -> ReviewResult:
@@ -198,11 +198,15 @@ def test_start_removes_the_containers_a_restart_left_behind_before_requeuing(
     from unittest.mock import MagicMock
 
     from docker.errors import NotFound
+    from src.config import ClaudeAccount, CodexAccount, CredentialSource
     from src.providers.claude import ClaudeReviewProvider
     from src.providers.codex import CodexReviewProvider
 
     docker = MagicMock()
-    left_behind = {"codex-review-1": MagicMock(), "claude-review-1-claude-work": MagicMock()}
+    left_behind = {
+        "review-test-codex-1": MagicMock(),
+        "review-test-claude-work-1": MagicMock(),
+    }
 
     def get(name: str):
         if name not in left_behind:
@@ -212,20 +216,28 @@ def test_start_removes_the_containers_a_restart_left_behind_before_requeuing(
     docker.containers.get.side_effect = get
     providers = {
         "codex": CodexReviewProvider(
+            account="codex",
+            settings=CodexAccount(
+                kind="codex", credential=CredentialSource(file=str(tmp_path / "auth.json"))
+            ),
             docker_client=docker,
             projects_root=tmp_path / "projects",
-            codex_state_root=tmp_path / "codex-state",
-            router_url="http://claude-router:8000",
-            model="",
+            image="codex:test",
+            instance="test",
         ),
         "claude-work": ClaudeReviewProvider(
             account="claude-work",
-            credential_env="CLAUDE_CODE_OAUTH_TOKEN",
-            credential="t",
+            settings=ClaudeAccount(
+                kind="claude",
+                auth="subscription",
+                credential=CredentialSource(env="T"),
+                model="m",
+            ),
             docker_client=docker,
+            worktrees=MagicMock(),
             projects_root=tmp_path / "projects",
-            router_url="http://claude-router:8000",
-            model="m",
+            image="claude:test",
+            instance="test",
         ),
     }
     store = ReviewJobStore(tmp_path / "jobs.db")

@@ -1,25 +1,36 @@
 import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from src.config import ToolProfile
+from docker.errors import ImageNotFound
+from src.config import CodexAccount, CredentialSource
 from src.job_store import JobStatus, ReviewJob
 from src.provider import ProviderUnavailable, SessionRef
 from src.providers import _agent_container as agent_container
-from src.providers._agent_container import PROMPT_PATH, parse_verdict
-from src.providers.codex import CodexReviewProvider, render_codex_config
+from src.providers._agent_container import PROMPT_PATH
+from src.providers.codex import CODEX_HOME, CodexReviewProvider, render_codex_config
 
 from tests.helpers import login
 
+TIMEOUT = 30 * 60
+IMAGE = "ordago-ci/codex-review:test"
 
-def _provider() -> CodexReviewProvider:
+
+def _provider(
+    raw: MagicMock | None = None,
+    projects_root: Path = Path("/x"),
+    login_file: Path = Path("/y/auth.json"),
+    account: str = "codex",
+) -> CodexReviewProvider:
     return CodexReviewProvider(
-        docker_client=MagicMock(),
-        projects_root=Path("/x"),
-        codex_state_root=Path("/y"),
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
+        account=account,
+        settings=CodexAccount(kind="codex", credential=CredentialSource(file=str(login_file))),
+        docker_client=raw if raw is not None else MagicMock(),
+        projects_root=projects_root,
+        image=IMAGE,
+        instance="test",
     )
 
 
@@ -41,53 +52,67 @@ def job() -> ReviewJob:
     )
 
 
-def profile() -> ToolProfile:
-    return ToolProfile(
-        github_role="reviewer",
-        mcps={"github": ["ro"]},
-        allow_shell=True,
-        allow_network=True,
-        allow_repo_write=True,
-        allow_git_push=False,
-        allow_docker=False,
-        max_runtime_minutes=30,
-    )
+def _session_provider(tmp_path: Path, raw: MagicMock) -> CodexReviewProvider:
+    raw.images.get.return_value = MagicMock(id="sha256:image")
+    state = tmp_path / "codex-state"
+    state.mkdir()
+    (state / "auth.json").write_text(login())
+    (tmp_path / "worktree").mkdir()
+    return _provider(raw, tmp_path / "projects", state / "auth.json")
+
+
+def _session_dir(tmp_path: Path) -> Path:
+    return tmp_path / "projects" / "homelab" / "review-sessions" / "3" / "codex"
+
+
+def _session_copy(tmp_path: Path) -> Path:
+    return _session_dir(tmp_path) / "auth.json"
 
 
 def test_starts_codex_review_container(tmp_path: Path) -> None:
     raw = MagicMock()
-    image = MagicMock()
-    image.id = "sha256:image"
-    raw.images.get.return_value = image
-    container = MagicMock()
-    container.name = "codex-review-3"
-    raw.containers.run.return_value = container
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=tmp_path / "projects",
-        codex_state_root=tmp_path / "codex-state",
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
-    (tmp_path / "codex-state").mkdir()
-    (tmp_path / "codex-state" / "auth.json").write_text(login())
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
+    provider = _session_provider(tmp_path, raw)
 
-    session = provider.start_review_session(job(), worktree, profile())
+    session = provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
 
-    raw.images.get.assert_called_once_with("homelab/codex-code-homelab:latest")
-    assert session.container == "codex-review-3"
-    assert (tmp_path / "projects" / "homelab" / "review-sessions" / "3" / "config.toml").exists()
-    env = raw.containers.run.call_args.kwargs["environment"]
-    assert env["AGENT_ROLE"] == agent_container.REVIEWER_GH_ROLE
-    # A review container is scoped to one repo (unlike github-review itself), so
-    # its gh/git wrappers are told which one rather than guessing the owner.
-    assert env["GITHUB_REPO"] == "alvaro/homelab"
+    raw.images.get.assert_called_once_with(IMAGE)
+    assert session.container == "review-test-codex-3"
+    assert (_session_dir(tmp_path) / "home" / "config.toml").exists()
+    run = raw.containers.run.call_args.kwargs
+    assert run["environment"] == {"CODEX_HOME": CODEX_HOME}
     # The worktree's `.git` names the clone by host path: mounted there, read-only.
     git_dir = str(tmp_path / "projects" / "homelab" / "repo" / ".git")
-    volumes = raw.containers.run.call_args.kwargs["volumes"]
-    assert volumes[git_dir] == {"bind": git_dir, "mode": "ro"}
+    assert run["volumes"][git_dir] == {"bind": git_dir, "mode": "ro"}
+
+
+def test_the_codex_container_is_sandboxed_like_every_review_container(tmp_path: Path) -> None:
+    """Codex runs a shell over the PR's code with a login in reach: it gets the
+    same sandbox as Claude, and nothing that reaches GitHub or this service."""
+    raw = MagicMock()
+    provider = _session_provider(tmp_path, raw)
+
+    provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
+
+    run = raw.containers.run.call_args.kwargs
+    assert run["network"] == "bridge"
+    assert run["user"] == "1000:1000"
+    assert run["cap_drop"] == ["ALL"]
+    assert run["security_opt"] == ["no-new-privileges"]
+    assert run["labels"] == {agent_container.INSTANCE_LABEL: "test"}
+    assert run["volumes"][str(tmp_path / "worktree")] == {"bind": "/workspace", "mode": "ro"}
+    assert not any("GITHUB" in key or "ROUTER" in key for key in run["environment"])
+
+
+def test_an_unbuilt_image_is_an_outage_not_a_crash(tmp_path: Path) -> None:
+    raw = MagicMock()
+    provider = _session_provider(tmp_path, raw)
+    raw.images.get.side_effect = ImageNotFound("no such image")
+
+    with pytest.raises(ProviderUnavailable) as caught:
+        provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
+
+    assert (caught.value.provider, caught.value.reason) == ("codex", "tooling")
+    raw.containers.run.assert_not_called()
 
 
 def test_a_session_reads_a_refreshless_copy_of_the_login_and_cannot_write_it(
@@ -95,62 +120,47 @@ def test_a_session_reads_a_refreshless_copy_of_the_login_and_cannot_write_it(
 ) -> None:
     # Concurrent sessions sharing the rw auth.json could each refresh its
     # single-use refresh token; the loser logs the account out. A session gets a
-    # copy without the refresh token, mounted read-only, and never the shared dir.
+    # copy without the refresh token, mounted read-only, and never the original.
     raw = MagicMock()
-    raw.images.get.return_value = MagicMock(id="sha256:image")
+    provider = _session_provider(tmp_path, raw)
     state = tmp_path / "codex-state"
-    state.mkdir()
-    (state / "auth.json").write_text(login())
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=tmp_path / "projects",
-        codex_state_root=state,
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
 
-    provider.start_review_session(job(), worktree, profile())
+    provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
 
     volumes = raw.containers.run.call_args.kwargs["volumes"]
-    copy = tmp_path / "projects" / "homelab" / "review-sessions" / "3" / "auth.json"
-    assert volumes[str(copy)] == {"bind": "/home/agent/.codex/auth.json", "mode": "ro"}
-    assert str(state) not in volumes
+    copy = _session_copy(tmp_path)
+    assert volumes[str(copy)] == {"bind": f"{CODEX_HOME}/auth.json", "mode": "ro"}
+    assert not any(str(state) in host for host in volumes)
     assert not copy.is_symlink()
     assert json.loads(copy.read_text())["tokens"]["refresh_token"] == ""
     assert json.loads((state / "auth.json").read_text())["tokens"]["refresh_token"] == "rt-1"
 
 
-def _session_provider(tmp_path: Path, raw: MagicMock) -> CodexReviewProvider:
-    raw.images.get.return_value = MagicMock(id="sha256:image")
-    state = tmp_path / "codex-state"
-    state.mkdir()
-    (state / "auth.json").write_text(login())
-    (tmp_path / "worktree").mkdir()
-    return CodexReviewProvider(
-        docker_client=raw,
-        projects_root=tmp_path / "projects",
-        codex_state_root=state,
-        router_url="http://claude-router:8000",
-        model="",
-    )
+def test_two_codex_accounts_never_share_a_session(tmp_path: Path) -> None:
+    raw = MagicMock()
+    _session_provider(tmp_path, raw)
+    other_login = tmp_path / "other" / "auth.json"
+    other_login.parent.mkdir()
+    other_login.write_text(login(refresh_token="rt-other"))
+    other = _provider(raw, tmp_path / "projects", other_login, account="codex-spare")
 
+    session = other.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
 
-def _session_copy(tmp_path: Path) -> Path:
-    return tmp_path / "projects" / "homelab" / "review-sessions" / "3" / "auth.json"
+    assert session.container == "review-test-codex-spare-3"
+    spare = tmp_path / "projects" / "homelab" / "review-sessions" / "3" / "codex-spare"
+    assert (spare / "auth.json").exists()
 
 
 def test_the_login_copy_outlives_its_session_by_nothing(tmp_path: Path) -> None:
     # It holds a live access token; review-sessions/ is never pruned otherwise.
     raw = MagicMock()
     provider = _session_provider(tmp_path, raw)
-    session = provider.start_review_session(job(), tmp_path / "worktree", profile())
+    session = provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
     assert _session_copy(tmp_path).stat().st_mode & 0o777 == 0o400
 
     provider.cleanup(session)
 
-    assert not _session_copy(tmp_path).exists()
+    assert not _session_dir(tmp_path).exists()
 
 
 def test_a_session_that_never_started_leaves_no_login_copy(tmp_path: Path) -> None:
@@ -159,7 +169,7 @@ def test_a_session_that_never_started_leaves_no_login_copy(tmp_path: Path) -> No
     provider = _session_provider(tmp_path, raw)
 
     with pytest.raises(RuntimeError, match="Conflict"):
-        provider.start_review_session(job(), tmp_path / "worktree", profile())
+        provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
 
     assert not _session_copy(tmp_path).exists()
 
@@ -167,15 +177,9 @@ def test_a_session_that_never_started_leaves_no_login_copy(tmp_path: Path) -> No
 def test_discarding_an_interrupted_session_removes_its_login_copy(tmp_path: Path) -> None:
     raw = MagicMock()
     provider = _session_provider(tmp_path, raw)
-    provider.start_review_session(job(), tmp_path / "worktree", profile())
+    provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
 
-    CodexReviewProvider(
-        docker_client=raw,
-        projects_root=tmp_path / "projects",
-        codex_state_root=tmp_path / "codex-state",
-        router_url="http://claude-router:8000",
-        model="",
-    ).discard(job())
+    _provider(raw, tmp_path / "projects", tmp_path / "codex-state" / "auth.json").discard(job())
 
     assert not _session_copy(tmp_path).exists()
     raw.containers.get.return_value.remove.assert_called_with(force=True)
@@ -193,39 +197,32 @@ def test_the_login_must_outlast_the_whole_review_plus_the_cli_s_refresh_window(
         real(dest, valid_for_seconds),
     )[-1]
 
-    provider.start_review_session(job(), tmp_path / "worktree", profile())
+    provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
 
     assert asked == [30 * 60 + 10 * 60]
 
 
-def test_review_container_cannot_post_to_github(tmp_path: Path) -> None:
-    # Regression: the model ignores prompt instructions and posts its own review
-    # via `gh` (it had the write-capable reviewer token), so every PR got a
-    # duplicate review. The worker is the sole poster; the review container must
-    # NOT receive a write-capable role.
+def test_makes_codex_home_and_login_copy_agent_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: github-review runs as root and creates CODEX_HOME as root, but
+    # the codex container runs as uid 1000, which then can't write its own home
+    # -> "Permission denied (os error 13)". The worktree is mounted read-only
+    # and is not handed over.
     raw = MagicMock()
-    image = MagicMock()
-    image.id = "sha256:image"
-    raw.images.get.return_value = image
-    raw.containers.run.return_value = MagicMock(name="codex-review-3")
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=tmp_path / "projects",
-        codex_state_root=tmp_path / "state",
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
-    (tmp_path / "state").mkdir()
-    (tmp_path / "state" / "auth.json").write_text(login())
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
+    provider = _session_provider(tmp_path, raw)
+    chowned: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(os, "chown", lambda p, u, g: chowned.append((str(p), u, g)))
+    monkeypatch.setattr(os, "lchown", lambda p, u, g: chowned.append((str(p), u, g)))
 
-    provider.start_review_session(job(), worktree, profile())
+    provider.start_review_session(job(), tmp_path / "worktree", TIMEOUT)
 
-    env = raw.containers.run.call_args.kwargs["environment"]
-    assert env["AGENT_ROLE"] not in ("reviewer", "developer"), (
-        "review container must not get a write-capable github role"
-    )
+    chowned_paths = {p for p, _, _ in chowned}
+    assert str(_session_dir(tmp_path) / "home") in chowned_paths
+    assert str(_session_copy(tmp_path)) in chowned_paths
+    assert str(tmp_path / "worktree") not in chowned_paths
+    expected = (agent_container.AGENT_UID, agent_container.AGENT_GID)
+    assert all((u, g) == expected for _, u, g in chowned)
 
 
 def test_extract_review_body_parses_codex_agent_message() -> None:
@@ -233,13 +230,6 @@ def test_extract_review_body_parses_codex_agent_message() -> None:
     # {"type":"item.completed","item":{"type":"agent_message","text":...}},
     # not {"type":"message","content":...}. The old parser matched nothing and
     # raised "codex produced no review body" even on a successful run.
-    provider = CodexReviewProvider(
-        docker_client=MagicMock(),
-        projects_root=Path("/x"),
-        codex_state_root=Path("/y"),
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
     output = "\n".join(
         [
             '{"type":"item.started","item":{"type":"reasoning"}}',
@@ -249,7 +239,7 @@ def test_extract_review_body_parses_codex_agent_message() -> None:
             '{"type":"turn.completed"}',
         ]
     )
-    body = provider._extract_review_body(output)
+    body = _provider()._extract_review_body(output)
     assert body.startswith("## Review")
     assert "Looks good." in body
 
@@ -257,128 +247,33 @@ def test_extract_review_body_parses_codex_agent_message() -> None:
 def test_extract_review_body_surfaces_raw_output_when_empty() -> None:
     # When codex returns no agent_message the error must include the raw output
     # so we can see what it actually emitted, instead of an opaque message.
-    provider = CodexReviewProvider(
-        docker_client=MagicMock(),
-        projects_root=Path("/x"),
-        codex_state_root=Path("/y"),
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
     output = '{"type":"turn.failed","error":{"message":"DISTINCTIVE_MARKER_42"}}'
     with pytest.raises(RuntimeError) as exc:
-        provider._extract_review_body(output)
+        _provider()._extract_review_body(output)
     assert "DISTINCTIVE_MARKER_42" in str(exc.value)
-
-
-def test_makes_worktree_and_codex_home_agent_writable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Regression: github-review runs as root and creates the worktree and
-    # CODEX_HOME as root, but the Codex container runs as the non-root `agent`
-    # user (uid 1000), which then can't write its own home -> "Permission
-    # denied (os error 13)". The provider must chown both to the agent uid.
-    import os
-
-    raw = MagicMock()
-    image = MagicMock()
-    image.id = "sha256:image"
-    raw.images.get.return_value = image
-    raw.containers.run.return_value = MagicMock(name="codex-review-3")
-
-    chowned: list[tuple[str, int, int]] = []
-    monkeypatch.setattr(os, "chown", lambda p, u, g: chowned.append((str(p), u, g)))
-    monkeypatch.setattr(os, "lchown", lambda p, u, g: chowned.append((str(p), u, g)))
-
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=tmp_path / "projects",
-        codex_state_root=tmp_path / "codex-state",
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
-    (tmp_path / "codex-state").mkdir()
-    (tmp_path / "codex-state" / "auth.json").write_text(login())
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-
-    provider.start_review_session(job(), worktree, profile())
-
-    codex_home = tmp_path / "projects" / "homelab" / "review-sessions" / "3"
-    chowned_paths = {p for p, _, _ in chowned}
-    assert str(worktree) in chowned_paths, "worktree must be chowned to the agent uid"
-    assert str(codex_home) in chowned_paths, "CODEX_HOME must be chowned to the agent uid"
-    expected = (agent_container.AGENT_UID, agent_container.AGENT_GID)
-    assert all((u, g) == expected for _, u, g in chowned)
 
 
 def test_cleanup_removes_container() -> None:
     raw = MagicMock()
     container = MagicMock()
     raw.containers.get.return_value = container
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=Path("/x"),
-        codex_state_root=Path("/y"),
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
-    provider.cleanup(SessionRef(id="1", container="codex-review-1", worktree=Path("/w")))
+    _provider(raw).cleanup(SessionRef(id="1", container="review-test-codex-1", worktree=Path("/w")))
     container.remove.assert_called_once_with(force=True)
 
 
 def test_cleanup_surfaces_removal_failure(capsys: pytest.CaptureFixture[str]) -> None:
     # Regression: cleanup() swallowed every exception, so a failing remove()
-    # silently leaked one codex container per review (observed on powerserver).
-    # A removal failure must be surfaced, not hidden.
+    # silently leaked one codex container per review. A removal failure must be
+    # surfaced, not hidden.
     raw = MagicMock()
     container = MagicMock()
     container.remove.side_effect = RuntimeError("docker daemon boom")
     raw.containers.get.return_value = container
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=Path("/x"),
-        codex_state_root=Path("/y"),
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
     # Must not raise (runs in a finally), but must log the failure.
-    provider.cleanup(SessionRef(id="1", container="codex-review-1", worktree=Path("/w")))
+    _provider(raw).cleanup(SessionRef(id="1", container="review-test-codex-1", worktree=Path("/w")))
     err = capsys.readouterr().err
-    assert "codex-review-1" in err
+    assert "review-test-codex-1" in err
     assert "docker daemon boom" in err
-
-
-def test_parse_review_approve_sets_event_and_strips_verdict() -> None:
-    out = "\n".join(
-        [
-            '{"type":"item.completed","item":'
-            '{"type":"agent_message","text":"No findings.\\nVERDICT: APPROVE"}}',
-        ]
-    )
-    body, event = parse_verdict(_provider()._extract_review_body(out))
-    assert event == "APPROVE"
-    assert "VERDICT:" not in body
-    assert body == "No findings."
-
-
-def test_parse_review_request_changes_when_findings() -> None:
-    out = "\n".join(
-        [
-            '{"type":"item.completed","item":'
-            '{"type":"agent_message","text":"- [P1] bug at foo.py:1\\nVERDICT: REQUEST_CHANGES"}}',
-        ]
-    )
-    body, event = parse_verdict(_provider()._extract_review_body(out))
-    assert event == "REQUEST_CHANGES"
-    assert body.startswith("- [P1]")
-
-
-def test_parse_review_missing_verdict_defaults_to_request_changes() -> None:
-    out = '{"type":"item.completed","item":{"type":"agent_message","text":"Looks fine to me."}}'
-    body, event = parse_verdict(_provider()._extract_review_body(out))
-    # Never auto-approve without an explicit APPROVE token.
-    assert event == "REQUEST_CHANGES"
-    assert body == "Looks fine to me."
 
 
 # ── run_review: the branch that decides outage vs finding ─────────────────
@@ -396,14 +291,9 @@ def _run(output: str, exit_code: int = 0, prompt: str = "p"):
     container = MagicMock()
     container.exec_run.return_value = MagicMock(exit_code=exit_code, output=output.encode())
     raw.containers.get.return_value = container
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=Path("/x"),
-        codex_state_root=Path("/y"),
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
+    return _provider(raw).run_review(
+        SessionRef(id="1", container="c", worktree=Path("/w")), prompt, 60
     )
-    return provider.run_review(SessionRef(id="1", container="c", worktree=Path("/w")), prompt, 60)
 
 
 def _msg(text: str) -> str:
@@ -555,12 +445,11 @@ def test_a_quota_line_on_stderr_of_a_successful_run_is_still_not_an_outage() -> 
     assert _run(out, exit_code=0).event == "APPROVE"
 
 
-def test_render_codex_config_omits_model_when_unpinned():
+def test_render_codex_config_omits_model_when_unpinned() -> None:
     # Empty model = no `model =` key, so the codex CLI picks whatever the
-    # subscription currently serves. See ADR 0007's unpinning correction.
-    out = render_codex_config(caller="homelab", mcps={"github": ["ro"]}, model="")
-    assert "model = " not in out
-    assert "[mcp_servers.github]" in out
+    # subscription currently serves.
+    assert render_codex_config(model="") == ""
+    assert render_codex_config(model="gpt-5.5") == 'model = "gpt-5.5"\n'
 
 
 def _archived_prompt(container: MagicMock) -> str:
@@ -587,13 +476,7 @@ def test_a_large_prompt_reaches_codex_on_stdin_not_argv() -> None:
         exit_code=0, output=_msg("VERDICT: APPROVE").encode()
     )
     raw.containers.get.return_value = container
-    provider = CodexReviewProvider(
-        docker_client=raw,
-        projects_root=Path("/x"),
-        codex_state_root=Path("/y"),
-        router_url="http://claude-router:8000",
-        model="gpt-5.5",
-    )
+    provider = _provider(raw)
     prompt = "x" * 300_000
 
     provider.run_review(SessionRef(id="1", container="c", worktree=Path("/w")), prompt, 60)

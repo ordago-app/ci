@@ -10,18 +10,20 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import yaml
 from src.config import ReviewConfig
 from src.job_store import JobStatus, ReviewJobStore
 from src.provider import (
     ProviderUnavailable,
     QuotaReading,
+    ReviewLimitExceeded,
     ReviewResult,
     SessionRef,
     classify_unavailable,
 )
 from src.worker import ProviderOutage, ReviewWorker
 
-from tests.helpers import tick_and_drain
+from tests.helpers import tick_and_drain, write_config
 
 from .test_worker_flow import FakeGitHub, FakeWorktrees
 
@@ -122,7 +124,7 @@ class ScriptedProvider:
         self.runs = 0
         self.cleaned = 0
 
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container=f"c-{self.name}", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -136,29 +138,7 @@ class ScriptedProvider:
 
 
 def _config(tmp_path: Path, chain: str) -> ReviewConfig:
-    path = tmp_path / "agent-review.yml"
-    path.write_text(
-        f"""
-        repos:
-          homelab:
-            providers: {chain}
-            enabled: true
-            review_drafts: false
-            run_ci_first: true
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer:
-            github_role: reviewer
-            mcps: {{}}
-            allow_shell: true
-            allow_network: true
-            allow_repo_write: true
-            allow_git_push: false
-            allow_docker: false
-            max_runtime_minutes: 30
-        """
-    )
-    return ReviewConfig.load(path)
+    return write_config(tmp_path, {"homelab": {"providers": yaml.safe_load(chain)}})
 
 
 def _worker(tmp_path: Path, providers: dict, chain: str, gh: FakeGitHub) -> ReviewWorker:
@@ -247,6 +227,35 @@ def test_an_ordinary_error_does_not_advance_the_chain(tmp_path: Path) -> None:
     assert work.runs == 0, "a job-level failure must not spend the fallback subscription"
     assert gh.posted == []
     assert worker.store.list_by_status(JobStatus.FAILED)
+
+
+def test_a_review_that_hits_its_cap_is_given_up_not_failed_over(tmp_path: Path) -> None:
+    """The next account would spend as much again and stop at the same cap, and
+    so would a retry: the head is failed for good, its run counted, and the PR
+    told why no review is coming."""
+
+    class Capped(ScriptedProvider):
+        def run_review(self, session, prompt, timeout_seconds):
+            self.runs += 1
+            raise ReviewLimitExceeded(self.name, "Reached maximum budget ($3)")
+
+    gh = FakeGitHub()
+    api = Capped("claude-api")
+    spare = ScriptedProvider("claude-work")
+    worker = _worker(
+        tmp_path, {"claude-api": api, "claude-work": spare}, "[claude-api, claude-work]", gh
+    )
+
+    tick_and_drain(worker)
+    tick_and_drain(worker)
+
+    assert (api.runs, spare.runs) == (1, 0)
+    assert gh.posted == []
+    failed = worker.store.list_by_status(JobStatus.FAILED)
+    assert len(failed) == 1 and failed[0].attempts >= worker.max_attempts
+    assert worker.store.runs_for(failed[0].repo, failed[0].pr_number) == 1
+    assert len(gh.comments) == 1 and "maximum budget" in gh.comments[0][2]
+    assert "cost cap" in gh.comments[0][2]
 
 
 def test_both_claude_accounts_are_tried_before_giving_up(tmp_path: Path) -> None:

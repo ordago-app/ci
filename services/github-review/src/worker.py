@@ -10,7 +10,13 @@ from .config import ReviewConfig
 from .job_store import InterruptedOutcome, JobStatus, ReviewJob, ReviewJobStore
 from .poller import CiGreenCache, ReviewPoller
 from .prompt import PreviousRound, build_review_prompt
-from .provider import ProviderUnavailable, QuotaReading, ReviewProvider, ReviewResult
+from .provider import (
+    ProviderUnavailable,
+    QuotaReading,
+    ReviewLimitExceeded,
+    ReviewProvider,
+    ReviewResult,
+)
 
 # Opens the body of a carried approval, so a reader of the PR can tell one from a
 # review that read the diff. pr-land needs no marker: it counts only
@@ -74,7 +80,7 @@ class ReviewWorker:
         # legitimately run; a stuck timeout inside that would reap live reviews.
         longest_review = max(
             (
-                config.profile_for(repo).max_runtime_minutes * 60 * len(repo.providers)
+                repo.max_runtime_minutes * 60 * len(repo.providers)
                 for repo in config.enabled_repos()
             ),
             default=0,
@@ -374,7 +380,7 @@ class ReviewWorker:
             return False
         repo_dir = self._projects_root / job.project / "repo"
         try:
-            self._worktrees.fetch(repo_dir)
+            self._worktrees.fetch(repo_dir, job.repo)
             before = self._worktrees.diff_fingerprint(
                 repo_dir=repo_dir, base_sha=previous.base_sha, head_sha=previous.head_sha
             )
@@ -416,7 +422,6 @@ class ReviewWorker:
             repo_policy = next(
                 repo for repo in self._config.enabled_repos() if repo.project == job.project
             )
-            profile = self._config.profile_for(repo_policy)
             pr = self._github.get_pull_request(job.repo, job.pr_number)
             if pr.state != "open":
                 self._store.mark_skipped(job.id, f"PR {pr.state}")
@@ -432,6 +437,7 @@ class ReviewWorker:
                 return
             worktree = self._worktrees.prepare(
                 repo_dir=repo_dir,
+                repo=job.repo,
                 project=job.project,
                 pr_number=job.pr_number,
                 head_sha=job.head_sha,
@@ -450,7 +456,7 @@ class ReviewWorker:
                 previous=self._previous_round(job, repo_dir),
             )
             result, used, outages = self._review_with_failover(
-                job, worktree, profile, prompt, repo_policy.providers
+                job, worktree, repo_policy.max_runtime_minutes * 60, prompt, repo_policy.providers
             )
             body = self._disclose(result.body, used, repo_policy.providers[0], outages)
             self._github.post_review(
@@ -459,6 +465,8 @@ class ReviewWorker:
             self._store.mark_posted(
                 job.id, verdict=result.event, provider=used, review_body=result.body
             )
+        except ReviewLimitExceeded as exc:
+            self._give_up(job, exc)
         except Exception as exc:
             self._store.mark_failed(job.id, str(exc))
             self._after_failure(job, str(exc))
@@ -487,7 +495,7 @@ class ReviewWorker:
         self,
         job: ReviewJob,
         worktree: Path,
-        profile,
+        timeout_seconds: int,
         prompt: str,
         chain: list[str],
     ) -> tuple[ReviewResult, str, list[ProviderUnavailable]]:
@@ -495,8 +503,9 @@ class ReviewWorker:
 
         Only `ProviderUnavailable` advances the chain. Any other error is about
         this job — a timeout, a bad mount, a malformed transcript — and failing
-        over on it would burn the spare subscription on a problem the spare has
-        too.
+        over on it would burn the spare account on a problem the spare has too.
+        That includes `ReviewLimitExceeded`: the next account would spend as
+        much again and stop at the same cap.
 
         Every outage is collected rather than replaced: when the whole chain is
         down, the operator needs to see that *all* of them were, and why each
@@ -507,11 +516,9 @@ class ReviewWorker:
             provider = self._providers[name]
             session = None
             try:
-                session = provider.start_review_session(job, worktree, profile)
+                session = provider.start_review_session(job, worktree, timeout_seconds)
                 try:
-                    result = provider.run_review(
-                        session, prompt, timeout_seconds=profile.max_runtime_minutes * 60
-                    )
+                    result = provider.run_review(session, prompt, timeout_seconds=timeout_seconds)
                 except ProviderUnavailable:
                     raise
                 except Exception:
@@ -586,6 +593,19 @@ class ReviewWorker:
                 f"{failed.attempts} times and will not be retried on its own: {error}\n\n"
                 "Push a new commit, or run `review <pr>`, to try again.",
             )
+
+    def _give_up(self, job: ReviewJob, exc: ReviewLimitExceeded) -> None:
+        """Fail the head for good and say so on the PR: a retry would spend the same."""
+        self._store.mark_given_up(job.id, str(exc), max_attempts=self._max_attempts)
+        self._report_failure(job, str(exc))
+        self._comment(
+            job,
+            f"{NO_REVIEW_MARKER}\n"
+            f"The automated review of `{job.head_sha[:12]}` stopped at its cap and will not "
+            f"be retried: {exc}\n\n"
+            "This is a cost cap, not a finding. Push a new commit, or run `review <pr>`, "
+            "to try again.",
+        )
 
     def _report_failure(self, job: ReviewJob, error: str) -> None:
         """Put the failure somewhere a human actually looks.

@@ -1,23 +1,30 @@
-"""The Claude side of the failover chain.
+"""Every Claude account, and the hardened container each one reviews in.
 
-One provider instance per subscription: the point of the second Anthropic
-account is that it has its own usage window, so the two must never share
-credentials, container names, or config state.
+One provider instance per account: the point of a second Anthropic account is
+that it has its own quota, so two must never share credentials, container
+names, or state. And whatever the account, its credential sits in a container
+reading a checkout the PR's author wrote — so most of what is pinned here is
+that the checkout cannot reach the credential or configure the CLI.
 """
 
 import contextlib
+import io
 import json
+import tarfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from docker.errors import ImageNotFound
+from src.config import ClaudeAccount, CredentialSource
 from src.job_store import JobStatus, ReviewJob
-from src.provider import ProviderUnavailable, SessionRef
-from src.providers import _agent_container as agent_container
-from src.providers._agent_container import PROMPT_PATH
-from src.providers.claude import ClaudeCredentialEnv, ClaudeReviewProvider, render_mcp_json
+from src.provider import ProviderUnavailable, ReviewLimitExceeded, SessionRef
+from src.providers._agent_container import INSTANCE_LABEL, PROMPT_PATH
+from src.providers.claude import DIFF_PATH, ClaudeReviewProvider, review_prompt
 
-from .test_provider_codex import profile
+TIMEOUT = 30 * 60
+IMAGE = "ordago-ci/claude-review:test"
+DIFF = "diff --git a/a.py b/a.py\n"
 
 
 def job(job_id: int = 3) -> ReviewJob:
@@ -38,194 +45,370 @@ def job(job_id: int = 3) -> ReviewJob:
     )
 
 
-def _provider(
-    tmp_path: Path,
-    raw: MagicMock,
-    account: str = "claude-work",
-    token: str = "sk-ant-oat01-x",
-    credential_env: ClaudeCredentialEnv = "CLAUDE_CODE_OAUTH_TOKEN",
-):
-    return ClaudeReviewProvider(
-        account=account,
-        credential_env=credential_env,
-        credential=token,
-        docker_client=raw,
-        projects_root=tmp_path / "projects",
-        router_url="http://claude-router:8000",
-        model="claude-opus-5",
+def _settings(auth: str = "subscription", env: str = "WORK_TOKEN") -> ClaudeAccount:
+    return ClaudeAccount(
+        kind="claude",
+        auth=auth,  # type: ignore[arg-type]
+        credential=CredentialSource(env=env),
+        model="claude-model",
+        max_budget_usd=3.0 if auth == "api_key" else None,
     )
 
 
-def _docker(container_name: str = "claude-review-3-claude-work") -> MagicMock:
+def _docker() -> MagicMock:
     raw = MagicMock()
-    image = MagicMock()
-    image.id = "sha256:image"
-    raw.images.get.return_value = image
+    raw.images.get.return_value = MagicMock(id="sha256:image")
     container = MagicMock()
-    container.name = container_name
     raw.containers.run.return_value = container
+    raw.containers.get.return_value = container
     return raw
 
 
-def test_starts_a_claude_review_container(tmp_path: Path) -> None:
-    raw = _docker()
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-
-    session = _provider(tmp_path, raw).start_review_session(job(), worktree, profile())
-
-    raw.images.get.assert_called_once_with("homelab/claude-code-homelab:latest")
-    assert session.container == "claude-review-3-claude-work"
-    env = raw.containers.run.call_args.kwargs["environment"]
-    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-x"
-    assert env["GITHUB_REPO"] == "alvaro/homelab"
-
-
-def test_review_container_cannot_post_to_github(tmp_path: Path) -> None:
-    """The worker is the sole poster.
-
-    The overlay's `gh` wrapper reads CLAUDE_ROLE — not AGENT_ROLE, which is
-    codex's name for it — so a copy-paste from the codex provider would hand
-    the model a write-capable token and every PR would get two reviews.
-    """
-    raw = _docker()
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-
-    _provider(tmp_path, raw).start_review_session(job(), worktree, profile())
-
-    env = raw.containers.run.call_args.kwargs["environment"]
-    assert env["CLAUDE_ROLE"] == agent_container.REVIEWER_GH_ROLE
-    assert env["CLAUDE_ROLE"] == "reviewer-readonly"
-
-
-def test_the_two_accounts_never_share_config_state(tmp_path: Path) -> None:
-    """Two subscriptions under one CLAUDE_CONFIG_DIR make the CLI reuse the
-    first account's cached credentials, which silently spends the wrong
-    window — the failover would then hit the same exhausted quota it fled."""
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-
-    dirs = []
-    for account in ("claude-work", "claude-personal"):
-        raw = _docker(f"claude-review-3-{account}")
-        _provider(tmp_path, raw, account=account).start_review_session(job(), worktree, profile())
-        volumes = raw.containers.run.call_args.kwargs["volumes"]
-        dirs.append(next(h for h, spec in volumes.items() if spec["bind"] == "/home/agent/.claude"))
-        assert raw.containers.run.call_args.kwargs["name"].endswith(account)
-
-    assert dirs[0] != dirs[1], "each account needs its own config dir"
-    assert "claude-work" in dirs[0] and "claude-personal" in dirs[1]
-
-
-def test_an_api_key_account_runs_on_the_key_alone(tmp_path: Path) -> None:
-    """Monthly API credits pay only for runs signed in with a Console key. An
-    OAuth token beside it could put the review on the plan instead, leaving the
-    credits to expire while the account still reads as `claude-api`."""
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    raw = _docker("claude-review-3-claude-api")
-
-    _provider(
-        tmp_path,
-        raw,
-        account="claude-api",
-        token="sk-ant-api03-x",
-        credential_env="ANTHROPIC_API_KEY",
-    ).start_review_session(job(), worktree, profile())
-
-    environment = raw.containers.run.call_args.kwargs["environment"]
-    assert environment["ANTHROPIC_API_KEY"] == "sk-ant-api03-x"
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in environment
-
-
-def test_a_plan_account_never_receives_an_api_key(tmp_path: Path) -> None:
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    raw = _docker()
-
-    _provider(tmp_path, raw).start_review_session(job(), worktree, profile())
-
-    environment = raw.containers.run.call_args.kwargs["environment"]
-    assert environment["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-x"
-    assert "ANTHROPIC_API_KEY" not in environment
-
-
-def test_spent_api_credits_are_an_outage(tmp_path: Path) -> None:
-    """The credits run out by design every month; that must move the chain on."""
-    payload = json.dumps(
-        {
-            "type": "result",
-            "is_error": True,
-            "result": "Credit balance is too low",
-        }
+def _provider(
+    tmp_path: Path,
+    raw: MagicMock | None = None,
+    *,
+    account: str = "claude-work",
+    settings: ClaudeAccount | None = None,
+    environ: dict[str, str] | None = None,
+) -> ClaudeReviewProvider:
+    worktrees = MagicMock()
+    worktrees.pr_diff.return_value = DIFF
+    return ClaudeReviewProvider(
+        account=account,
+        settings=settings or _settings(),
+        docker_client=raw if raw is not None else _docker(),
+        worktrees=worktrees,
+        projects_root=tmp_path / "projects",
+        image=IMAGE,
+        instance="test",
+        environ=environ if environ is not None else {"WORK_TOKEN": "sk-ant-oat01-x"},
     )
 
-    with pytest.raises(ProviderUnavailable) as caught:
-        _run(tmp_path, payload, exit_code=1)
 
-    assert caught.value.reason == "exhausted"
-
-
-def test_missing_token_is_an_outage_not_a_crash(tmp_path: Path) -> None:
-    """An unconfigured second account must fail over past, not fail the PR."""
+def _worktree(tmp_path: Path) -> Path:
     worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    provider = _provider(tmp_path, _docker(), account="claude-personal", token="")
-
-    with pytest.raises(ProviderUnavailable) as caught:
-        provider.start_review_session(job(), worktree, profile())
-
-    assert caught.value.reason == "auth"
-    assert caught.value.provider == "claude-personal"
+    worktree.mkdir(exist_ok=True)
+    return worktree
 
 
-def _run(tmp_path: Path, output: str, exit_code: int = 0):
+def _archived_files(container: MagicMock) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for call in container.put_archive.call_args_list:
+        target_dir, archive = call.args
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            for member in tar.getmembers():
+                extracted = tar.extractfile(member)
+                assert extracted is not None
+                files[f"{target_dir}/{member.name}"] = extracted.read().decode()
+    return files
+
+
+def _run(tmp_path: Path, output: str, exit_code: int = 0, provider=None):
     raw = _docker()
-    container = MagicMock()
-    container.exec_run.return_value = MagicMock(exit_code=exit_code, output=output.encode())
-    raw.containers.get.return_value = container
-    provider = _provider(tmp_path, raw)
+    raw.containers.get.return_value.exec_run.return_value = MagicMock(
+        exit_code=exit_code, output=output.encode()
+    )
+    provider = provider or _provider(tmp_path, raw)
     return provider.run_review(SessionRef(id="3", container="c", worktree=tmp_path), "p", 60)
 
 
-def test_parses_the_verdict_out_of_output_format_json(tmp_path: Path) -> None:
-    payload = json.dumps(
-        {
-            "type": "result",
-            "subtype": "success",
-            "is_error": False,
-            "result": "Looks fine.\n\nVERDICT: APPROVE",
-        }
+def _result(text: str = "", **fields: object) -> str:
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": text, **fields}
     )
 
-    result = _run(tmp_path, payload)
 
-    assert result.event == "APPROVE"
-    assert result.body == "Looks fine."
+# ── the container ──────────────────────────────────────────────────────────
 
 
-def test_a_missing_verdict_never_approves(tmp_path: Path) -> None:
-    payload = json.dumps({"type": "result", "is_error": False, "result": "Some prose."})
+def test_the_container_is_the_sandbox_and_the_checkout_is_read_only(tmp_path: Path) -> None:
+    raw = _docker()
+    worktree = _worktree(tmp_path)
 
-    assert _run(tmp_path, payload).event == "REQUEST_CHANGES"
+    session = _provider(tmp_path, raw).start_review_session(job(), worktree, TIMEOUT)
+
+    run = raw.containers.run.call_args.kwargs
+    assert session.container == "review-test-claude-work-3"
+    assert run["name"] == session.container
+    assert run["image"] == "sha256:image"
+    raw.images.get.assert_called_once_with(IMAGE)
+    # The checkout only, read-only: no clone .git, no config dir, nothing writable.
+    assert run["volumes"] == {str(worktree): {"bind": "/workspace", "mode": "ro"}}
+    assert run["working_dir"] == "/workspace"
+    assert run["user"] == "1000:1000"
+    assert run["cap_drop"] == ["ALL"]
+    assert run["security_opt"] == ["no-new-privileges"]
+    # Off this service's network: nothing there for the PR's code to reach.
+    assert run["network"] == "bridge"
+    assert run["labels"] == {INSTANCE_LABEL: "test"}
 
 
-def test_its_own_usage_limit_is_an_outage(tmp_path: Path) -> None:
-    """The fallback can be exhausted too — that must advance the chain to the
-    second account rather than fail the PR."""
-    payload = json.dumps(
-        {
-            "type": "result",
-            "is_error": True,
-            "result": "Claude AI usage limit reached|1788400000",
-        }
+def test_a_subscription_runs_on_its_oauth_token_alone(tmp_path: Path) -> None:
+    raw = _docker()
+    _provider(tmp_path, raw).start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    assert raw.containers.run.call_args.kwargs["environment"] == {
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"
+    }
+
+
+def test_an_api_key_account_runs_on_the_key_alone(tmp_path: Path) -> None:
+    """Both set, the CLI picks one by its own precedence and the wrong account pays."""
+    raw = _docker()
+    provider = _provider(
+        tmp_path,
+        raw,
+        account="claude-api",
+        settings=_settings("api_key", env="REVIEW_KEY"),
+        environ={"REVIEW_KEY": "sk-ant-api03-y", "WORK_TOKEN": "sk-ant-oat01-x"},
     )
+
+    provider.start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    assert raw.containers.run.call_args.kwargs["environment"] == {
+        "ANTHROPIC_API_KEY": "sk-ant-api03-y"
+    }
+
+
+def test_a_credential_can_be_read_from_a_file(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("sk-ant-api03-from-file\n")
+    raw = _docker()
+    settings = ClaudeAccount(
+        kind="claude",
+        auth="api_key",
+        credential=CredentialSource(file=str(key)),
+        model="m",
+        max_budget_usd=1,
+    )
+
+    _provider(tmp_path, raw, settings=settings).start_review_session(
+        job(), _worktree(tmp_path), TIMEOUT
+    )
+
+    environment = raw.containers.run.call_args.kwargs["environment"]
+    assert environment == {"ANTHROPIC_API_KEY": "sk-ant-api03-from-file"}
+
+
+@pytest.mark.parametrize("environ", [{}, {"WORK_TOKEN": "  "}])
+def test_a_missing_credential_is_an_outage_not_a_crash(
+    tmp_path: Path, environ: dict[str, str]
+) -> None:
+    """An unconfigured spare account must fail over past, not fail the PR."""
+    raw = _docker()
+    provider = _provider(tmp_path, raw, account="claude-personal", environ=environ)
 
     with pytest.raises(ProviderUnavailable) as caught:
+        provider.start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    assert (caught.value.provider, caught.value.reason) == ("claude-personal", "auth")
+    assert "WORK_TOKEN" in caught.value.detail
+    raw.containers.run.assert_not_called()
+
+
+def test_an_unbuilt_image_is_an_outage(tmp_path: Path) -> None:
+    raw = _docker()
+    raw.images.get.side_effect = ImageNotFound("no such image")
+
+    with pytest.raises(ProviderUnavailable) as caught:
+        _provider(tmp_path, raw).start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    assert caught.value.reason == "tooling"
+
+
+def test_the_two_accounts_never_share_a_container(tmp_path: Path) -> None:
+    raw = _docker()
+    environ = {"WORK_TOKEN": "a", "PERSONAL_TOKEN": "b"}
+    work = _provider(tmp_path, raw, environ=environ)
+    personal = _provider(
+        tmp_path,
+        raw,
+        account="claude-personal",
+        settings=_settings(env="PERSONAL_TOKEN"),
+        environ=environ,
+    )
+
+    names = {
+        work.start_review_session(job(), _worktree(tmp_path), TIMEOUT).container,
+        personal.start_review_session(job(), _worktree(tmp_path), TIMEOUT).container,
+    }
+
+    assert names == {"review-test-claude-work-3", "review-test-claude-personal-3"}
+
+
+def test_the_pr_diff_goes_into_the_container_where_the_prompt_says(tmp_path: Path) -> None:
+    raw = _docker()
+    provider = _provider(tmp_path, raw)
+
+    provider.start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    assert _archived_files(raw.containers.run.return_value)[DIFF_PATH] == DIFF
+    provider._worktrees.pr_diff.assert_called_once_with(  # type: ignore[attr-defined]
+        repo_dir=tmp_path / "projects" / "homelab" / "repo", base_sha="base", head_sha="head"
+    )
+    assert DIFF_PATH in review_prompt("the prompt")
+    assert review_prompt("the prompt").endswith("the prompt")
+
+
+def test_a_symlink_committed_by_the_pr_is_never_written_through(tmp_path: Path) -> None:
+    # Regression: the diff used to be written into the worktree, by a service running
+    # as root, at a path the PR could commit as a symlink to anywhere on the host.
+    victim = tmp_path / "victim"
+    victim.write_text("untouched")
+    worktree = _worktree(tmp_path)
+    for name in (Path(DIFF_PATH).name, ".pr-review.diff", ".claude"):
+        (worktree / name).symlink_to(victim)
+
+    _provider(tmp_path).start_review_session(job(), worktree, TIMEOUT)
+
+    assert victim.read_text() == "untouched"
+
+
+def test_a_failed_diff_copy_leaves_no_container_behind(tmp_path: Path) -> None:
+    raw = _docker()
+    container = raw.containers.run.return_value
+    container.put_archive.side_effect = RuntimeError("copy")
+
+    with pytest.raises(RuntimeError, match="copy"):
+        _provider(tmp_path, raw).start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    container.remove.assert_called_with(force=True)
+
+
+def test_no_diff_is_a_job_failure_not_an_outage(tmp_path: Path) -> None:
+    raw = _docker()
+    provider = _provider(tmp_path, raw)
+    provider._worktrees.pr_diff.return_value = None  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError) as caught:
+        provider.start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    assert not isinstance(caught.value, ProviderUnavailable)
+    raw.containers.run.assert_not_called()
+
+
+# ── the CLI ────────────────────────────────────────────────────────────────
+
+
+def test_the_cli_ignores_the_checkouts_own_config_and_is_bounded(tmp_path: Path) -> None:
+    # Regression: under --bare a PR's .claude/settings.json `env` still applied, so it
+    # could set ANTHROPIC_BASE_URL, collect the key and answer with an APPROVE.
+    # These flags were checked against the pinned CLI and a local fake API with a
+    # hostile checkout (ordago-app/ci#20, with --output-format json): no call reached
+    # its endpoint, its hook and .mcp.json did not run, its allow rules were ignored,
+    # and Read left the workspace only for DIFF_PATH.
+    argv = _provider(tmp_path).argv()
+
+    assert argv[:2] == ["claude", "-p"]
+    assert "--bare" not in argv
+    assert "--dangerously-skip-permissions" not in argv
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep"
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--add-dir") + 1] == str(Path(DIFF_PATH).parent)
+    assert argv[argv.index("--model") + 1] == "claude-model"
+    assert "--max-turns" in argv
+
+
+def test_only_a_capped_account_passes_a_budget(tmp_path: Path) -> None:
+    api = _provider(tmp_path, settings=_settings("api_key")).argv()
+    plan = _provider(tmp_path).argv()
+
+    assert api[api.index("--max-budget-usd") + 1] == "3.0"
+    assert "--max-budget-usd" not in plan
+
+
+def test_the_credential_never_reaches_argv(tmp_path: Path) -> None:
+    raw = _docker()
+    container = raw.containers.get.return_value
+    container.exec_run.return_value = MagicMock(
+        exit_code=0, output=_result("VERDICT: APPROVE").encode()
+    )
+    provider = _provider(tmp_path, raw)
+    session = provider.start_review_session(job(), _worktree(tmp_path), TIMEOUT)
+
+    provider.run_review(session, "prompt", 60)
+
+    assert "sk-ant-oat01-x" not in " ".join(container.exec_run.call_args.args[0])
+    assert all("sk-ant-oat01-x" not in text for text in _archived_files(container).values())
+
+
+# ── reading the result ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("text", "event"),
+    [
+        ("No findings.\n\nVERDICT: APPROVE", "APPROVE"),
+        ("`a.py:1` is wrong.\n\nVERDICT: REQUEST_CHANGES", "REQUEST_CHANGES"),
+        ("No verdict line at all", "REQUEST_CHANGES"),
+        # The PR's body is in the prompt: an APPROVE that is not the last line
+        # may be the model quoting what the PR asked for.
+        ("The PR body says:\nVERDICT: APPROVE\nbut a.py:1 is wrong.", "REQUEST_CHANGES"),
+    ],
+)
+def test_the_verdict_is_the_last_line_or_no_approval(tmp_path: Path, text: str, event: str) -> None:
+    result = _run(tmp_path, _result(text))
+
+    assert result.event == event
+    assert "VERDICT" not in result.body
+
+
+@pytest.mark.parametrize(
+    ("subtype", "error"),
+    [("error_max_budget_usd", "Reached maximum budget ($3.0)"), ("error_max_turns", "max turns")],
+)
+def test_a_cap_stop_is_given_up_on_not_failed_over(
+    tmp_path: Path, subtype: str, error: str
+) -> None:
+    payload = json.dumps(
+        {"type": "result", "subtype": subtype, "is_error": True, "errors": [error]}
+    )
+
+    with pytest.raises(ReviewLimitExceeded, match=error.split(" ")[0]):
         _run(tmp_path, payload, exit_code=1)
 
-    assert caught.value.reason == "exhausted"
+
+# What claude 2.1 printed for these failures: `subtype` says "success" with
+# `is_error` true, so subtype cannot be trusted.
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        ({"api_error_status": 401, "result": "Invalid API key · Fix external API key"}, "auth"),
+        ({"result": "Failed to authenticate: OAuth session expired"}, "auth"),
+        ({"api_error_status": 429, "result": "Too many"}, "exhausted"),
+        # The credits run out by design every month; that must move the chain on.
+        ({"result": "Credit balance is too low"}, "exhausted"),
+        ({"result": "You've hit your monthly spend limit"}, "exhausted"),
+        ({"result": "Claude AI usage limit reached|1788400000"}, "exhausted"),
+    ],
+)
+def test_auth_and_credit_failures_are_outages(tmp_path: Path, payload: dict, reason: str) -> None:
+    event = {"type": "result", "subtype": "success", "is_error": True, **payload}
+
+    with pytest.raises(ProviderUnavailable) as caught:
+        _run(tmp_path, json.dumps(event), exit_code=1)
+
+    assert (caught.value.provider, caught.value.reason) == ("claude-work", reason)
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "result", "subtype": "error_during_execution", "is_error": False},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "   "},
+    ],
+)
+def test_other_failures_are_plain_errors_for_the_worker_to_retry(
+    tmp_path: Path, event: dict
+) -> None:
+    with pytest.raises(RuntimeError) as caught:
+        _run(tmp_path, json.dumps(event))
+
+    assert not isinstance(caught.value, ProviderUnavailable)
 
 
 def test_a_non_json_failure_is_still_classified(tmp_path: Path) -> None:
@@ -237,145 +420,36 @@ def test_a_non_json_failure_is_still_classified(tmp_path: Path) -> None:
     assert caught.value.reason == "auth"
 
 
-def test_mcp_json_uses_the_transport_key_claude_actually_reads() -> None:
-    """`transport` instead of `type` yields a valid-looking config that claude
-    treats as having no servers — a reviewer that silently cannot see GitHub."""
-    body = json.loads(render_mcp_json(caller="claude-code-server-homelab", mcps={"github": ["ro"]}))
-
-    assert body["mcpServers"]["github"]["type"] == "http"
-    assert body["mcpServers"]["github"]["headers"]["X-MCP-Caller"] == "claude-code-server-homelab"
+def test_an_unclassified_non_json_failure_surfaces_its_output(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="DISTINCTIVE_MARKER_42"):
+        _run(tmp_path, "DISTINCTIVE_MARKER_42\n", exit_code=1)
 
 
 def test_a_review_body_quoting_a_quota_message_is_not_an_outage(tmp_path: Path) -> None:
-    """Same leak as the codex side: only error text may be classified.
-
-    Here `is_error` is false, so `result` holds the review itself — and a
-    review of a rate-limiting PR quotes the whole signature table.
-    """
-    payload = json.dumps(
-        {
-            "type": "result",
-            "is_error": False,
-            "result": "The diff handles 'You've hit your usage limit'.\n\nVERDICT: APPROVE",
-        }
-    )
+    """Only error text may be classified. Here `is_error` is false, so `result`
+    holds the review itself — and a review of a rate-limiting PR quotes the
+    whole signature table."""
+    body = _result("The diff handles 'You've hit your usage limit'.\n\nVERDICT: APPROVE")
 
     with pytest.raises(RuntimeError) as caught:
-        _run(tmp_path, payload, exit_code=1)
+        _run(tmp_path, body, exit_code=1)
 
     assert not isinstance(caught.value, ProviderUnavailable)
 
 
-def test_mcp_config_is_written_into_the_mounted_config_dir(tmp_path: Path) -> None:
-    """Rendered where the CLI is pointed at it, and never into the worktree.
-
-    claude does not auto-discover this path — run_review passes --mcp-config —
-    which is exactly what lets it live outside ground the PR controls.
-    """
+def test_cleanup_and_discard_remove_the_container(tmp_path: Path) -> None:
     raw = _docker()
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
+    provider = _provider(tmp_path, raw)
 
-    _provider(tmp_path, raw).start_review_session(job(), worktree, profile())
+    provider.cleanup(SessionRef(id="3", container="review-test-claude-work-3", worktree=tmp_path))
+    provider.discard(job())
 
-    volumes = raw.containers.run.call_args.kwargs["volumes"]
-    host_config = next(h for h, spec in volumes.items() if spec["bind"] == "/home/agent/.claude")
-    written = Path(host_config) / ".mcp.json"
-    assert written.is_file()
-    assert json.loads(written.read_text())["mcpServers"]
-    assert not (worktree / ".claude").exists(), "nothing may be written into the PR's worktree"
+    assert raw.containers.get.call_args_list[-1].args == ("review-test-claude-work-3",)
+    assert raw.containers.get.return_value.remove.call_count == 2
 
 
-def test_a_hostile_dot_claude_in_the_worktree_cannot_be_written_through(
-    tmp_path: Path,
-) -> None:
-    """The worktree is a checkout of the PR head and this service runs as root
-    outside the container. A branch committing `.claude` as a symlink used to
-    get this write to land wherever the link pointed."""
-    raw = _docker()
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    target = tmp_path / "elsewhere"
-    target.mkdir()
-    (worktree / ".claude").symlink_to(target)
+# ── quota ──────────────────────────────────────────────────────────────────
 
-    _provider(tmp_path, raw).start_review_session(job(), worktree, profile())
-
-    assert not (target / ".mcp.json").exists(), "must not write through a branch-supplied symlink"
-
-
-def test_a_dot_claude_file_in_the_worktree_does_not_break_the_review(
-    tmp_path: Path,
-) -> None:
-    """Committed as a regular file it used to raise FileExistsError, which is
-    not ProviderUnavailable — so the job failed without failing over, turning a
-    hostile (or merely odd) branch into a red required check."""
-    raw = _docker()
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    (worktree / ".claude").write_text("not a directory")
-
-    session = _provider(tmp_path, raw).start_review_session(job(), worktree, profile())
-
-    assert session.container.endswith("claude-work")
-
-
-def test_the_cli_is_locked_to_that_one_config(tmp_path: Path) -> None:
-    """--strict-mcp-config, because the reviewer runs inside the PR's own
-    worktree with --dangerously-skip-permissions: without it, an .mcp.json
-    shipped by the branch under review would be honoured."""
-    raw = _docker()
-    container = MagicMock()
-    ok = {"type": "result", "is_error": False, "result": "VERDICT: APPROVE"}
-    container.exec_run.return_value = MagicMock(exit_code=0, output=json.dumps(ok).encode())
-    raw.containers.get.return_value = container
-
-    _provider(tmp_path, raw).run_review(
-        SessionRef(id="3", container="c", worktree=tmp_path), "p", 60
-    )
-
-    cmd = container.exec_run.call_args.args[0]
-    assert "--mcp-config" in cmd
-    assert cmd[cmd.index("--mcp-config") + 1] == "/home/agent/.claude/.mcp.json"
-    assert "--strict-mcp-config" in cmd
-
-
-def test_the_branch_under_review_brings_no_settings_or_hooks(tmp_path: Path) -> None:
-    """Project settings come from the PR's worktree. Their hooks would run next to
-    the OAuth token, and ordago's SessionStart hook added ~20k characters that
-    every later turn re-read (measured 2026-10-20)."""
-    raw = _docker()
-    container = MagicMock()
-    ok = {"type": "result", "is_error": False, "result": "VERDICT: APPROVE"}
-    container.exec_run.return_value = MagicMock(exit_code=0, output=json.dumps(ok).encode())
-    raw.containers.get.return_value = container
-
-    _provider(tmp_path, raw).run_review(
-        SessionRef(id="3", container="c", worktree=tmp_path), "p", 60
-    )
-
-    cmd = container.exec_run.call_args.args[0]
-    assert cmd[cmd.index("--setting-sources") + 1] == "user"
-
-
-def test_git_works_in_the_container_but_cannot_write_the_clone(tmp_path: Path) -> None:
-    raw = _docker()
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-
-    _provider(tmp_path, raw).start_review_session(job(), worktree, profile())
-
-    git_dir = str(tmp_path / "projects" / "homelab" / "repo" / ".git")
-    volumes = raw.containers.run.call_args.kwargs["volumes"]
-    assert volumes[git_dir] == {"bind": git_dir, "mode": "ro"}
-
-
-# ── quota capture ─────────────────────────────────────────────────────────────
-# The two payloads below are verbatim `rate_limit_info` objects read off the two
-# live subscriptions on 2026-09-04, and they are recorded rather than invented
-# because their *difference* is the whole design constraint: at the same moment
-# one account reported an `overage` limit with a number, and the other a
-# `five_hour` limit with no number at all.
 
 WORK_EVENT = {
     "type": "rate_limit_event",
@@ -399,7 +473,12 @@ PERSONAL_EVENT = {
         "isUsingOverage": False,
     },
 }
-RESULT_EVENT = {"type": "result", "is_error": False, "result": "VERDICT: APPROVE"}
+RESULT_EVENT = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": "VERDICT: APPROVE",
+}
 
 
 def _stream(*events: dict) -> str:
@@ -554,13 +633,9 @@ def test_a_real_outage_on_plain_stderr_is_still_classified_through_the_stream(
 def test_a_large_prompt_reaches_claude_on_stdin_not_argv(tmp_path: Path) -> None:
     """Regression: the prompt embeds the whole diff, and as one argv element it
     failed every PR past the kernel's 128 KiB single-argument cap."""
-    import io
-    import tarfile
-
     raw = _docker()
     container = MagicMock()
-    ok = {"type": "result", "is_error": False, "result": "VERDICT: APPROVE"}
-    container.exec_run.return_value = MagicMock(exit_code=0, output=json.dumps(ok).encode())
+    container.exec_run.return_value = MagicMock(exit_code=0, output=_stream(RESULT_EVENT).encode())
     raw.containers.get.return_value = container
     prompt = "x" * 300_000
 
@@ -572,8 +647,4 @@ def test_a_large_prompt_reaches_claude_on_stdin_not_argv(tmp_path: Path) -> None
     assert all(len(arg) < 1_000 for arg in cmd)
     assert cmd[:5] == ["sh", "-c", f'exec "$@" < {PROMPT_PATH}', "sh", "claude"]
     assert cmd[5] == "-p"
-    _, archive = container.put_archive.call_args.args
-    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        extracted = tar.extractfile(Path(PROMPT_PATH).name)
-        assert extracted is not None
-        assert extracted.read().decode("utf-8") == prompt
+    assert _archived_files(container)[PROMPT_PATH] == review_prompt(prompt)
