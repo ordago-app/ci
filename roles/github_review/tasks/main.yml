@@ -87,6 +87,21 @@
       GITHUB_REVIEW_RUN_AS_UID={{ ansible_facts.getent_passwd[github_review_owner][1] }}
       GITHUB_REVIEW_RUN_AS_GID={{ ansible_facts.getent_passwd[github_review_owner][2] }}
 
+- name: Every env credential can be single-quoted in the env file
+  ansible.builtin.assert:
+    that:
+      - item.key is match('^[A-Za-z_][A-Za-z0-9_]*$')
+      - "\"'\" not in (item.value | string)"
+      - "'\\n' not in (item.value | string)"
+    fail_msg: >-
+      github_review_secrets.{{ item.key }} must be a shell-style name whose value
+      has no single quote and no newline: it is written single-quoted to
+      secrets.env, and either would end the value early or start a new variable.
+  loop: "{{ github_review_secrets | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true
+
 - name: Credentials named by env are in the service's env file
   ansible.builtin.copy:
     dest: "{{ github_review_root }}/app/secrets.env"
@@ -95,7 +110,7 @@
     mode: "0600"
     content: |
       {% for name, value in github_review_secrets | dictsort %}
-      {{ name }}={{ value }}
+      {{ name }}='{{ value }}'
       {% endfor %}
   no_log: true
 

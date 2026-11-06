@@ -101,3 +101,27 @@ def test_the_network_compose_joins_exists_before_compose_runs() -> None:
     assert (
         tasks[network]["community.docker.docker_network"]["name"] == "{{ github_review_network }}"
     )
+
+
+def test_env_credentials_are_quoted_and_cannot_break_out_of_the_quotes() -> None:
+    """Unquoted, a value with a space or `#` is cut short by Compose; quoted, a
+    value holding the quote or a newline would end it and start a new variable.
+    So the values are single-quoted, and the role refuses the two characters
+    that could escape that."""
+    tasks = _tasks()
+    render = next(
+        t
+        for t in tasks
+        if str(t.get("ansible.builtin.copy", {}).get("dest", "")).endswith("/secrets.env")
+    )
+    assert "{{ name }}='{{ value }}'" in render["ansible.builtin.copy"]["content"]
+
+    guard = next(
+        t
+        for t in tasks
+        if "ansible.builtin.assert" in t and "github_review_secrets" in str(t.get("loop", ""))
+    )
+    assert tasks.index(guard) < tasks.index(render), "the guard must run before the render"
+    assert guard.get("no_log") is True
+    checks = " ".join(guard["ansible.builtin.assert"]["that"])
+    assert '"\'"' in checks and "'\\n'" in checks
