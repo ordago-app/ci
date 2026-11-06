@@ -96,17 +96,23 @@ form the compose file uses.
 | `github_review_network` | no | Docker network `/status` and `/heads` are served on (default `github-review-<instance>`, created if absent) |
 | `github_review_secrets` | no | `{VAR: value}` for credentials the config names by `env:` (rendered 0600, never logged) |
 | `github_review_secret_files` | no | `{filename: content}` for credentials named by `file:`; seen at `/run/secrets/github-review/<filename>` |
+| `github_review_codex_seeds` | no | `{account: auth.json content}`: a codex account's first login, written only while it has none (below) |
 
 The role builds the service and both sandbox images (`claude-review/`,
 `codex-review/`) from this repo, tagged per instance, so an instance needs no
 image from anywhere else. Nothing is pulled from the operator's other services.
 
-A **codex login** is the one credential the role does not place: the service
-refreshes it in place (its refresh token is single-use), so redeploying would
-roll it back. Run `codex login` once, copy the resulting `auth.json` to
-`<github_review_root>/state/codex/<account>/auth.json` (root-owned, 0600), and
-point the account at `/var/lib/github-review/codex/<account>/auth.json`. Never
-give two instances, or any other process that refreshes, the same login.
+A **codex login** is the one credential the role never overwrites: the service
+refreshes it in place (its refresh token is single-use), so redeploying it would
+roll it back. Make a login used by nothing else — `CODEX_HOME=$(mktemp -d) codex
+login --device-auth`, so it is not your own CLI's session — and either pass that
+`auth.json` as `github_review_codex_seeds.<account>` (written once, only while
+the account has no login on the host) or copy it to
+`<github_review_root>/state/codex/<account>/auth.json` (root-owned, 0600). Point
+the account at `/var/lib/github-review/codex/<account>/auth.json`. Never give two
+instances, or any other process that refreshes, the same login. A seed is spent
+once the service first refreshes it; to replace a broken login, delete the
+host's file and seed a fresh one.
 
 ### Config (`agent-review.yml`)
 

@@ -29,3 +29,9 @@ github_review_secrets: {}
 # /run/secrets/github-review/<filename>. A codex login does NOT go here: the
 # service rewrites it, so it lives in the state dir (README.md).
 github_review_secret_files: {}
+
+# First codex logins, as {account: auth.json content}. Each is written to the
+# state dir ONLY when that account has no login there yet: the service refreshes
+# it in place and its refresh token is single-use, so overwriting a live login
+# with this (by then spent) copy would log the account out.
+github_review_codex_seeds: {}

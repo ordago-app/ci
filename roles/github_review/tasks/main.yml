@@ -124,6 +124,28 @@
   loop: "{{ github_review_secret_files | dict2items }}"
   no_log: true
 
+- name: Each seeded codex account has a login dir
+  ansible.builtin.file:
+    path: "{{ github_review_root }}/state/codex/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop: "{{ github_review_codex_seeds.keys() | list }}"
+
+- name: A codex account with no login yet gets its seed, and a live one is left alone
+  ansible.builtin.copy:
+    dest: "{{ github_review_root }}/state/codex/{{ item.key }}/auth.json"
+    content: "{{ item.value }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+  loop: "{{ github_review_codex_seeds | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true
+
 - name: The network /status and /heads are served on exists
   community.docker.docker_network:
     name: "{{ github_review_network }}"
