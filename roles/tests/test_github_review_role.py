@@ -125,3 +125,19 @@ def test_env_credentials_are_quoted_and_cannot_break_out_of_the_quotes() -> None
     assert guard.get("no_log") is True
     checks = " ".join(guard["ansible.builtin.assert"]["that"])
     assert '"\'"' in checks and "'\\n'" in checks
+
+
+def test_a_changed_config_or_credential_recreates_the_service() -> None:
+    """agent-review.yml is a single-file bind mount that copy replaces, so a
+    container left running keeps the old file: a config-only deploy reported
+    success and the service ran the previous chain."""
+    tasks = {t["name"]: t for t in _tasks()}
+    registered = {
+        tasks["This instance's config is in place"]["register"],
+        tasks["Credentials named by env are in the service's env file"]["register"],
+        tasks["Credentials named by file are in the secrets dir"]["register"],
+    }
+    recreate = tasks["github-review stack up"]["community.docker.docker_compose_v2"]["recreate"]
+    assert "always" in recreate
+    for name in registered:
+        assert f"{name} is changed" in recreate, f"{name} does not force a recreate"
