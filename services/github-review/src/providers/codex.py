@@ -1,197 +1,250 @@
+"""A review on one ChatGPT login, with the codex CLI, in the codex-review container.
+
+Codex runs a shell inside its container (`--dangerously-bypass-approvals-and-
+sandbox`: the container is the sandbox), so unlike the Claude provider it can
+run `git` against the checkout. That is also why its container gets no more
+than it needs: the sandbox `sandbox_run_kwargs` describes, the checkout and
+the clone's `.git` read-only, and a session copy of the login with no refresh
+token in it (codex_auth.py).
+"""
+
 from __future__ import annotations
 
 import json
-import os
-import re
-import shlex
+import shutil
 import sys
+import threading
 from pathlib import Path
 
 from docker import DockerClient
+from docker.errors import ImageNotFound
 
-from ..config import ToolProfile
+from ..config import CodexAccount
 from ..job_store import ReviewJob
-from ..provider import ProviderUnavailableError, ReviewResult, SessionRef, parse_verdict
-from .container import (
-    PROMPT_PATH,
-    copy_text_file,
+from ..provider import (
+    ProviderUnavailable,
+    ReviewResult,
+    SessionRef,
+    classify_unavailable,
+    parse_verdict,
+)
+from ._agent_container import (
+    container_name,
+    diagnostic_lines,
     exec_with_deadline,
-    remove_existing,
-    remove_quietly,
+    make_agent_writable,
+    prompt_on_stdin,
+    remove_container,
+    remove_container_strict,
+    repo_git_volume,
+    run_session_container,
+    sandbox_run_kwargs,
 )
+from .codex_auth import CodexAuthOwner
 
-# The codex-code agent image runs as this non-root user; the worktree and
-# CODEX_HOME it mounts must be owned by it or codex can't write (os error 13).
-AGENT_UID = 1000
-AGENT_GID = 1000
+# Headroom past the review's own runtime limit: the CLI refreshes once the token is
+# within five minutes of expiry, and a session cannot refresh.
+_AUTH_MARGIN_SECONDS = 10 * 60
 
-# The worker is the sole poster. The review container must NOT get a
-# write-capable github role, or the model posts its own review via `gh` and
-# every PR ends up with duplicate reviews. claude-router does not configure
-# this role, so the gh shim / credential helper run unauthenticated (codex
-# reads code from the local worktree and the github MCP, never `gh` writes).
-CODEX_GH_ROLE = "reviewer-readonly"
-
-# Retrying cannot fix any of these. The long usage cap resets days out, and the
-# models-API failure is a CLI the vendor has moved past until its pin is bumped.
-_UNAVAILABLE_RE = re.compile(
-    r"usage limit|rate limit|out of (extra )?usage|quota|failed to refresh available models",
-    re.IGNORECASE,
-)
+# Where the session's CODEX_HOME is mounted in the container. Not under the
+# image user's home, so the mount does not depend on how the image names it.
+CODEX_HOME = "/codex-home"
 
 
-def render_codex_config(*, caller: str, mcps: dict[str, list[str]], model: str) -> str:
-    lines = [f'model = "{model}"', ""]
-    for mcp_name, caps in mcps.items():
-        for cap in caps:
-            key = mcp_name if len(caps) == 1 else f"{mcp_name}-{cap}"
-            lines.extend(
-                [
-                    f"[mcp_servers.{key}]",
-                    f'url = "http://mcp-gateway:8000/mcp/{mcp_name}/{cap}/mcp"',
-                    f'http_headers = {{ "X-MCP-Caller" = "codex-code-server-{caller}" }}',
-                    "",
-                ]
-            )
-    return "\n".join(lines)
+def render_codex_config(*, model: str) -> str:
+    # Empty model = unpinned: emit no `model =` key so the codex CLI uses
+    # whatever the ChatGPT subscription currently serves. Pinning an explicit
+    # id broke twice when OpenAI rotated the allowlist.
+    return f'model = "{model}"\n' if model else ""
 
 
 class CodexReviewProvider:
     def __init__(
         self,
         *,
+        account: str,
+        settings: CodexAccount,
         docker_client: DockerClient,
         projects_root: Path,
-        codex_state_root: Path,
-        router_url: str,
-        model: str,
+        image: str,
+        instance: str,
+        auth: CodexAuthOwner | None = None,
     ) -> None:
+        self._account = account
+        self._settings = settings
         self._docker = docker_client
         self._projects_root = projects_root
-        self._codex_state_root = codex_state_root
-        self._router_url = router_url
-        self._model = model
+        self._image = image
+        self._instance = instance
+        assert settings.credential.file is not None
+        self._auth = auth or CodexAuthOwner(Path(settings.credential.file), account)
+        # Container name -> its session directory, deleted with the session.
+        self._sessions: dict[str, Path] = {}
+        self._sessions_lock = threading.Lock()
+
+    @property
+    def account(self) -> str:
+        return self._account
+
+    def start_auth_keeper(self, stop: threading.Event) -> None:
+        threading.Thread(
+            target=self._auth.keep_fresh,
+            args=(stop,),
+            name=f"codex-auth-keeper-{self._account}",
+            daemon=True,
+        ).start()
 
     def start_review_session(
-        self, job: ReviewJob, worktree: Path, profile: ToolProfile
+        self, job: ReviewJob, worktree: Path, timeout_seconds: int
     ) -> SessionRef:
-        auth = self._codex_state_root / "auth.json"
-        if not auth.exists():
-            raise ProviderUnavailableError(
-                "Codex auth is not onboarded; run `make codex-onboard host=<host>`"
-            )
-
-        image = self._docker.images.get(f"homelab/codex-code-{job.project}:latest")
-        codex_home = self._projects_root / job.project / "review-sessions" / str(job.id)
-        codex_home.mkdir(parents=True, exist_ok=True)
-        (codex_home / "config.toml").write_text(
-            render_codex_config(caller=job.project, mcps=profile.mcps, model=self._model)
-        )
-        auth_link = codex_home / "auth.json"
-        if auth_link.exists() or auth_link.is_symlink():
-            auth_link.unlink()
-        auth_link.symlink_to(auth)
-
-        # github-review runs as root; the codex container runs as `agent`
-        # (uid 1000). Hand both mounts to that uid so codex can write.
-        self._make_agent_writable(worktree, codex_home)
-
-        # `containers.run` is create-then-start. On a loaded host the start can time
-        # out after the container exists, and this raises before the worker has a
-        # session to clean up -- every retry of the job then died on the name
-        # (docs/incidents/2026-10-20-review-container-name-conflict.md). So clear
-        # the name first (safe: a job is claimed by exactly one worker, this one)
-        # and remove the container if create or start raises.
-        name = f"codex-review-{job.id}"
-        remove_existing(self._docker, name)
         try:
-            container = self._start_container(job, image.id, name, worktree, codex_home)
+            image = self._docker.images.get(self._image)
+        except ImageNotFound as exc:
+            raise ProviderUnavailable(
+                self._account, "tooling", f"image {self._image} is not built"
+            ) from exc
+        name = self._container_name(job)
+        session_dir = self._session_dir(job)
+        with self._sessions_lock:
+            self._sessions[name] = session_dir
+        try:
+            codex_home = session_dir / "home"
+            codex_home.mkdir(parents=True, exist_ok=True)
+            (codex_home / "config.toml").write_text(render_codex_config(model=self._settings.model))
+            # Mounted read-only over the rw home below: the session reads its
+            # login and can never write one. See codex_auth.py.
+            session_auth = session_dir / "auth.json"
+            self._auth.write_session_copy(session_auth, timeout_seconds + _AUTH_MARGIN_SECONDS)
+            # github-review runs as root; the codex container as uid 1000.
+            make_agent_writable(codex_home, session_auth)
+            run = sandbox_run_kwargs(
+                instance=self._instance,
+                image_id=image.id,
+                worktree=worktree,
+                environment={"CODEX_HOME": CODEX_HOME},
+            )
+            run["volumes"].update(
+                {
+                    str(codex_home): {"bind": CODEX_HOME, "mode": "rw"},
+                    str(session_auth): {"bind": f"{CODEX_HOME}/auth.json", "mode": "ro"},
+                    **repo_git_volume(self._projects_root, job.project),
+                }
+            )
+            run_session_container(self._docker, name, **run)
         except BaseException:
-            remove_quietly(self._docker, name)
+            self._forget_session(name)
             raise
-        return SessionRef(id=str(job.id), container=container.name, worktree=worktree)
-
-    def _start_container(
-        self, job: ReviewJob, image_id: str, name: str, worktree: Path, codex_home: Path
-    ):
-        return self._docker.containers.run(
-            image=image_id,
-            name=name,
-            command=["sleep", "infinity"],
-            detach=True,
-            network="homelab",
-            environment={
-                "SESSION_ID": f"review-{job.id}",
-                "ROUTER_INTERNAL_URL": self._router_url,
-                "AGENT_ROLE": CODEX_GH_ROLE,
-                # The reviewed repo, so the container's gh/git wrappers can ask
-                # the router for a token from the right App installation. A
-                # review container is scoped to one repo, unlike this service.
-                "GITHUB_REPO": job.repo,
-                "CODEX_HOME": "/home/agent/.codex",
-            },
-            volumes={
-                str(worktree): {"bind": "/workspace", "mode": "rw"},
-                str(codex_home): {"bind": "/home/agent/.codex", "mode": "rw"},
-                str(self._codex_state_root): {"bind": str(self._codex_state_root), "mode": "rw"},
-            },
-        )
+        return SessionRef(id=str(job.id), container=name, worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
         container = self._docker.containers.get(session.container)
-        copy_text_file(container, PROMPT_PATH, prompt)
-        codex = "codex exec --json --dangerously-bypass-approvals-and-sandbox -"
+        cmd = prompt_on_stdin(
+            container,
+            prompt,
+            ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "-"],
+        )
         result = exec_with_deadline(
             container,
-            ["sh", "-c", f"{codex} < {shlex.quote(PROMPT_PATH)}"],
+            cmd,
             timeout_seconds=timeout_seconds,
             on_timeout=lambda: self.cleanup(session),
-            label="codex",
+            label=self._account,
             stdout=True,
             stderr=True,
         )
         output = result.output.decode("utf-8", errors="replace")
-        if result.exit_code != 0:
-            reported = _reported_by_codex(output)
-            if _UNAVAILABLE_RE.search(reported):
-                raise ProviderUnavailableError(reported)
-            raise RuntimeError(f"codex review failed: {output.strip()}")
+        failure = self._failure_text(output)
+
+        # What the classifier is allowed to see, and nothing more. The
+        # transcript carries the model's own prose and the diff it read, and a
+        # PR about rate limiting says "usage limit" all over itself — feeding
+        # that to the classifier invents outages out of ordinary failures and
+        # spends the fallback account on them.
+        #
+        # Structured error events plus the CLI's own non-JSON diagnostics: a
+        # transcript only ever travels inside JSON, so everything outside it is
+        # diagnostics by construction. Narrowing to "structured events only"
+        # would close the leak but drop a real outage that arrives on stderr
+        # after the stream has already started, which is the failure class this
+        # whole chain exists for.
+        probe = "\n".join(x for x in (failure, diagnostic_lines(output, prompt)) if x)
+
+        # Gated on an actual failure signal. `exec_run` folds stderr into this
+        # same blob, so a perfectly good run routinely carries non-JSON tracing
+        # lines — and classifying those discards a completed review, records a
+        # sticky outage, spends the fallback account re-reviewing the same PR,
+        # and stamps the PR with "codex could not run" when codex just did.
+        # claude.py gates on `errored` for the same reason.
+        if probe and (failure or result.exit_code != 0):
+            reason = classify_unavailable(probe)
+            if reason is not None:
+                raise ProviderUnavailable(self._account, reason, probe.strip()[-800:])
+
+        # `failure` with no recognised signature is still a failed turn — codex
+        # said so itself. Whatever trailing agent_message it left is a partial
+        # answer or a refusal, and posting it puts a finding on the PR that
+        # nobody wrote (docs/incidents/2026-08-09-phantom-review-verdicts.md). A
+        # clean exit code does not redeem it.
+        if failure or result.exit_code != 0:
+            raise RuntimeError(f"{self._account} review failed: {output.strip()[-1500:]}")
+
         return parse_verdict(self._extract_review_body(output))
 
-    def cleanup(self, session: SessionRef) -> None:
-        remove_quietly(self._docker, session.container)
+    def _failure_text(self, output: str) -> str:
+        """Error text from a run that exited 0 anyway, or "".
 
-    def _make_agent_writable(self, *paths: Path) -> None:
-        for path in paths:
-            if not path.exists() and not path.is_symlink():
+        The exit code is not the only failure channel: codex can emit an
+        `error` / `turn.failed` event and still exit clean, in which case the
+        final agent_message — if any — is a refusal rather than a review, and
+        posting it would put a phantom finding on the PR. See
+        docs/incidents/2026-08-09-phantom-review-verdicts.md.
+        """
+        messages: list[str] = []
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            if path.is_dir() and not path.is_symlink():
-                for child in path.rglob("*"):
-                    self._chown_for_agent(child)
-            self._chown_for_agent(path)
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "error":
+                messages.append(str(event.get("message") or ""))
+            elif event.get("type") == "turn.failed":
+                messages.append(str((event.get("error") or {}).get("message") or ""))
+        return "\n".join(m for m in messages if m)
 
-    def _chown_for_agent(self, path: Path) -> None:
-        try:
-            if path.is_symlink():
-                os.lchown(path, AGENT_UID, AGENT_GID)
-            else:
-                os.chown(path, AGENT_UID, AGENT_GID)
-        except PermissionError:
-            # When running unprivileged (tests/local) the chown is a no-op; in
-            # the container github-review is root, so a failure there is real.
-            if os.geteuid() == 0:
-                raise
+    def cleanup(self, session: SessionRef) -> None:
+        remove_container(self._docker, session.container)
+        self._forget_session(session.container)
+
+    def discard(self, job: ReviewJob) -> None:
+        remove_container_strict(self._docker, self._container_name(job))
+        shutil.rmtree(self._session_dir(job), ignore_errors=True)
+
+    def _session_dir(self, job: ReviewJob) -> Path:
+        return self._projects_root / job.project / "review-sessions" / str(job.id) / self._account
+
+    def _forget_session(self, container: str) -> None:
+        """Delete the session's directory, and the login copy in it."""
+        with self._sessions_lock:
+            path = self._sessions.pop(container, None)
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _container_name(self, job: ReviewJob) -> str:
+        return container_name(self._instance, self._account, job.id)
 
     def _extract_review_body(self, output: str) -> str:
         # codex `exec --json` emits JSONL events; the review is the final
         # agent_message: {"type":"item.completed","item":{"type":
-        # "agent_message","text":...}}. (Same schema the telegram codex backend
-        # consumes.) Keep the last non-empty agent_message as the review.
+        # "agent_message","text":...}}. Keep the last non-empty one.
         last_text = ""
         for line in output.splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
                 continue
             item = event.get("item") or {}
             if event.get("type") == "item.completed" and item.get("type") == "agent_message":
@@ -203,32 +256,10 @@ class CodexReviewProvider:
             # Dump the full transcript to the container log and surface a tail in
             # the error so "no review body" is diagnosable instead of opaque.
             print(
-                f"[github-review] codex emitted no agent_message; raw output:\n{output}",
+                f"[github-review] {self._account} emitted no agent_message; raw output:\n{output}",
                 file=sys.stderr,
                 flush=True,
             )
             tail = output.strip()[-1500:] or "<empty>"
-            raise RuntimeError(f"codex produced no review body; raw tail: {tail}")
+            raise RuntimeError(f"{self._account} produced no review body; raw tail: {tail}")
         return body
-
-
-def _reported_by_codex(output: str) -> str:
-    """What codex itself said went wrong. `item.*` events carry what the session read
-    and ran (a review reads code, and code talks about usage limits), and lifecycle
-    events like `thread.started` say nothing, so only error messages and plain text
-    lines count."""
-    reported: list[str] = []
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            reported.append(line)
-            continue
-        if not isinstance(event, dict) or str(event.get("type", "")).startswith("item."):
-            continue
-        error = event.get("error")
-        message = error.get("message") if isinstance(error, dict) else error
-        message = message or event.get("message")
-        if message:
-            reported.append(str(message))
-    return "\n".join(reported).strip()

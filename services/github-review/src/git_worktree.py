@@ -4,8 +4,20 @@ import hashlib
 import os
 import shutil
 import subprocess
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from .github_app import TokenSource
+
+# On every git command the service runs. A PR can commit a symlink to any path —
+# `/proc/self/environ` of whatever reads it, a key file on the host — and a
+# review container reading the worktree would follow it. Checked out as plain
+# files holding the link target, a symlink still reads as what it is in the
+# review, and points nowhere.
+_HARDENING = ("-c", "core.symlinks=false")
 
 
 class GitWorktreeError(RuntimeError):
@@ -19,8 +31,13 @@ class GitWorktreeManager:
         projects_root: Path,
         run_as_uid: int | None = None,
         run_as_gid: int | None = None,
+        tokens: TokenSource | None = None,
+        remote_url: str = "https://github.com/{repo}.git",
     ) -> None:
         self._projects_root = projects_root
+        # Credentials for fetching from GitHub. None in tests, whose clones are local.
+        self._tokens = tokens
+        self._remote_url = remote_url
         # When set (in production the container runs as root), git subprocesses
         # drop to this uid/gid so objects written into the shared clone are
         # owned by the operator (uid 1000), not root. Root-owned objects would
@@ -29,15 +46,56 @@ class GitWorktreeManager:
         # setuid.
         self._run_as_uid = run_as_uid
         self._run_as_gid = run_as_gid
+        # One lock per clone. Concurrent reviews of one repo collide on git's
+        # own lock files, and a `worktree prune` drops another job's half-made
+        # worktree, so fetching, preparing and removing a worktree each hold
+        # it. Reading a commit or a diff does not, and neither does the review.
+        self._locks: dict[Path, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
-    def fetch(self, repo_dir: Path) -> None:
-        self._run(self._git(repo_dir, "fetch", "--all", "--prune"))
+    @contextmanager
+    def _repo_lock(self, repo_dir: Path) -> Iterator[None]:
+        with self._locks_guard:
+            lock = self._locks.setdefault(repo_dir.resolve(), threading.Lock())
+        with lock:
+            yield
+
+    def fetch(self, repo_dir: Path, repo: str) -> None:
+        with self._repo_lock(repo_dir):
+            self._fetch(repo_dir, repo)
+
+    def _fetch(self, repo_dir: Path, repo: str) -> None:
+        """Fetch `repo` into its clone, cloning it first if this instance has none.
+
+        The service owns its clones: an instance on a fresh host starts with an
+        empty data directory, and nobody else is there to clone for it. No
+        checkout: reviews read worktrees, never the clone's own tree."""
+        if not (repo_dir / ".git").exists():
+            repo_dir.parent.mkdir(parents=True, exist_ok=True)
+            self._chown_to_operator(repo_dir.parent)
+            self._run(
+                [
+                    "git",
+                    *_HARDENING,
+                    "clone",
+                    "--no-checkout",
+                    self._remote_url.format(repo=repo),
+                    str(repo_dir),
+                ],
+                repo=repo,
+            )
+        self._run(self._git(repo_dir, "fetch", "--all", "--prune"), repo=repo)
 
     def prepare(
-        self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str, fetch: bool = True
+        self, *, repo_dir: Path, repo: str, project: str, pr_number: int, head_sha: str
     ) -> Path:
-        if fetch:
-            self.fetch(repo_dir)
+        with self._repo_lock(repo_dir):
+            return self._prepare(repo_dir, repo, project, pr_number, head_sha)
+
+    def _prepare(
+        self, repo_dir: Path, repo: str, project: str, pr_number: int, head_sha: str
+    ) -> Path:
+        self._fetch(repo_dir, repo)
         present = subprocess.run(
             self._git(repo_dir, "cat-file", "-e", f"{head_sha}^{{commit}}"),
             **self._subprocess_kwargs(),
@@ -95,43 +153,72 @@ class GitWorktreeManager:
             return None
         return hashlib.sha256(raw.stdout.encode()).hexdigest()
 
-    def pr_diff(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str:
-        """What `head_sha` changes since its merge base with `base_sha`, as a patch.
-
-        A PR can touch files that are not UTF-8, and that must not stop it being read."""
+    def pr_diff(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
+        """What `head_sha` changes relative to its merge-base with `base_sha`: the diff
+        GitHub shows on the PR. None when either commit is gone or git fails."""
         kwargs = self._subprocess_kwargs()
         merge_base = subprocess.run(self._git(repo_dir, "merge-base", base_sha, head_sha), **kwargs)
         if merge_base.returncode != 0:
-            raise GitWorktreeError(
-                f"no merge base for {base_sha} and {head_sha}: {merge_base.stderr.strip()!r}"
-            )
-        diff = subprocess.run(
-            self._git(repo_dir, "diff", merge_base.stdout.strip(), head_sha),
-            **{**kwargs, "errors": "replace"},
+            return None
+        return self._diff(repo_dir, merge_base.stdout.strip(), head_sha)
+
+    def diff_since(self, *, repo_dir: Path, previous_head_sha: str, head_sha: str) -> str | None:
+        """What was pushed on top of `previous_head_sha` to reach `head_sha`.
+
+        None unless `previous_head_sha` is an ancestor of `head_sha`: after a rebase or
+        force-push, a plain diff between the two heads also carries every change the
+        base gained, which is not what the author did between rounds."""
+        ancestor = subprocess.run(
+            self._git(repo_dir, "merge-base", "--is-ancestor", previous_head_sha, head_sha),
+            **self._subprocess_kwargs(),
         )
-        if diff.returncode != 0:
-            raise GitWorktreeError(f"diff of {head_sha} failed: {diff.stderr.strip()!r}")
-        return str(diff.stdout)
+        if ancestor.returncode != 0:
+            return None
+        return self._diff(repo_dir, previous_head_sha, head_sha)
+
+    def _diff(self, repo_dir: Path, from_sha: str, to_sha: str) -> str | None:
+        result = subprocess.run(
+            self._git(repo_dir, "diff", "--no-color", "--no-ext-diff", from_sha, to_sha),
+            **self._subprocess_kwargs(),
+        )
+        return result.stdout if result.returncode == 0 else None
 
     def _git(self, repo_dir: Path, *args: str) -> list[str]:
         # The container runs git as root over a clone owned by the operator
         # (uid 1000). Without this, git aborts with "detected dubious
         # ownership". Scope the exemption to the repo we operate on.
-        return ["git", "-c", f"safe.directory={repo_dir}", "-C", str(repo_dir), *args]
+        return [
+            "git",
+            *_HARDENING,
+            "-c",
+            f"safe.directory={repo_dir}",
+            "-C",
+            str(repo_dir),
+            *args,
+        ]
 
-    def cleanup(self, worktree: Path) -> None:
-        if worktree.exists():
-            shutil.rmtree(worktree)
+    def cleanup(self, *, repo_dir: Path, worktree: Path) -> None:
+        with self._repo_lock(repo_dir):
+            if worktree.exists():
+                shutil.rmtree(worktree)
 
-    def _subprocess_kwargs(self) -> dict[str, Any]:
+    def _subprocess_kwargs(self, repo: str | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"capture_output": True, "text": True, "check": False}
+        env: dict[str, str] = {}
         if self._run_as_uid is not None:
             kwargs["user"] = self._run_as_uid
             if self._run_as_gid is not None:
                 kwargs["group"] = self._run_as_gid
             # git as a non-root uid needs a readable/writable HOME; system git
             # config (the credential helper) still applies, so auth is intact.
-            kwargs["env"] = {**os.environ, "HOME": "/tmp"}
+            env["HOME"] = "/tmp"
+        if repo is not None and self._tokens is not None:
+            # Read by bin/git-credential-helper, which answers only for this
+            # repo: a token in a child's environment never reaches argv or disk.
+            env["GIT_REVIEW_REPO"] = repo
+            env["GIT_REVIEW_TOKEN"] = self._tokens.token(repo)
+        if env:
+            kwargs["env"] = {**os.environ, **env}
         return kwargs
 
     def _chown_to_operator(self, path: Path) -> None:
@@ -140,8 +227,8 @@ class GitWorktreeManager:
                 path, self._run_as_uid, self._run_as_gid if self._run_as_gid is not None else -1
             )
 
-    def _run(self, cmd: list[str]) -> None:
-        result = subprocess.run(cmd, **self._subprocess_kwargs())
+    def _run(self, cmd: list[str], repo: str | None = None) -> None:
+        result = subprocess.run(cmd, **self._subprocess_kwargs(repo))
         if result.returncode != 0:
             raise GitWorktreeError(
                 f"command failed: {' '.join(cmd)} stderr={result.stderr.strip()!r}"

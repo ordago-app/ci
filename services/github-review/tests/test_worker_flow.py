@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -5,12 +6,15 @@ from src.config import ReviewConfig
 from src.github_client import PullRequest
 from src.job_store import JobStatus, ReviewJobStore
 from src.provider import ReviewResult, SessionRef
-from src.worker import ReviewWorker
+from src.worker import NO_REVIEW_MARKER, ReviewWorker
+
+from tests.helpers import begin_attempt, tick_and_drain, write_config
 
 
 class FakeGitHub:
     def __init__(self) -> None:
         self.posted: list[tuple[str, int, str, str, str]] = []
+        self.comments: list[tuple[str, int, str]] = []
 
     def list_open_prs(self, repo: str) -> list[PullRequest]:
         return [
@@ -40,26 +44,38 @@ class FakeGitHub:
     def ci_summary(self, repo: str, head_sha: str) -> str:
         return "checks skipped in test"
 
+    def head_ci_green(self, repo: str, head_sha: str) -> bool:
+        return False
+
     def post_review(self, repo: str, number: int, body: str, event: str, commit_id: str) -> None:
         self.posted.append((repo, number, body, event, commit_id))
+
+    def post_comment(self, repo: str, number: int, body: str) -> None:
+        self.comments.append((repo, number, body))
 
 
 class FakeWorktrees:
     def __init__(self, path: Path) -> None:
         self.path = path
 
+    def pr_diff(self, *, repo_dir: Path, base_sha: str, head_sha: str) -> str | None:
+        return f"diff --git a/README.md b/README.md\n+{head_sha}\n"
+
+    def diff_since(self, *, repo_dir: Path, previous_head_sha: str, head_sha: str) -> str | None:
+        return f"+pushed {previous_head_sha}..{head_sha}\n"
+
     def prepare(
-        self, *, repo_dir: Path, project: str, pr_number: int, head_sha: str, fetch: bool = True
+        self, *, repo_dir: Path, repo: str, project: str, pr_number: int, head_sha: str
     ) -> Path:
         self.path.mkdir(parents=True, exist_ok=True)
         return self.path
 
-    def cleanup(self, worktree: Path) -> None:
+    def cleanup(self, *, repo_dir: Path, worktree: Path) -> None:
         pass
 
 
 class FakeProvider:
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -71,29 +87,7 @@ class FakeProvider:
 
 
 def config(tmp_path: Path) -> ReviewConfig:
-    path = tmp_path / "agent-review.yml"
-    path.write_text(
-        """
-        repos:
-          homelab:
-            provider: codex
-            enabled: true
-            review_drafts: false
-            run_ci_first: true
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer:
-            github_role: reviewer
-            mcps: {}
-            allow_shell: true
-            allow_network: true
-            allow_repo_write: true
-            allow_git_push: false
-            allow_docker: false
-            max_runtime_minutes: 30
-        """
-    )
-    return ReviewConfig.load(path)
+    return write_config(tmp_path)
 
 
 def test_worker_polls_runs_review_and_marks_posted(tmp_path: Path) -> None:
@@ -109,7 +103,7 @@ def test_worker_polls_runs_review_and_marks_posted(tmp_path: Path) -> None:
         projects_root=tmp_path / "projects",
         reviewer_bot="reviewer[bot]",
     )
-    worker.tick()
+    tick_and_drain(worker)
     assert store.list_by_status(JobStatus.POSTED)[0].head_sha == "head"
     assert gh.posted == [("alvaro-francisco-gil/homelab", 1, "No findings.", "COMMENT", "head")]
 
@@ -118,7 +112,7 @@ class FlakyProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -146,11 +140,11 @@ def test_worker_retries_failed_job_on_next_tick(tmp_path: Path) -> None:
         reviewer_bot="reviewer[bot]",
         max_attempts=3,
     )
-    worker.tick()  # first attempt fails
+    tick_and_drain(worker)  # first attempt fails
     assert store.list_by_status(JobStatus.FAILED), "first attempt should have failed"
     assert not store.list_by_status(JobStatus.POSTED)
 
-    worker.tick()  # retry succeeds
+    tick_and_drain(worker)  # retry succeeds
     posted = store.list_by_status(JobStatus.POSTED)
     assert posted and posted[0].head_sha == "head"
     assert provider.calls == 2
@@ -158,7 +152,7 @@ def test_worker_retries_failed_job_on_next_tick(tmp_path: Path) -> None:
 
 
 class FailingProvider:
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -190,7 +184,7 @@ def test_a_failed_job_is_logged_not_just_recorded_in_the_db(
         projects_root=tmp_path / "projects",
         reviewer_bot="reviewer[bot]",
     )
-    worker.tick()
+    tick_and_drain(worker)
 
     assert store.list_by_status(JobStatus.FAILED), "precondition: the job must have failed"
     err = capsys.readouterr().err
@@ -222,7 +216,7 @@ def test_a_repo_failing_over_and_over_says_so(
         max_attempts=10,
     )
     for _ in range(3):
-        worker.tick()
+        tick_and_drain(worker)
 
     err = capsys.readouterr().err
     assert "3 consecutive failures" in err, (
@@ -230,7 +224,7 @@ def test_a_repo_failing_over_and_over_says_so(
     )
 
 
-def test_run_pr_review_raises_when_review_fails(tmp_path: Path) -> None:
+def test_a_review_out_of_attempts_says_so_on_the_pr(tmp_path: Path) -> None:
     store = ReviewJobStore(tmp_path / "jobs.db")
     store.init()
     gh = FakeGitHub()
@@ -242,14 +236,24 @@ def test_run_pr_review_raises_when_review_fails(tmp_path: Path) -> None:
         providers={"codex": FailingProvider()},
         projects_root=tmp_path / "projects",
         reviewer_bot="reviewer[bot]",
-        max_attempts=3,
+        max_attempts=2,
     )
-    with pytest.raises(RuntimeError):
-        worker.run_pr_review("alvaro-francisco-gil/homelab", 1)
+    tick_and_drain(worker)
+    assert gh.comments == [], "a failure with retries left is not news yet"
+
+    tick_and_drain(worker)
+    assert len(gh.comments) == 1
+    _, number, body = gh.comments[0]
+    assert number == 1
+    assert body.startswith(NO_REVIEW_MARKER)
+    assert "codex boom" in body
+
+    tick_and_drain(worker)
+    assert len(gh.comments) == 1, "an exhausted job is not retried, so nothing new to say"
 
 
 class ApprovingProvider:
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         return SessionRef(id=str(job.id), container="c", worktree=worktree)
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -259,7 +263,7 @@ class ApprovingProvider:
         pass
 
 
-def test_run_pr_review_returns_verdict_summary(tmp_path: Path) -> None:
+def test_request_review_queues_the_current_head_without_running_it(tmp_path: Path) -> None:
     store = ReviewJobStore(tmp_path / "jobs.db")
     store.init()
     gh = FakeGitHub()
@@ -271,22 +275,59 @@ def test_run_pr_review_returns_verdict_summary(tmp_path: Path) -> None:
         providers={"codex": ApprovingProvider()},
         projects_root=tmp_path / "projects",
         reviewer_bot="reviewer[bot]",
-        max_attempts=3,
     )
-    summary = worker.run_pr_review("alvaro-francisco-gil/homelab", 1)
-    assert summary.verdict == "APPROVE"
-    assert summary.head_sha == "head"
-    assert summary.escalated is False
-    assert gh.posted == [("alvaro-francisco-gil/homelab", 1, "No findings.", "APPROVE", "head")]
-    # Verdict persisted so a repeat request is idempotent.
-    posted = store.list_by_status(JobStatus.POSTED)
-    assert posted and posted[0].verdict == "APPROVE"
+    job = worker.request_review("alvaro-francisco-gil/homelab", 1)
+    assert (job.head_sha, job.status) == ("head", JobStatus.QUEUED)
+    assert gh.posted == [], "the request returns before any review runs"
+
+    assert worker.request_review("alvaro-francisco-gil/homelab", 1).id == job.id, "idempotent"
+
+    tick_and_drain(worker)
+    done = store.get(job.id)
+    assert done is not None and (done.status, done.verdict) == (JobStatus.POSTED, "APPROVE")
+
+
+def test_request_review_retries_a_head_that_ran_out_of_attempts(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=FakeGitHub(),
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": FailingProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+        max_attempts=1,
+    )
+    tick_and_drain(worker)
+    assert store.list_by_status(JobStatus.FAILED)
+
+    job = worker.request_review("alvaro-francisco-gil/homelab", 1)
+
+    assert (job.status, job.attempts) == (JobStatus.QUEUED, 0)
+
+
+def test_request_review_rejects_a_repo_with_no_policy(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=FakeGitHub(),
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": ApprovingProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+    )
+    with pytest.raises(KeyError):
+        worker.request_review("someone/else", 1)
 
 
 class BombProvider:
     """Raises unconditionally — proves the provider was never invoked."""
 
-    def start_review_session(self, job, worktree, profile) -> SessionRef:
+    def start_review_session(self, job, worktree, timeout_seconds) -> SessionRef:
         raise AssertionError("provider must not be called")
 
     def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
@@ -302,11 +343,14 @@ class EmptyGitHub(FakeGitHub):
     def list_open_prs(self, repo: str) -> list[PullRequest]:
         return []
 
+    def get_pull_request(self, repo: str, number: int) -> PullRequest:
+        return replace(FakeGitHub().get_pull_request(repo, number), head_sha="head-v2")
+
 
 def test_tick_skips_jobs_over_round_cap(tmp_path: Path) -> None:
-    """tick() must skip a queued job when rounds_for >= max_rounds (Fix #1).
+    """A claimed job is skipped when rounds_for >= max_rounds (Fix #1).
 
-    Regression: before the fix, tick() ran every retryable job without checking
+    Regression: before the fix, the worker ran every retryable job without checking
     the round cap, so an always-on poller would keep reviewing new head SHAs past
     MAX_REVIEW_ROUNDS.
     """
@@ -315,7 +359,7 @@ def test_tick_skips_jobs_over_round_cap(tmp_path: Path) -> None:
 
     # Seed one POSTED round at head_sha="head-v1" — rounds_for == 1.
     j1 = store.enqueue("alvaro-francisco-gil/homelab", "homelab", "codex", 1, "head-v1", "base")
-    store.mark_running(j1.id)
+    begin_attempt(store, j1.id)
     store.mark_posted(j1.id, verdict="REQUEST_CHANGES")
     assert store.rounds_for("alvaro-francisco-gil/homelab", 1) == 1
 
@@ -336,7 +380,7 @@ def test_tick_skips_jobs_over_round_cap(tmp_path: Path) -> None:
         max_rounds=1,  # cap already reached after the seed job
     )
 
-    worker.tick()
+    tick_and_drain(worker)
 
     assert store.get(j2.id).status == JobStatus.SKIPPED, "over-cap job should be SKIPPED, not run"
     assert all(commit_id != "head-v2" for (_, _, _, _, commit_id) in gh.posted), (
@@ -344,36 +388,127 @@ def test_tick_skips_jobs_over_round_cap(tmp_path: Path) -> None:
     )
 
 
-def test_run_pr_review_idempotent_for_legacy_posted_row_without_verdict(tmp_path: Path) -> None:
-    """run_pr_review must treat ANY POSTED row as already-reviewed (Fix #2).
-
-    Regression: the old guard was `existing.verdict is not None`, so a legacy
-    migrated row (status=POSTED, verdict=NULL) bypassed the guard and triggered
-    a duplicate review + duplicate post_review call.
-    """
+def test_a_failed_review_is_not_retried_inside_the_backoff(tmp_path: Path) -> None:
     store = ReviewJobStore(tmp_path / "jobs.db")
     store.init()
+    provider = FlakyProvider()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=FakeGitHub(),
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": provider},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+        retry_backoff_seconds=900,
+    )
+    tick_and_drain(worker)
+    tick_and_drain(worker)
+    assert provider.calls == 1, "the next 60 s tick must not spend another attempt"
 
-    # FakeGitHub returns head_sha="head"; seed a POSTED row for that head with
-    # verdict=None (simulating a legacy migrated row).
-    j1 = store.enqueue("alvaro-francisco-gil/homelab", "homelab", "codex", 1, "head", "base")
-    store.mark_running(j1.id)
-    store.mark_posted(j1.id)  # no verdict arg → verdict stays NULL
-    assert store.get_posted("alvaro-francisco-gil/homelab", 1, "head").verdict is None
 
-    gh = FakeGitHub()
+class TwoPRsOneGreen(FakeGitHub):
+    """PR 1 is older; only PR 2's head has passed CI."""
+
+    def list_open_prs(self, repo: str) -> list[PullRequest]:
+        base = super().list_open_prs(repo)[0]
+        return [replace(base, number=n, head_sha=f"head{n}") for n in (1, 2)]
+
+    def get_pull_request(self, repo: str, number: int) -> PullRequest:
+        return next(p for p in self.list_open_prs(repo) if p.number == number)
+
+    def head_ci_green(self, repo: str, head_sha: str) -> bool:
+        return head_sha == "head2"
+
+
+class AnyPRProvider(ApprovingProvider):
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        return ReviewResult(body="ok", event="APPROVE")
+
+
+def test_a_head_with_green_ci_is_reviewed_before_an_older_pr(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    gh = TwoPRsOneGreen()
     worker = ReviewWorker(
         config=config(tmp_path),
         store=store,
         github=gh,
         worktrees=FakeWorktrees(tmp_path / "wt"),
-        providers={"codex": BombProvider()},
+        providers={"codex": AnyPRProvider()},
         projects_root=tmp_path / "projects",
         reviewer_bot="reviewer[bot]",
     )
+    tick_and_drain(worker)
+    assert [number for (_, number, _, _, _) in gh.posted] == [2, 1]
 
-    summary = worker.run_pr_review("alvaro-francisco-gil/homelab", 1)
 
-    assert summary.verdict == "REQUEST_CHANGES", "conservative fallback for legacy NULL verdict"
-    assert summary.escalated is False
-    assert gh.posted == [], "must not post a duplicate review"
+def test_unreadable_ci_leaves_the_queue_in_pr_age_order(tmp_path: Path) -> None:
+    class Forbidden(TwoPRsOneGreen):
+        def head_ci_green(self, repo: str, head_sha: str) -> bool:
+            raise RuntimeError("HTTP 403 Resource not accessible by integration")
+
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    gh = Forbidden()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=gh,
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": AnyPRProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+    )
+    tick_and_drain(worker)
+    assert [number for (_, number, _, _, _) in gh.posted] == [1, 2]
+
+
+class MovingHeadGitHub(FakeGitHub):
+    def __init__(self) -> None:
+        super().__init__()
+        self.head = "head"
+
+    def list_open_prs(self, repo: str) -> list[PullRequest]:
+        return [replace(pr, head_sha=self.head) for pr in super().list_open_prs(repo)]
+
+
+class PromptRecordingProvider(FakeProvider):
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def run_review(self, session: SessionRef, prompt: str, timeout_seconds: int) -> ReviewResult:
+        self.prompts.append(prompt)
+        return ReviewResult(body="1. `README.md:1` is wrong.", event="REQUEST_CHANGES")
+
+
+def test_a_later_round_builds_on_the_last_review_instead_of_starting_over(
+    tmp_path: Path,
+) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    gh = MovingHeadGitHub()
+    provider = PromptRecordingProvider()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=gh,
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": provider},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+    )
+    tick_and_drain(worker)
+    gh.head = "head2"
+    tick_and_drain(worker)
+
+    first, second = provider.prompts
+    assert "```diff\ndiff --git a/README.md b/README.md\n+head\n```" in first
+    assert "Earlier round" not in first
+    assert "Earlier round: head head got REQUEST_CHANGES" in second
+    assert "1. `README.md:1` is wrong." in second
+    assert "+pushed head..head2" in second
+    # The body kept is the provider's own, not the disclosure-wrapped one posted.
+    assert store.find("alvaro-francisco-gil/homelab", 1, "head").review_body == (
+        "1. `README.md:1` is wrong."
+    )

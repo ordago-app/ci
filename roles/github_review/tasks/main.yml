@@ -1,131 +1,139 @@
 ---
-# ── github-review (agentic PR reviews; reuses claude-router + codex images) ──
-- name: Preconditions for a github-review host are met
+# ── github-review: one reviewer instance on one Docker host ──
+# Everything the instance needs is built from this collection or given as a role
+# variable. Two instances on one host are two runs of this role with different
+# github_review_instance and github_review_root.
+- name: This operator has said which instance, where, and with what config
   ansible.builtin.assert:
     that:
-      - services_root is defined and services_root | length > 0
-      - personal_root is defined and personal_root | length > 0
-      - operator_user is defined and operator_user | length > 0
-    fail_msg: >-
-      github_review requires services_root, personal_root and operator_user, which
-      come from the OPERATOR's inventory, not from this collection.
-
-- name: This operator has pointed github_review at their own config
-  ansible.builtin.assert:
-    that:
+      - github_review_instance is defined
+      - github_review_instance is match('^[a-z0-9][a-z0-9-]{0,39}$')
+      - github_review_root is defined and github_review_root | length > 0
+      - github_review_root is match('^/')
+      - github_review_owner is defined and github_review_owner | length > 0
       - github_review_config is defined and github_review_config | length > 0
-      - github_review_repos_config is defined and github_review_repos_config | length > 0
     fail_msg: >-
-      github_review_config and github_review_repos_config must point at this
-      operator's own agent-review.yml and repos.yml. This collection deliberately
-      does not ship one operator's pool config for every other operator — set both
-      in your own inventory.
+      github_review needs github_review_instance ([a-z0-9-]), github_review_root
+      (an absolute path), github_review_owner and github_review_config, from the
+      OPERATOR's inventory. This collection ships no instance of its own.
 
-- name: repos.yml is already in place for this stack to mount
-  # repos.yml is placed OUTSIDE the ported range in the source playbook (a
-  # generic loop that renders every operator's repo map, not part of this
-  # extraction) — this role correctly does not place it either. But
-  # compose.yml mounts it read-only, and an absent bind-mount source makes
-  # Docker fabricate a root-owned directory at that path instead of failing:
-  # the container then dies obscurely. Fail loudly here instead.
-  ansible.builtin.stat:
-    path: "{{ github_review_repos_config }}"
-  register: _github_review_repos_config
-
-- name: This operator's repos.yml exists at github_review_repos_config
+- name: The config names the same instance as the inventory
   ansible.builtin.assert:
     that:
-      - _github_review_repos_config.stat.exists
-      - not _github_review_repos_config.stat.isdir
+      - (lookup('ansible.builtin.file', github_review_config) | from_yaml).instance == github_review_instance
     fail_msg: >-
-      github_review_repos_config ({{ github_review_repos_config }}) must already
-      exist as a file on this host before this role runs — this collection does
-      not place it (it is out of the ported range). See compose.yml's
-      /opt/personal/repos.yml mount.
+      {{ github_review_config }} must set `instance: {{ github_review_instance }}`:
+      the service labels and reaps its review containers by it, so two names for
+      one instance would reap the wrong containers.
 
-# DELIBERATELY no secrets-file assert here, unlike ci_controller. Ruling 7:
-# services/github-review/compose.yml declares no `env_file:` at all, and the
-# service's own src/main.py reads no token/secret env var. It authenticates to
-# GitHub only indirectly, by calling claude-router over ROUTER_INTERNAL_URL;
-# claude-router's own stack (not part of this ported range) holds the GitHub App
-# credentials. The one credential this stack can hold is optional: the Anthropic
-# API key an operator places by hand to use the `claude` provider. With no key
-# that provider reports itself unavailable, so a missing file must not fail this
-# role. Do not restore a stat-loop assert here without first re-checking
-# services/github-review/compose.yml for a new env_file.
+- name: The owner's uid and gid, which git in the service runs as
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ github_review_owner }}"
 
-- name: github-review service dir
+- name: Instance directories exist
   ansible.builtin.file:
-    path: "{{ services_root }}/github-review"
+    path: "{{ github_review_root }}/{{ item.path }}"
     state: directory
-    owner: "{{ operator_user }}"
-    group: "{{ operator_user }}"
-    mode: "0755"
-
-- name: github-review state dir exists
-  ansible.builtin.file:
-    path: "{{ personal_root }}/state/github-review"
-    state: directory
-    owner: "{{ operator_user }}"
-    group: "{{ operator_user }}"
-    mode: "0750"
-
-# compose.yml mounts this directory, and an absent bind-mount source makes Docker
-# fabricate a root-owned one. The key inside it is placed by the operator.
-- name: claude-review key dir exists
-  ansible.builtin.file:
-    path: "{{ personal_root }}/claude-review-state"
-    state: directory
-    owner: "{{ operator_user }}"
-    group: "{{ operator_user }}"
-    mode: "0700"
-
-- name: place agent-review.yml on host
-  ansible.builtin.copy:
-    src: "{{ github_review_config }}"
-    dest: "{{ personal_root }}/agent-review.yml"
-    owner: "{{ operator_user }}"
-    group: "{{ operator_user }}"
-    mode: "0640"
-
-- name: github-review compose file
-  ansible.builtin.copy:
-    src: "{{ role_path }}/../../services/github-review/compose.yml"
-    dest: "{{ services_root }}/github-review/compose.yml"
-    mode: "0644"
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "", owner: "{{ github_review_owner }}", mode: "0750" }
+    - { path: app, owner: "{{ github_review_owner }}", mode: "0750" }
+    # jobs.db and each codex login. The service runs as root.
+    - { path: state, owner: root, mode: "0700" }
+    # Clones and review worktrees, mounted at this same path inside the service.
+    - { path: projects, owner: "{{ github_review_owner }}", mode: "0750" }
+    - { path: secrets, owner: root, mode: "0700" }
+  loop_control:
+    label: "{{ item.path or '.' }}"
 
 # Content comparison + skip mtime-only updates: see ci_lane_host role for details.
-- name: github-review build context (Dockerfile + src/ + pyproject.toml + uv.lock)
+- name: github-review build context (service, sandbox images, compose file)
   ansible.posix.synchronize:
     src: "{{ role_path }}/../../services/github-review/"
-    dest: "{{ services_root }}/github-review/"
+    dest: "{{ github_review_root }}/app/"
     rsync_opts:
       - "--exclude=tests"
       - "--exclude=__pycache__"
       - "--exclude=.venv"
+      - "--exclude=.pytest_cache"
       - "--checksum"
       - "--no-times"
   become: true
-  become_user: "{{ operator_user }}"
+  become_user: "{{ github_review_owner }}"
 
-# Spawned by the service rather than run by compose, so no `up` would build it.
-# Opt-in: an operator not using the claude provider needs neither this build nor
-# what it needs from the host. force_source so a bumped CLI pin rebuilds; an
-# unchanged Dockerfile is a cache hit.
-- name: claude-review image is built
-  when: github_review_build_claude_image | bool
+- name: This instance's config is in place
+  ansible.builtin.copy:
+    src: "{{ github_review_config }}"
+    dest: "{{ github_review_root }}/app/agent-review.yml"
+    owner: "{{ github_review_owner }}"
+    group: "{{ github_review_owner }}"
+    mode: "0640"
+
+- name: Compose variables for this instance
+  ansible.builtin.copy:
+    dest: "{{ github_review_root }}/app/.env"
+    owner: "{{ github_review_owner }}"
+    group: "{{ github_review_owner }}"
+    mode: "0640"
+    content: |
+      GITHUB_REVIEW_INSTANCE={{ github_review_instance }}
+      GITHUB_REVIEW_PROJECTS_DIR={{ github_review_root }}/projects
+      GITHUB_REVIEW_STATE_DIR={{ github_review_root }}/state
+      GITHUB_REVIEW_SECRETS_DIR={{ github_review_root }}/secrets
+      GITHUB_REVIEW_NETWORK={{ github_review_network }}
+      GITHUB_REVIEW_RUN_AS_UID={{ ansible_facts.getent_passwd[github_review_owner][1] }}
+      GITHUB_REVIEW_RUN_AS_GID={{ ansible_facts.getent_passwd[github_review_owner][2] }}
+
+- name: Credentials named by env are in the service's env file
+  ansible.builtin.copy:
+    dest: "{{ github_review_root }}/app/secrets.env"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      {% for name, value in github_review_secrets | dictsort %}
+      {{ name }}={{ value }}
+      {% endfor %}
+  no_log: true
+
+- name: Credentials named by file are in the secrets dir
+  ansible.builtin.copy:
+    dest: "{{ github_review_root }}/secrets/{{ item.key }}"
+    content: "{{ item.value }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ github_review_secret_files | dict2items }}"
+  no_log: true
+
+- name: The network /status and /heads are served on exists
+  community.docker.docker_network:
+    name: "{{ github_review_network }}"
+    state: present
+
+# Spawned by the service rather than run by compose, so no `up` would build them.
+# force_source so a bumped CLI pin rebuilds; an unchanged Dockerfile is a cache
+# hit. Tagged per instance: two instances pinned to different SHAs of this repo
+# must not overwrite each other's sandbox.
+- name: The review sandbox images are built
   community.docker.docker_image:
-    name: homelab/claude-review
-    tag: latest
+    name: "ordago-ci/{{ item }}"
+    tag: "{{ github_review_instance }}"
     source: build
     force_source: true
     state: present
     build:
-      path: "{{ services_root }}/github-review/claude-review"
+      path: "{{ github_review_root }}/app/{{ item }}"
       pull: false
+  loop:
+    - claude-review
+    - codex-review
 
 - name: github-review stack up
   community.docker.docker_compose_v2:
-    project_src: "{{ services_root }}/github-review"
+    project_src: "{{ github_review_root }}/app"
     state: present
     build: always

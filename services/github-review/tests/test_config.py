@@ -1,284 +1,172 @@
-import textwrap
 from pathlib import Path
 
 import pytest
-from src.config import ConfigError, ReviewConfig
+import yaml
+from src.config import ClaudeAccount, CodexAccount, ConfigError, ReviewConfig
+
+from tests.helpers import config_doc, write_config
 
 
-def write(path: Path, text: str) -> Path:
-    # dedent before strip: the YAML blocks below are uniformly indented, so a
-    # bare strip() would leave the first key at column 0 and the rest indented,
-    # which is not valid YAML.
-    path.write_text(textwrap.dedent(text).strip() + "\n")
-    return path
-
-
-def test_loads_codex_repo_and_profile(tmp_path: Path) -> None:
-    cfg_path = write(
-        tmp_path / "agent-review.yml",
-        """
-        repos:
-          homelab:
-            provider: codex
-            enabled: true
-            review_drafts: false
-            run_ci_first: true
-            tool_profile: default-reviewer
-        tool_profiles:
-          default-reviewer:
-            github_role: reviewer
-            mcps:
-              github: [ro]
-            allow_shell: true
-            allow_network: true
-            allow_repo_write: true
-            allow_git_push: false
-            allow_docker: false
-            max_runtime_minutes: 30
-        """,
-    )
-    cfg = ReviewConfig.load(cfg_path)
-    repo = cfg.enabled_repos()[0]
-    assert repo.name == "homelab"
-    assert repo.repo == "alvaro-francisco-gil/homelab"
-    assert repo.provider == "codex"
-    assert cfg.profile_for(repo).github_role == "reviewer"
-
-
-def test_rejects_unknown_provider(tmp_path: Path) -> None:
-    cfg_path = write(
-        tmp_path / "agent-review.yml",
-        """
-        repos:
-          homelab:
-            provider: other
-            enabled: true
-            review_drafts: false
-            run_ci_first: true
-            tool_profile: default-reviewer
-        tool_profiles:
-          default-reviewer:
-            github_role: reviewer
-            mcps: {}
-            allow_shell: true
-            allow_network: true
-            allow_repo_write: true
-            allow_git_push: false
-            allow_docker: false
-            max_runtime_minutes: 30
-        """,
-    )
-    with pytest.raises(ConfigError, match="unknown provider"):
-        ReviewConfig.load(cfg_path)
-
-
-def test_rejects_missing_profile(tmp_path: Path) -> None:
-    cfg_path = write(
-        tmp_path / "agent-review.yml",
-        """
-        repos:
-          homelab:
-            provider: codex
-            enabled: true
-            review_drafts: false
-            run_ci_first: true
-            tool_profile: missing
-        tool_profiles: {}
-        """,
-    )
-    with pytest.raises(ConfigError, match="unknown tool_profile"):
-        ReviewConfig.load(cfg_path)
-
-
-REVIEW_MODE_UNSET_YAML = """
-    repos:
-      homelab:
-        provider: codex
-        enabled: true
-        review_drafts: false
-        run_ci_first: true
-        tool_profile: default-reviewer
-    tool_profiles:
-      default-reviewer:
-        github_role: reviewer
-        mcps: {}
-        allow_shell: true
-        allow_network: true
-        allow_repo_write: true
-        allow_git_push: false
-        allow_docker: false
-        max_runtime_minutes: 30
-    """
-
-REVIEW_MODE_BAD_YAML = """
-    repos:
-      homelab:
-        provider: codex
-        enabled: true
-        review_drafts: false
-        run_ci_first: true
-        review_mode: nonsense
-        tool_profile: default-reviewer
-    tool_profiles:
-      default-reviewer:
-        github_role: reviewer
-        mcps: {}
-        allow_shell: true
-        allow_network: true
-        allow_repo_write: true
-        allow_git_push: false
-        allow_docker: false
-        max_runtime_minutes: 30
-    """
-
-
-def test_review_mode_defaults_to_all(tmp_path: Path) -> None:
-    cfg_path = write(tmp_path / "agent-review.yml", REVIEW_MODE_UNSET_YAML)
-    cfg = ReviewConfig.load(cfg_path)
-    assert cfg.repos["homelab"].review_mode == "all"
-
-
-def test_invalid_review_mode_rejected(tmp_path: Path) -> None:
-    cfg_path = write(tmp_path / "agent-review.yml", REVIEW_MODE_BAD_YAML)
-    with pytest.raises(ConfigError, match="review_mode"):
-        ReviewConfig.load(cfg_path)
-
-
-def test_rejects_git_push_for_reviewer(tmp_path: Path) -> None:
-    cfg_path = write(
-        tmp_path / "agent-review.yml",
-        """
-        repos:
-          homelab:
-            provider: codex
-            enabled: true
-            review_drafts: false
-            run_ci_first: true
-            tool_profile: default-reviewer
-        tool_profiles:
-          default-reviewer:
-            github_role: reviewer
-            mcps: {}
-            allow_shell: true
-            allow_network: true
-            allow_repo_write: true
-            allow_git_push: true
-            allow_docker: false
-            max_runtime_minutes: 30
-        """,
-    )
-    with pytest.raises(ConfigError, match="allow_git_push"):
-        ReviewConfig.load(cfg_path)
-
-
-def test_repo_is_resolved_from_the_shared_registry(tmp_path: Path) -> None:
-    """The review config names a project; the GitHub owner/name comes from
-    personal/repos.yml, so an owner move is a one-line edit in one file."""
-    cfg_path = write(
-        tmp_path / "agent-review.yml",
-        """
-        repos:
-          homelab:
-            provider: codex
-            tool_profile: default-reviewer
-        tool_profiles:
-          default-reviewer:
-            github_role: reviewer
-""",
-    )
-    cfg = ReviewConfig.load(cfg_path)
-    repo = cfg.repos["homelab"]
-    assert repo.repo == "alvaro-francisco-gil/homelab"
-    assert repo.project == "homelab"
-
-
-def test_a_project_missing_from_the_registry_is_rejected(tmp_path: Path) -> None:
-    """Silently skipping it would be a repo nobody reviews, which looks exactly
-    like a quiet day."""
-    (tmp_path / "repos.yml").write_text("project_repos:\n  ordago-apps: acme/ordago-apps\n")
-    cfg_path = write(
-        tmp_path / "agent-review.yml",
-        """
-        repos:
-          homelab:
-            provider: codex
-            tool_profile: default-reviewer
-        tool_profiles:
-          default-reviewer:
-            github_role: reviewer
-""",
-    )
-    with pytest.raises(ConfigError, match="homelab"):
-        ReviewConfig.load(cfg_path)
-
-
-def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path: Path) -> None:
-    (tmp_path / "repos.yml").write_text("project_repos:\n  homelab: homelab\n")
-    cfg_path = write(
-        tmp_path / "agent-review.yml",
-        """
-        repos:
-          homelab:
-            provider: codex
-            tool_profile: default-reviewer
-        tool_profiles:
-          default-reviewer:
-            github_role: reviewer
-""",
-    )
-    with pytest.raises(ConfigError, match="owner/name"):
-        ReviewConfig.load(cfg_path)
-
-
-# `test_the_committed_config_and_registry_agree` is NOT here, deliberately. It
-# asserted that one operator's `personal/agent-review.yml` and
-# `personal/repos.yml` ship consistently. That is a fact about a DEPLOYMENT, not
-# about this platform, and those files live in the consumer's repo. It stays
-# with the consumer; re-adding it here would only ever fail.
-
-
-def _fallback_config(tmp_path: Path, fallbacks: str) -> Path:
+def _load(tmp_path: Path, doc: dict) -> ReviewConfig:
     path = tmp_path / "agent-review.yml"
-    path.write_text(
-        f"""
-        repos:
-          homelab:
-            provider: codex
-            fallback_providers: {fallbacks}
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer: {{}}
-        """
+    path.write_text(yaml.safe_dump(doc))
+    return ReviewConfig.load(path)
+
+
+def test_loads_an_instance_with_its_accounts_and_repos(tmp_path: Path) -> None:
+    cfg = write_config(
+        tmp_path, {"ordago-apps": {"providers": ["codex", "claude-work"], "review_mode": "labeled"}}
     )
-    return path
 
-
-def test_fallback_providers_default_to_none(tmp_path: Path) -> None:
-    path = tmp_path / "agent-review.yml"
-    path.write_text(
-        """
-        repos:
-          homelab:
-            provider: codex
-            tool_profile: reviewer
-        tool_profiles:
-          reviewer: {}
-        """
+    assert cfg.instance == "test"
+    assert cfg.reviewer_bot == "reviewer[bot]"
+    assert cfg.github_app.app_id == 1
+    assert isinstance(cfg.accounts["codex"], CodexAccount)
+    assert isinstance(cfg.accounts["claude-work"], ClaudeAccount)
+    repo = cfg.repos["ordago-apps"]
+    assert (repo.name, repo.project, repo.repo) == (
+        "ordago-apps",
+        "ordago-apps",
+        "ordago-app/ordago-apps",
     )
-    assert ReviewConfig.load(path).repos["homelab"].fallback_providers == []
+    assert repo.providers == ["codex", "claude-work"]
+    assert repo.review_mode == "labeled"
+    assert repo.max_runtime_minutes == 30
+    assert cfg.limits.poll_interval_seconds == 60
+    assert [r.name for r in cfg.enabled_repos()] == ["ordago-apps"]
 
 
-def test_fallback_providers_load(tmp_path: Path) -> None:
-    cfg = ReviewConfig.load(_fallback_config(tmp_path, "[claude]"))
-    assert cfg.repos["homelab"].fallback_providers == ["claude"]
+def test_a_chain_naming_an_undeclared_account_is_refused(tmp_path: Path) -> None:
+    doc = config_doc({"homelab": {"providers": ["codex", "claude-api-jaime"]}})
+    del doc["accounts"]["claude-api-jaime"]  # type: ignore[attr-defined]
+
+    with pytest.raises(ConfigError, match="claude-api-jaime"):
+        _load(tmp_path, doc)
 
 
-def test_rejects_unknown_fallback_provider(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="gemini"):
-        ReviewConfig.load(_fallback_config(tmp_path, "[gemini]"))
+@pytest.mark.parametrize("missing", ["instance", "reviewer_bot", "github_app", "accounts", "repos"])
+def test_nothing_operator_specific_has_a_default(tmp_path: Path, missing: str) -> None:
+    doc = config_doc()
+    del doc[missing]
+
+    with pytest.raises(ConfigError, match=missing):
+        _load(tmp_path, doc)
 
 
-@pytest.mark.parametrize("fallbacks", ["[codex]", "[claude, claude]"])
-def test_rejects_a_provider_listed_twice_in_a_chain(tmp_path: Path, fallbacks: str) -> None:
-    with pytest.raises(ConfigError, match="twice"):
-        ReviewConfig.load(_fallback_config(tmp_path, fallbacks))
+def test_a_misspelt_key_is_refused_not_ignored(tmp_path: Path) -> None:
+    doc = config_doc({"homelab": {"providers": ["codex"], "review_drfts": True}})
+
+    with pytest.raises(ConfigError, match="review_drfts"):
+        _load(tmp_path, doc)
+
+
+def test_an_api_key_account_must_cap_its_spend(tmp_path: Path) -> None:
+    doc = config_doc(
+        {"homelab": {"providers": ["claude-api"]}},
+        accounts={
+            "claude-api": {
+                "kind": "claude",
+                "auth": "api_key",
+                "credential": {"env": "KEY"},
+                "model": "m",
+            }
+        },
+    )
+
+    with pytest.raises(ConfigError, match="max_budget_usd"):
+        _load(tmp_path, doc)
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [{}, {"env": "A", "file": "/b"}],
+    ids=["neither", "both"],
+)
+def test_a_credential_names_exactly_one_source(tmp_path: Path, credential: dict) -> None:
+    doc = config_doc(
+        {"homelab": {"providers": ["claude-work"]}},
+        accounts={
+            "claude-work": {
+                "kind": "claude",
+                "auth": "subscription",
+                "credential": credential,
+                "model": "m",
+            }
+        },
+    )
+
+    with pytest.raises(ConfigError, match="exactly one"):
+        _load(tmp_path, doc)
+
+
+def test_a_codex_login_is_a_file(tmp_path: Path) -> None:
+    doc = config_doc(accounts={"codex": {"kind": "codex", "credential": {"env": "X"}}})
+
+    with pytest.raises(ConfigError, match=r"auth\.json"):
+        _load(tmp_path, doc)
+
+
+def test_two_codex_accounts_cannot_share_a_login(tmp_path: Path) -> None:
+    """Its refresh token is single-use: two refreshers log it out."""
+    login = {"kind": "codex", "credential": {"file": "/logins/auth.json"}}
+    doc = config_doc(
+        {"homelab": {"providers": ["codex", "codex-spare"]}},
+        accounts={"codex": login, "codex-spare": login},
+    )
+
+    with pytest.raises(ConfigError, match="share the login"):
+        _load(tmp_path, doc)
+
+
+@pytest.mark.parametrize("name", ["Claude_Work", "-claude", "a" * 41])
+def test_account_names_must_be_safe_container_names(tmp_path: Path, name: str) -> None:
+    doc = config_doc(
+        {"homelab": {"providers": [name]}},
+        accounts={name: {"kind": "codex", "credential": {"file": "/a"}}},
+    )
+
+    with pytest.raises(ConfigError, match="account name"):
+        _load(tmp_path, doc)
+
+
+def test_a_repo_must_be_owner_slash_name(tmp_path: Path) -> None:
+    doc = config_doc({"homelab": {"providers": ["codex"], "repo": "just-a-name"}})
+
+    with pytest.raises(ConfigError, match="repo"):
+        _load(tmp_path, doc)
+
+
+def test_a_github_repo_listed_twice_is_refused(tmp_path: Path) -> None:
+    doc = config_doc(
+        {
+            "homelab": {"providers": ["codex"], "repo": "o/r"},
+            "copy": {"providers": ["codex"], "repo": "o/r"},
+        }
+    )
+
+    with pytest.raises(ConfigError, match="listed twice"):
+        _load(tmp_path, doc)
+
+
+def test_providers_must_not_repeat(tmp_path: Path) -> None:
+    doc = config_doc({"homelab": {"providers": ["codex", "codex"]}})
+
+    with pytest.raises(ConfigError, match="repeat"):
+        _load(tmp_path, doc)
+
+
+def test_review_mode_is_all_or_labeled(tmp_path: Path) -> None:
+    assert write_config(tmp_path).repos["homelab"].review_mode == "all"
+    with pytest.raises(ConfigError):
+        write_config(tmp_path, {"homelab": {"providers": ["codex"], "review_mode": "sometimes"}})
+
+
+def test_a_credential_reads_env_or_file_and_is_empty_when_absent(tmp_path: Path) -> None:
+    from src.config import CredentialSource
+
+    key = tmp_path / "key"
+    key.write_text(" secret \n")
+    assert CredentialSource(env="K").read({"K": " v "}) == "v"
+    assert CredentialSource(env="K").read({}) == ""
+    assert CredentialSource(file=str(key)).read() == "secret"
+    assert CredentialSource(file=str(tmp_path / "absent")).read() == ""

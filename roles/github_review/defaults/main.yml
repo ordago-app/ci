@@ -1,18 +1,31 @@
 ---
-# No secrets directory var here, unlike ci_controller. This stack holds no
-# credential of its own — see tasks/main.yml for why — so there is nothing to
-# point at a rendered-secrets directory.
+# Required, deliberately without defaults (the role asserts each):
+#   github_review_instance  — this instance's name: [a-z0-9-], unique per Docker
+#                             host. Names its compose project, container, images
+#                             and review containers. Must equal `instance:` in
+#                             the config.
+#   github_review_root      — the directory on the host that holds everything
+#                             this instance owns (build context, config, secrets,
+#                             state, clones). One per instance.
+#   github_review_owner     — the host user that owns it. Git in the service runs
+#                             as this user's uid, so the clones stay theirs.
+#   github_review_config    — path, on the Ansible controller, to this instance's
+#                             agent-review.yml (schema: README.md).
+# A default for any of these would be one operator's machine wearing a neutral
+# name, inherited by every other operator without their noticing.
 
-# No default: this collection deliberately ships no pool config for any
-# operator. Point this at YOUR OWN agent-review.yml (see README.md).
-# github_review_config: /path/to/your/agent-review.yml
+# The Docker network /status and /heads are served on: whatever reads them (a
+# dashboard, ci-controller) joins it. Created if absent. Review containers never
+# join it.
+github_review_network: "github-review-{{ github_review_instance }}"
 
-# repos.yml is rendered and placed outside this collection's ported range but
-# compose.yml mounts it read-only, so it must already exist on the target
-# host before this role runs.
-github_review_repos_config: "{{ personal_root }}/repos.yml"
+# Credentials the config names by `env:`, as {VARIABLE: value}. Rendered into a
+# 0600 file the service loads; pass them from your own secret store, never
+# inline. Names only are in README.md.
+github_review_secrets: {}
 
-# Build the image the `claude` review provider runs in. Set it where a repo in your
-# agent-review.yml names `claude`; without the image that provider reports itself
-# unavailable.
-github_review_build_claude_image: false
+# Credentials the config names by `file:`, as {filename: content}. Placed 0600 in
+# {{ github_review_root }}/secrets, which the service sees read-only at
+# /run/secrets/github-review/<filename>. A codex login does NOT go here: the
+# service rewrites it, so it lives in the state dir (README.md).
+github_review_secret_files: {}
