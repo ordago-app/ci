@@ -21,6 +21,10 @@ class SessionRef:
 class ReviewResult:
     body: str
     event: str = "COMMENT"
+    # What the run cost in dollars, as the CLI reported it. None when the
+    # provider reports no figure (a subscription run, a CLI that died first),
+    # which is "unknown", never zero.
+    cost_usd: float | None = None
 
 
 def parse_verdict(text: str) -> ReviewResult:
@@ -52,11 +56,18 @@ class ProviderUnavailable(RuntimeError):
     """
 
     def __init__(
-        self, provider: str, reason: str, detail: str = "", *, read_diff: bool = False
+        self,
+        provider: str,
+        reason: str,
+        detail: str = "",
+        *,
+        read_diff: bool = False,
+        cost_usd: float | None = None,
     ) -> None:
         self.provider = provider
         self.reason = reason
         self.detail = detail
+        self.cost_usd = cost_usd
         # True when the run got far enough to spend: the model took turns before
         # the account gave out (a 429 mid-review). The run cap counts it.
         self.read_diff = read_diff
@@ -70,10 +81,28 @@ class ReviewLimitExceeded(RuntimeError):
     spend as much again and stop in the same place. So the head is given up on,
     not failed over or retried."""
 
-    def __init__(self, provider: str, detail: str) -> None:
+    def __init__(self, provider: str, detail: str, *, cost_usd: float | None = None) -> None:
         self.provider = provider
         self.detail = detail
+        self.cost_usd = cost_usd
         super().__init__(f"{provider} stopped at its review cap: {detail}")
+
+
+class ReviewFailed(RuntimeError):
+    """The review ran and failed for a reason about this job, not the provider.
+
+    A plain RuntimeError to everything that catches it; it exists to carry what
+    the failed run cost, since a run that read the diff was paid for."""
+
+    def __init__(self, message: str, *, cost_usd: float | None = None) -> None:
+        self.cost_usd = cost_usd
+        super().__init__(message)
+
+
+def run_cost(outcome: object) -> float | None:
+    """The dollar cost a review run's result or exception carries, if any."""
+    cost = getattr(outcome, "cost_usd", None)
+    return float(cost) if isinstance(cost, int | float) else None
 
 
 class ReviewProvider(Protocol):

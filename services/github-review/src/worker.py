@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
@@ -16,7 +17,10 @@ from .provider import (
     ReviewLimitExceeded,
     ReviewProvider,
     ReviewResult,
+    run_cost,
 )
+
+_log = logging.getLogger(__name__)
 
 # Opens the body of a carried approval, so a reader of the PR can tell one from a
 # review that read the diff. pr-land needs no marker: it counts only
@@ -521,12 +525,12 @@ class ReviewWorker:
                     result = provider.run_review(session, prompt, timeout_seconds=timeout_seconds)
                 except ProviderUnavailable as exc:
                     if exc.read_diff:
-                        self._store.record_provider_run(job.id)
+                        self._record_run(job, name, run_cost(exc))
                     raise
-                except Exception:
-                    self._store.record_provider_run(job.id)
+                except Exception as exc:
+                    self._record_run(job, name, run_cost(exc))
                     raise
-                self._store.record_provider_run(job.id)
+                self._record_run(job, name, run_cost(result))
                 with self._health:
                     self._outages.pop(name, None)
                     self._last_ok[name] = time.time()
@@ -551,6 +555,17 @@ class ReviewWorker:
         raise RuntimeError(
             "no review provider could run: "
             + "; ".join(f"{o.provider} [{o.reason}] {o.detail}" for o in outages)
+        )
+
+    def _record_run(self, job: ReviewJob, account: str, cost_usd: float | None) -> None:
+        self._store.record_provider_run(job.id, account, cost_usd)
+        _log.info(
+            "job %s %s#%s: %s ran, cost %s",
+            job.id,
+            job.repo,
+            job.pr_number,
+            account,
+            "unreported" if cost_usd is None else f"${cost_usd:.4f}",
         )
 
     @staticmethod

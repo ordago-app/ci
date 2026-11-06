@@ -522,3 +522,33 @@ def test_an_outage_counts_toward_the_run_cap_only_once_the_model_ran(
     posted = worker.store.list_by_status(JobStatus.POSTED)[0]
     assert work.runs == 1
     assert worker.store.runs_for(posted.repo, posted.pr_number) == counted + 1
+
+
+def test_each_account_is_charged_for_its_own_run_in_a_failover(tmp_path: Path) -> None:
+    """Each api_key account is somebody's credit: a failover that spent on both
+    must charge each its own run, not the reviewer that posted."""
+
+    class GaveOut(ScriptedProvider):
+        def run_review(self, session, prompt, timeout_seconds):
+            self.runs += 1
+            raise ProviderUnavailable(self.name, "exhausted", "429", read_diff=True, cost_usd=0.75)
+
+    class Priced(ScriptedProvider):
+        def run_review(self, session, prompt, timeout_seconds):
+            self.runs += 1
+            return ReviewResult(body=self.body, event="APPROVE", cost_usd=1.5)
+
+    gh = FakeGitHub()
+    worker = _worker(
+        tmp_path,
+        {"claude-a": GaveOut("claude-a"), "claude-b": Priced("claude-b")},
+        "[claude-a, claude-b]",
+        gh,
+    )
+
+    tick_and_drain(worker)
+
+    assert {row["account"]: row["cost_usd"] for row in worker.store.spend_by_account(0)} == {
+        "claude-b": 1.5,
+        "claude-a": 0.75,
+    }

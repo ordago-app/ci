@@ -198,6 +198,14 @@ Per repo, also: `enabled` (true), `review_drafts` (false), `review_dependency_bo
 (false), `run_ci_first` (true), `review_mode` (`all` | `labeled`, default `all`),
 `max_runtime_minutes` (30). Unknown keys are refused, not ignored.
 
+**What each account spent.** Every paid run is logged (`job N owner/repo#PR:
+<account> ran, cost $X`) and recorded per account in `jobs.db`'s `review_runs`,
+and `/status` returns the totals for the last day and 30 days under `spend`. The
+cost is the Claude CLI's own `total_cost_usd`, failed runs included; Codex
+reports none, so its runs count in `runs` but not in `priced_runs`. Read it on
+the host with `docker exec github-review-<instance> python -c "import
+urllib.request;print(urllib.request.urlopen('http://localhost:8000/status').read().decode())"`.
+
 The GitHub App needs Pull requests: write, Contents: read, Checks: read and
 Metadata: read, installed on every account that owns a reviewed repo. Tokens
 are minted in the service, one per repo, scoped to that repo.
