@@ -7,8 +7,8 @@ name: github-review-${GITHUB_REVIEW_INSTANCE:?}
 
 services:
   github-review:
-    image: ordago-ci/github-review:${GITHUB_REVIEW_INSTANCE:?}
-    build: .
+    # Published by .github/workflows/images.yml at the pinned commit; never built here.
+    image: ${GITHUB_REVIEW_IMAGE:?}
     container_name: github-review-${GITHUB_REVIEW_INSTANCE:?}
     restart: unless-stopped
     # Run tini as PID 1 so exited children are reaped. The worker shells out to
@@ -24,8 +24,8 @@ services:
       - PROJECTS_ROOT=${GITHUB_REVIEW_PROJECTS_DIR:?}
       - WORKTREE_RUN_AS_UID=${GITHUB_REVIEW_RUN_AS_UID:?}
       - WORKTREE_RUN_AS_GID=${GITHUB_REVIEW_RUN_AS_GID:?}
-      - CLAUDE_REVIEW_IMAGE=ordago-ci/claude-review:${GITHUB_REVIEW_INSTANCE:?}
-      - CODEX_REVIEW_IMAGE=ordago-ci/codex-review:${GITHUB_REVIEW_INSTANCE:?}
+      - CLAUDE_REVIEW_IMAGE=${CLAUDE_REVIEW_IMAGE:?}
+      - CODEX_REVIEW_IMAGE=${CODEX_REVIEW_IMAGE:?}
     # The credentials the config names by `env:`. A file, not inline here: this
     # compose file is world-readable on the host, the secrets file is 0600.
     env_file:

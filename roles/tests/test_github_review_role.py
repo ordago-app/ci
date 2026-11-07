@@ -78,18 +78,31 @@ def test_secrets_are_rendered_privately_and_never_logged() -> None:
             assert copy.get("owner") == "root"
 
 
-def test_the_sandbox_images_are_built_here_and_named_as_the_service_expects() -> None:
-    build = next(t for t in _tasks() if "community.docker.docker_image" in t)
-    image = build["community.docker.docker_image"]
-    assert sorted(build["loop"]) == ["claude-review", "codex-review"]
-    assert image["name"] == "ordago-ci/{{ item }}"
-    assert image["tag"] == "{{ github_review_instance }}"
-    assert image["build"]["path"] == "{{ github_review_root }}/app/{{ item }}"
-    for item in build["loop"]:
-        assert (SERVICE / item / "Dockerfile").is_file()
-    compose = (SERVICE / "compose.yml").read_text()
-    for item in build["loop"]:
-        assert f"ordago-ci/{item}:${{GITHUB_REVIEW_INSTANCE:?}}" in compose
+def test_every_image_is_pulled_from_the_pinned_commit_and_none_is_built() -> None:
+    """A host holds no copy of the code: the service and both sandboxes are the images
+    this repository published at the commit the consumer pinned."""
+    tasks = _tasks()
+    assert not any(t.get("ansible.posix.synchronize") for t in tasks)
+    pull = next(t for t in tasks if "community.docker.docker_image" in t)
+    assert pull["community.docker.docker_image"]["source"] == "pull"
+    assert pull["community.docker.docker_image"]["name"] == (
+        "{{ ci_image_registry }}/{{ item }}:{{ ci_image_tag }}"
+    )
+    assert sorted(pull["loop"]) == ["github-review-claude", "github-review-codex"]
+
+    up = next(t for t in tasks if t["name"] == "github-review stack up")
+    assert up["community.docker.docker_compose_v2"]["build"] == "never"
+
+    env = next(
+        t["ansible.builtin.copy"]["content"]
+        for t in tasks
+        if str((t.get("ansible.builtin.copy") or {}).get("dest", "")).endswith("/app/.env")
+    )
+    for image in ("github-review", "github-review-claude", "github-review-codex"):
+        assert f"/{image}:{{{{ ci_image_tag }}}}" in env
+    assert "ci_image_tag" in yaml.dump(
+        [t["ansible.builtin.assert"] for t in tasks if "ansible.builtin.assert" in t]
+    )
 
 
 def test_the_network_compose_joins_exists_before_compose_runs() -> None:
