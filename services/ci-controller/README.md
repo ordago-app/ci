@@ -12,8 +12,8 @@ registration token and a one-job (`--ephemeral`) runner container spawned via a
 its RAM reservation frees. Excess jobs stay queued on GitHub (back-pressure).
 
 Supersedes the static pools in `services/github-actions-runner` (which become
-`ci-controller` config). CI-green → review is unchanged — handled by the existing
-`request-review.yml` reusable workflow.
+`ci-controller` config). Automated review uses no lane: `github-review` polls for new
+heads itself.
 
 ## Architecture: scheduler + dispatcher, one ledger, multiple hosts
 
@@ -68,11 +68,42 @@ choice for the second host.
 - `repos[].label_class` — the allowlist + label→class map (also the ACL).
 - `hosts` — per-host `docker_endpoint`, `allowed_classes`, `cpu_shares`, plus optional
   overrides of any of the above (see "Architecture" above and ADR 0016).
+- `review_admission` — `cheap_classes` (go first among heads under review),
+  `session_host` and `session_ram_mb` (what each running review container is charged).
+  Required; see "Review-aware admission" below.
+
+`GITHUB_REVIEW_URL` (required env, `http://github-review:8000` in `compose.yml`) is where
+per-head review state is read.
+
+## Review-aware admission
+
+See [ADR 0032](../../docs/decisions/0032-review-aware-admission-binds-through-a-run-pin.md).
+Each tick the controller asks github-review's `GET /heads` for the review state of every
+queued job's head and stamps it on the job. Admission then ranks jobs **pinned to their
+own run** (`runs-on` carries `run-${{ github.run_id }}`): approved or unreviewed first,
+then heads under review (cheap classes before heavy), then heads with changes requested,
+which are deferred `review_held` while anything ranked above them waits on a capacity
+gate. Largest-first orders jobs within a rank. An unpinned job is not ranked, because
+GitHub would hand its lane to any job with the same labels.
+
+While another job waits for a lane, rejected heads' runs with no job in progress and no
+lane held by the controller are cancelled (`cancel` events in `metrics.db`). Needs the
+runner App's Actions: write.
+
+github-review unreachable: jobs admit untiered, largest-first, with an ERROR log and
+`review_state_reachable: false` in `/status`. Never a stall.
+
+Review containers (`claude-review-*`, `codex-review-*`) on `session_host` are counted
+every tick and charged `session_ram_mb` each against that host's budget, so reviews and
+lanes share one capacity model. `/status` reports the count as `review_sessions`; it is
+not part of `ledger_ram_mb`, which sums lanes.
 
 ## Security model
 
 - The controller holds the runner App private key; **lanes never do** (they get only a
   short-lived registration token). Safe because every onboarded repo is private + single-owner.
+  The App's Actions: write is used for one call only, cancelling a rejected head's
+  still-queued run (`GitHubAdapter.cancel_queued_run`).
 - The controller talks to Docker only through `docker-socket-proxy`, scoped to
   container create/start/list/remove. No raw socket, no `exec`, no images/volumes.
 - `/metrics` + `/status` are `expose`-only (no Caddy route, no public ingress).
@@ -94,6 +125,7 @@ choice for the second host.
   the first tick that deferred the job and *is* in-memory, so it does reset on a
   restart — the durable version of that history is the `defer` events in `metrics.db`,
   and querying those behind a page that polls every 5s is not a trade worth making.
-  Both are null rather than zero when unknown.
+  Both are null rather than zero when unknown. `deferred[].review` is the head's review
+  state, null when github-review has no row for it.
 - Onboard a repo: `make ci-onboard REPO=owner/name`.
 - Deploy: from the main checkout, `... services.yml --tags ci-controller --diff`.

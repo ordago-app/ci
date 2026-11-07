@@ -7,6 +7,9 @@ services:
       # Allow only what the controller needs to create/start/list/remove lanes.
       CONTAINERS: 1
       POST: 1
+      # Read-only: the daemon host's kernel, memory and container counts. The pool
+      # reads MemTotal from it as an elastic host's RAM offer (ram_offer_reserve_mb).
+      INFO: 1
       # Everything else denied (default 0, pinned explicitly for the wiring test).
       EXEC: 0
       IMAGES: 0
@@ -78,6 +81,9 @@ services:
       RUNNER_HOST: powerserver
       DOCKER_PROXY_URL: tcp://docker-socket-proxy:2375
       CI_CONTROLLER_DB: /var/lib/ci-controller/metrics.db
+      # Per-head review state for admission tiers (docs/decisions/0032). Reached over
+      # the homelab network through ci-fabric's namespace.
+      GITHUB_REVIEW_URL: http://github-review:8000
     env_file:
       - path: /opt/personal/secrets/github-actions-runner.env
         required: false

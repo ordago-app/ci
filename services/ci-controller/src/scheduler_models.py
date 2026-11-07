@@ -21,7 +21,12 @@ def decision_from_wire(data: dict[str, Any]) -> Decision:
     if kind == "admit":
         return AdmitDecision(job=job, **payload)
     if kind == "defer":
-        return DeferDecision(job, tuple(payload.pop("reasons")), **payload)
+        gates_by_host = {
+            host: tuple(gates) for host, gates in payload.pop("gates_by_host", {}).items()
+        }
+        return DeferDecision(
+            job, tuple(payload.pop("reasons")), gates_by_host=gates_by_host, **payload
+        )
     raise ValueError(f"unknown decision kind: {kind!r}")
 
 
@@ -45,6 +50,11 @@ class PlanRequest(BaseModel):
     jobs: list[dict[str, Any]]
     host_stats: dict[str, HostStatsWire]
     healthy: list[str] | None
+    review_sessions: int
+    # Defaulted so a dispatcher from before elastic hosts still talks to this scheduler
+    # mid-redeploy. The default is the safe side: an elastic host with no offer admits
+    # nothing (admission.ram_budget_mb), it never falls back to its ceiling.
+    ram_offers: dict[str, int] = {}
 
 
 class PlanResponse(BaseModel):

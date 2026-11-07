@@ -25,6 +25,7 @@ def test_plan_returns_an_admit_decision(client):
         "jobs": [{"job_id": 1, "repo": "ordago-app/ordago-apps", "labels": ["ordago-ci"]}],
         "host_stats": {},
         "healthy": None,
+        "review_sessions": 0,
     }
     decisions = client.post("/plan", json=body).json()["decisions"]
 
@@ -38,6 +39,7 @@ def test_commit_update_and_release(client):
         "jobs": [{"job_id": 1, "repo": "ordago-app/ordago-apps", "labels": ["ordago-ci"]}],
         "host_stats": {},
         "healthy": None,
+        "review_sessions": 0,
     }
     decision = client.post("/plan", json=body).json()["decisions"][0]
 
@@ -82,3 +84,32 @@ def test_adopt_reinserts_a_reservation(client):
     }
     assert client.post("/lanes/adopt", json={"reservation": res}).status_code == 204
     assert client.get("/lanes").json()["lanes"][0]["lane_id"] == "lane-z"
+
+
+def test_plan_carries_review_state_and_review_sessions_over_the_wire(client):
+    """The scheduler runs in its own container: a field lost in transit would silently
+    turn review tiers and the review charge off."""
+    pinned = {
+        "repo": "ordago-app/ordago-apps",
+        "run_id": 7,
+        "head_sha": "sha",
+        "labels": ["ordago-ci", "run-7"],
+    }
+    body = {
+        "jobs": [
+            {**pinned, "job_id": 1, "review": "changes_requested"},
+            {**pinned, "job_id": 2, "review": "pending"},
+        ],
+        "host_stats": {},
+        "healthy": None,
+        # 12000 MB budget; 19 x 600 leaves 600, so no 700 MB light job fits.
+        "review_sessions": 19,
+    }
+
+    decisions = client.post("/plan", json=body).json()["decisions"]
+
+    assert [(d["job"]["job_id"], d["reasons"]) for d in decisions] == [
+        (2, ["budget_full"]),
+        (1, ["review_held"]),
+    ]
+    assert decisions[1]["job"]["review"] == "changes_requested"

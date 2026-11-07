@@ -15,6 +15,7 @@ from src.github_adapter import GitHubAdapter
 from src.host_stats import read_host_stats
 from src.ledger import Ledger
 from src.metrics import MetricsStore
+from src.review_client import ReviewStateClient
 from src.scheduler import LocalScheduler, Scheduler
 from src.scheduler_client import HttpScheduler
 
@@ -50,6 +51,7 @@ def main() -> None:
         raise SystemExit(f"RUNNER_HOST '{host}' is not a configured host")
 
     scheduler = build_scheduler(config, os.environ.get("CI_SCHEDULER_URL"))
+    reviews = ReviewStateClient(_require("GITHUB_REVIEW_URL"))
 
     private_key = base64.b64decode(_require("GITHUB_RUNNER_APP_PRIVATE_KEY_B64")).decode()
     github = GitHubAdapter(
@@ -70,6 +72,7 @@ def main() -> None:
         metrics=metrics,
         host_stats_reader=read_host_stats,
         host=host,
+        reviews=reviews,
     )
     app = create_app(controller, poll_interval=poll_interval)
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

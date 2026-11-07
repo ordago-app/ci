@@ -21,6 +21,9 @@ class Scheduler(Protocol):
         jobs: list[QueuedJob],
         host_stats: dict[str, HostStats],
         healthy: set[str] | None,
+        *,
+        review_sessions: int,
+        ram_offers: dict[str, int],
     ) -> list[Decision]: ...
 
     def commit(
@@ -53,8 +56,19 @@ class LocalScheduler:
         jobs: list[QueuedJob],
         host_stats: dict[str, HostStats],
         healthy: set[str] | None,
+        *,
+        review_sessions: int,
+        ram_offers: dict[str, int],
     ) -> list[Decision]:
-        return evaluate(jobs, self.ledger, self.config, host_stats, healthy)
+        return evaluate(
+            jobs,
+            self.ledger,
+            self.config,
+            host_stats,
+            healthy,
+            review_sessions=review_sessions,
+            ram_offers=ram_offers,
+        )
 
     def commit(
         self,

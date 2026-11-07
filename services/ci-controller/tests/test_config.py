@@ -230,10 +230,6 @@ def test_work_dir_mode_defaults_to_bind(write_config) -> None:
     assert cfg.resolved_hosts()["powerserver"].work_dir_mode == "bind"
 
 
-OPERATOR_CONFIG = Path(__file__).resolve().parents[3] / "personal" / "ci-controller.yml"
-REPO_REGISTRY = Path(__file__).resolve().parents[3] / "personal" / "repos.yml"
-
-
 def test_repos_are_resolved_through_the_shared_registry(write_config) -> None:
     """`repos:` names projects; the GitHub owner/name comes from
     personal/repos.yml, so a repo that changes owner is one edit in one file."""
@@ -278,3 +274,34 @@ def test_a_registry_entry_that_is_not_owner_name_is_rejected(tmp_path) -> None:
 # Consumers keep these tests against their own config. If this repo ever needs
 # an equivalent, it validates the SCHEMA against a fixture, not a real
 # operator's file.
+
+
+def test_review_admission_is_required(write_config) -> None:
+    """No silent default: without it reviews would fall out of the budget unnoticed."""
+    start = VALID_CONFIG.index("review_admission:")
+    end = VALID_CONFIG.index("repos:")
+    with pytest.raises(ConfigError, match="review_admission"):
+        ControllerConfig.load(write_config(VALID_CONFIG[:start] + VALID_CONFIG[end:]))
+
+
+def test_review_admission_cheap_classes_must_exist(write_config) -> None:
+    text = VALID_CONFIG.replace("cheap_classes: [light]", "cheap_classes: [lint]")
+    with pytest.raises(ConfigError, match="cheap_classes references unknown class 'lint'"):
+        ControllerConfig.load(write_config(text))
+
+
+def test_review_admission_session_host_must_be_a_host(write_config) -> None:
+    text = VALID_CONFIG.replace("session_host: powerserver", "session_host: elsewhere")
+    with pytest.raises(ConfigError, match="session_host 'elsewhere' is not a host"):
+        ControllerConfig.load(write_config(text))
+
+
+def test_a_ram_offer_reserve_must_be_positive(write_config) -> None:
+    text = VALID_CONFIG + (
+        "hosts:\n"
+        "  powerserver:\n"
+        "    docker_endpoint: tcp://docker-socket-proxy:2375\n"
+        "    ram_offer_reserve_mb: 0\n"
+    )
+    with pytest.raises(ConfigError, match="ram_offer_reserve_mb"):
+        ControllerConfig.load(write_config(text))

@@ -31,7 +31,13 @@ def create_scheduler_app(scheduler: LocalScheduler) -> FastAPI:
         jobs = [QueuedJob(**j) for j in req.jobs]
         stats = {name: HostStats(**s.model_dump()) for name, s in req.host_stats.items()}
         healthy = set(req.healthy) if req.healthy is not None else None
-        decisions = scheduler.plan(jobs, stats, healthy)
+        decisions = scheduler.plan(
+            jobs,
+            stats,
+            healthy,
+            review_sessions=req.review_sessions,
+            ram_offers=req.ram_offers,
+        )
         return PlanResponse(decisions=[decision_to_wire(d) for d in decisions])
 
     @app.post("/lanes", status_code=204)

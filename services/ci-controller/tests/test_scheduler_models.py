@@ -44,3 +44,19 @@ def test_reservation_round_trips_including_none_fields():
     )
 
     assert reservation_from_wire(reservation_to_wire(res)) == res
+
+
+def test_defer_decision_round_trips_every_hosts_gates():
+    job = QueuedJob(job_id=9, repo="o/r", labels=[])
+    decision = DeferDecision(
+        job,
+        ("host_pressure",),
+        host="powerserver",
+        class_name="node",
+        gates_by_host={"powerserver": ("host_pressure",), "desktop": ("budget_full",)},
+    )
+
+    restored = decision_from_wire(decision_to_wire(decision))
+
+    assert restored == decision
+    assert restored.gates_by_host["desktop"] == ("budget_full",)

@@ -223,3 +223,42 @@ def test_fabric_healthcheck_proves_the_tailnet_is_up_not_just_the_process():
     check = _compose()["services"]["ci-fabric"]["healthcheck"]
     probe = " ".join(check["test"]) if isinstance(check["test"], list) else check["test"]
     assert "tailscale" in probe and "status" in probe
+
+
+def test_controller_healthcheck_would_fail_in_a_dead_shared_namespace():
+    """ci-controller borrows ci-fabric's namespace (`network_mode: service:ci-fabric`).
+    Docker does not restart a dependent when the container whose namespace it borrows
+    restarts, so any sidecar bounce strands the dispatcher in a namespace with no DNS:
+    the process is fine, and every outbound call fails.
+
+    Observed twice, both times at boot: 2026-08-28 (sidecar finished 39 s after the
+    dispatcher) and 2026-08-30 (33 s), the second costing an hour of silent CI downtime.
+
+    So the probe must exercise **name resolution**. A liveness probe passes in exactly
+    the broken state, which is what made this silent: on 2026-08-26 every container read
+    `Up` and `/healthz` returned 200 while no repo was being polled at all.
+    """
+    hc = _compose()["services"]["ci-controller"].get("healthcheck")
+    assert hc, (
+        "ci-controller must have a healthcheck; without one the orphaned-namespace "
+        "state is indistinguishable from a healthy container"
+    )
+
+    test = hc["test"]
+    probe = " ".join(test) if isinstance(test, list) else str(test)
+
+    assert "/status" in probe, (
+        "probe /status: it calls the scheduler by name, so it fails when resolution is "
+        "gone. That is the call that actually broke on 2026-08-28 and 2026-08-30."
+    )
+    assert "/healthz" not in probe, (
+        "/healthz answers from the dispatcher's own process and returned 200 throughout "
+        "the 2026-08-26 outage -- it cannot see this failure"
+    )
+
+    # The probe is only useful if it is allowed to fail and to settle.
+    assert hc.get("retries", 0) >= 2, "a single failed probe must not condemn the container"
+    assert "start_period" in hc, (
+        "the dispatcher and its sidecar both start at boot; without a start_period the "
+        "probe fails during normal startup"
+    )

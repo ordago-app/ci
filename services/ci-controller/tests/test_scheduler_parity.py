@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 from src.config import ControllerConfig
 from src.ledger import Ledger
-from src.models import QueuedJob
+from src.models import BUDGET_FULL, AdmitDecision, DeferDecision, QueuedJob
 from src.scheduler import LocalScheduler
 from src.scheduler_api import create_scheduler_app
 from src.scheduler_client import HttpScheduler
@@ -63,8 +63,8 @@ def pair(write_config):
 def test_same_decisions_over_a_full_admission_batch(pair):
     local, remote = pair
 
-    local_decisions = local.plan(JOBS, {}, None)
-    remote_decisions = remote.plan(JOBS, {}, None)
+    local_decisions = local.plan(JOBS, {}, None, review_sessions=0, ram_offers={})
+    remote_decisions = remote.plan(JOBS, {}, None, review_sessions=0, ram_offers={})
 
     assert [type(d).__name__ for d in local_decisions] == [
         type(d).__name__ for d in remote_decisions
@@ -73,3 +73,38 @@ def test_same_decisions_over_a_full_admission_batch(pair):
         getattr(d, "host", None) for d in remote_decisions
     ]
     assert [d.job.job_id for d in local_decisions] == [d.job.job_id for d in remote_decisions]
+
+
+ELASTIC_CONFIG = (
+    VALID_CONFIG
+    + """\
+hosts:
+  powerserver:
+    docker_endpoint: tcp://docker-socket-proxy:2375
+  desktop:
+    docker_endpoint: tcp://desktop:2375
+    ram_offer_reserve_mb: 1000
+"""
+)
+
+
+@pytest.mark.parametrize(
+    ("offers", "admitted"),
+    [({"desktop": 2500}, True), ({"desktop": 500}, False), ({}, False)],
+    ids=["offer-fits", "offer-too-small", "no-offer"],
+)
+def test_offers_cross_the_wire_into_admission(write_config, offers, admitted):
+    backing = LocalScheduler(ControllerConfig.load(write_config(ELASTIC_CONFIG)), Ledger())
+    remote = HttpScheduler(
+        "http://sched",
+        transport=_TestClientTransport(TestClient(create_scheduler_app(backing))),
+        retries=1,
+        backoff=0.0,
+    )
+
+    (decision,) = remote.plan(JOBS[:1], {}, {"desktop"}, review_sessions=0, ram_offers=offers)
+
+    assert isinstance(decision, AdmitDecision) is admitted
+    if not admitted:
+        assert isinstance(decision, DeferDecision)
+        assert BUDGET_FULL in decision.reasons

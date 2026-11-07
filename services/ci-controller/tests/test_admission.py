@@ -50,9 +50,42 @@ classes:
   light:
     ram_mb: 900
     work_disk: ssd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
+      homelab: light
+"""
+
+# Two non-KVM classes of very different size, and a budget that fits the big one plus
+# exactly one small one. Arrival order alone decides whether the big one ever runs.
+MIXED_SIZE_CONFIG = """\
+ram_budget_mb: 5000
+max_concurrent_lanes: 8
+default_host: powerserver
+default_class: light
+runner_image: homelab/github-actions-runner:latest
+work_dirs:
+  ssd: /mnt/ci-ssd/ci-controller
+  hdd: /opt/personal/github-actions/ci-controller
+classes:
+  heavy:
+    ram_mb: 4000
+    work_disk: ssd
+  light:
+    ram_mb: 700
+    work_disk: ssd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
+repos:
+  - project: homelab
+    label_class:
+      homelab-heavy: heavy
       homelab: light
 """
 
@@ -77,6 +110,10 @@ classes:
     ram_mb: 700
     work_disk: hdd
     work_gb: 50
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
@@ -105,6 +142,10 @@ classes:
     ram_mb: 2500
     needs_kvm: true
     work_disk: hdd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
@@ -138,6 +179,10 @@ classes:
     ram_mb: 2500
     needs_kvm: true
     work_disk: hdd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
@@ -167,6 +212,10 @@ classes:
   light:
     ram_mb: 700
     work_disk: ssd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
@@ -193,6 +242,10 @@ classes:
   light:
     ram_mb: 700
     work_disk: ssd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
@@ -429,6 +482,78 @@ def test_a_job_deferred_by_the_primary_lands_on_the_second_host(write_config) ->
     assert decision.class_name == "light"
 
 
+# powervaro-ci offers MORE headroom than powerserver, so without a rank it would win
+# every job; ranking powerserver first must override that and nothing else.
+RANKED_HOSTS_CONFIG = """\
+ram_budget_mb: 4000
+max_concurrent_lanes: 2
+default_class: light
+default_host: powerserver
+runner_image: homelab/github-actions-runner:latest
+work_dirs:
+  ssd: /mnt/ci-ssd/ci-controller
+  hdd: /opt/personal/github-actions/ci-controller
+classes:
+  light:
+    ram_mb: 700
+    work_disk: ssd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
+repos:
+  - project: homelab
+    label_class:
+      homelab: light
+hosts:
+  powerserver:
+    docker_endpoint: tcp://docker-socket-proxy:2375
+  powervaro-ci:
+    docker_endpoint: tcp://100.64.0.2:2375
+    ram_budget_mb: 20000
+    max_concurrent_lanes: 10
+    placement_rank: 1
+"""
+
+
+def test_the_lowest_ranked_host_wins_over_one_with_more_headroom(write_config) -> None:
+    config = ControllerConfig.load(write_config(RANKED_HOSTS_CONFIG))
+
+    (decision,) = evaluate([_homelab_job(1)], Ledger(), config)
+
+    assert isinstance(decision, AdmitDecision)
+    assert decision.host == "powerserver"
+
+
+def test_a_job_the_preferred_host_cannot_take_spills_to_the_next_rank(write_config) -> None:
+    """Rank is a preference, never a gate: a full first host must not leave a job queued
+    while a later one has room. The batch fills powerserver's 2 lanes, then spills."""
+    config = ControllerConfig.load(write_config(RANKED_HOSTS_CONFIG))
+    jobs = [_homelab_job(job_id) for job_id in (1, 2, 3, 4)]
+
+    decisions = evaluate(jobs, Ledger(), config)
+
+    assert all(isinstance(d, AdmitDecision) for d in decisions)
+    assert [d.host for d in decisions] == [
+        "powerserver",
+        "powerserver",
+        "powervaro-ci",
+        "powervaro-ci",
+    ]
+
+
+def test_an_unset_rank_keeps_most_headroom_placement(write_config) -> None:
+    """Every host predates placement_rank; omitting it everywhere must not move work."""
+    config = ControllerConfig.load(
+        write_config(RANKED_HOSTS_CONFIG.replace("    placement_rank: 1\n", ""))
+    )
+
+    (decision,) = evaluate([_homelab_job(1)], Ledger(), config)
+
+    assert isinstance(decision, AdmitDecision)
+    assert decision.host == "powervaro-ci"
+
+
 def test_the_emulator_class_is_never_scheduled_off_its_allowed_host(write_config) -> None:
     """allowed_classes is a hard filter, not a preference."""
     config = ControllerConfig.load(write_config(TWO_HOST_CONFIG))
@@ -536,11 +661,63 @@ def test_reasons_match_the_closest_host_not_the_first(write_config) -> None:
     assert decision.reason == LANE_CEILING
 
 
+def test_a_defer_names_every_hosts_gates_not_only_the_closest(write_config) -> None:
+    """Reporting only the closest host hid why a roomier one refused: on 2026-11-07 node
+    jobs read `budget_full` (the elastic host was 42 MB short) while powerserver, its
+    reserve half empty, was actually holding them on host_pressure."""
+    config = ControllerConfig.load(write_config(TWO_HOST_CONFIG))
+    ledger = Ledger()
+    ledger.add(
+        Reservation(
+            lane_id="lane-ps",
+            spawned_for_job_id=1,
+            repo="alvaro-francisco-gil/homelab",
+            class_name="light",
+            ram_mb=3500,
+            needs_kvm=False,
+            host="powerserver",
+        )
+    )
+    for index in (2, 3):
+        ledger.add(
+            Reservation(
+                lane_id=f"lane-pv-{index}",
+                spawned_for_job_id=index,
+                repo="alvaro-francisco-gil/homelab",
+                class_name="light",
+                ram_mb=700,
+                needs_kvm=False,
+                host="powervaro-ci",
+            )
+        )
+
+    (decision,) = evaluate([_homelab_job(4)], ledger, config)
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.gates_by_host == {
+        "powerserver": (LANE_CEILING, BUDGET_FULL),
+        "powervaro-ci": (LANE_CEILING,),
+    }
+
+
+def test_a_defer_that_is_no_capacity_verdict_names_no_host_gates(write_config) -> None:
+    config = ControllerConfig.load(write_config(TWO_HOST_CONFIG))
+
+    (decision,) = evaluate([_homelab_job(1)], Ledger(), config, healthy=set())
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.gates_by_host == {}
+
+
 def test_single_host_config_produces_identical_decisions_to_the_pre_hosts_behaviour(
     write_config,
 ) -> None:
     """Equivalence: run the existing CROWDED_CONFIG fixtures and assert the same
-    (kind, reasons) sequence the pre-migration suite asserted."""
+    (kind, reasons) verdict per job the pre-migration suite asserted.
+
+    Keyed by job id, not by position: decisions come back largest-reserve-first, which
+    is the ordering `test_the_biggest_job_is_admitted_ahead_of_smaller_ones_queued_before_it`
+    owns. What must not drift is the verdict each job gets."""
     crowded = ControllerConfig.load(write_config(CROWDED_CONFIG))
     crowded_jobs = [
         _homelab_job(1),
@@ -550,11 +727,11 @@ def test_single_host_config_produces_identical_decisions_to_the_pre_hosts_behavi
 
     crowded_decisions = evaluate(crowded_jobs, Ledger(), crowded)
 
-    assert [_shape(d) for d in crowded_decisions] == [
-        ("admit", ("light",)),
-        ("defer", (LANE_CEILING, BUDGET_FULL)),
-        ("defer", (NOT_ALLOWLISTED,)),
-    ]
+    assert {d.job.job_id: _shape(d) for d in crowded_decisions} == {
+        1: ("admit", ("light",)),
+        2: ("defer", (LANE_CEILING, BUDGET_FULL)),
+        3: ("defer", (NOT_ALLOWLISTED,)),
+    }
     assert all(d.host == "powerserver" for d in crowded_decisions if isinstance(d, AdmitDecision))
 
     valid = ControllerConfig.load(write_config(VALID_CONFIG))
@@ -568,11 +745,11 @@ def test_single_host_config_produces_identical_decisions_to_the_pre_hosts_behavi
 
     valid_decisions = evaluate(valid_jobs, ledger, valid)
 
-    assert [_shape(d) for d in valid_decisions] == [
-        ("defer", ("already_running",)),
-        ("admit", ("light",)),
-        ("admit", ("emulator",)),
-    ]
+    assert {d.job.job_id: _shape(d) for d in valid_decisions} == {
+        9: ("defer", ("already_running",)),
+        10: ("admit", ("light",)),
+        11: ("admit", ("emulator",)),
+    }
 
 
 def test_ties_break_by_host_name_ascending(write_config) -> None:
@@ -752,6 +929,10 @@ classes:
   light:
     ram_mb: 700
     work_disk: ssd
+review_admission:
+  cheap_classes: []
+  session_host: aaa-personal
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
@@ -817,6 +998,57 @@ def test_omitting_allowed_orgs_means_every_org(write_config):
 
     assert isinstance(decisions[0], AdmitDecision)
     assert decisions[0].host == "powerserver"
+
+
+def _homelab(job_id: int, label: str) -> QueuedJob:
+    return QueuedJob(job_id=job_id, repo="alvaro-francisco-gil/homelab", labels=[label])
+
+
+def test_the_biggest_job_is_admitted_ahead_of_smaller_ones_queued_before_it(
+    write_config,
+) -> None:
+    # Budget 5000. In arrival order the two lights (700 each) go first and heavy (4000)
+    # no longer fits; largest-first admits heavy and one light, and defers the other.
+    cfg = ControllerConfig.load(write_config(MIXED_SIZE_CONFIG))
+    jobs = [_homelab(1, "homelab"), _homelab(2, "homelab"), _homelab(3, "homelab-heavy")]
+
+    decisions = evaluate(jobs, Ledger(), cfg)
+
+    admitted = {d.job.job_id: d.class_name for d in decisions if isinstance(d, AdmitDecision)}
+    deferred = [d for d in decisions if isinstance(d, DeferDecision)]
+    assert admitted == {3: "heavy", 1: "light"}
+    assert [d.job.job_id for d in deferred] == [2]
+    assert deferred[0].reasons == (BUDGET_FULL,)
+
+
+def test_jobs_reserving_the_same_amount_keep_arrival_order(write_config) -> None:
+    # Stability: with one light-sized slot left after heavy, the FIRST light queued wins.
+    cfg = ControllerConfig.load(write_config(MIXED_SIZE_CONFIG))
+    jobs = [_homelab(3, "homelab-heavy"), _homelab(1, "homelab"), _homelab(2, "homelab")]
+
+    decisions = evaluate(jobs, Ledger(), cfg)
+
+    admitted = [d.job.job_id for d in decisions if isinstance(d, AdmitDecision)]
+    assert admitted == [3, 1]
+
+
+def test_an_unservable_job_is_ordered_last_without_changing_any_verdict(write_config) -> None:
+    # A job whose repo is not allowlisted reserves nothing, so it must neither consume
+    # budget nor push a real job behind it — it just reports not_allowlisted.
+    cfg = ControllerConfig.load(write_config(MIXED_SIZE_CONFIG))
+    jobs = [
+        QueuedJob(job_id=9, repo="alvaro-francisco-gil/not-served", labels=["homelab-heavy"]),
+        _homelab(3, "homelab-heavy"),
+        _homelab(1, "homelab"),
+    ]
+
+    decisions = evaluate(jobs, Ledger(), cfg)
+
+    admitted = [d.job.job_id for d in decisions if isinstance(d, AdmitDecision)]
+    unservable = next(d for d in decisions if d.job.job_id == 9)
+    assert admitted == [3, 1]
+    assert isinstance(unservable, DeferDecision)
+    assert unservable.reasons == (NOT_ALLOWLISTED,)
 
 
 def _load_guarded(write_config) -> ControllerConfig:
@@ -902,3 +1134,99 @@ def test_a_disabled_load_gate_ignores_load_and_cpu_pressure(write_config) -> Non
     job = QueuedJob(job_id=1, repo="alvaro-francisco-gil/homelab", labels=["homelab"])
     stats = HostStats(mem_available_mb=8000, load_1m=99.0, cpu_pressure_pct=100.0)
     assert isinstance(evaluate([job], Ledger(), cfg, {"powerserver": stats})[0], AdmitDecision)
+
+
+# ─── Elastic hosts: the budget follows the host's own offer ──────────────────────────
+# Only powervaro-ci is healthy below, so every verdict is that host's alone.
+ELASTIC_HOST_CONFIG = TWO_HOST_CONFIG.replace(
+    "    ram_budget_mb: 3000\n",
+    "    ram_budget_mb: 3000\n    ram_offer_reserve_mb: 1000\n",
+)
+
+DESKTOP_ONLY = {"powervaro-ci"}
+
+
+def test_an_elastic_host_is_budgeted_by_its_offer_below_the_ceiling(write_config) -> None:
+    config = ControllerConfig.load(write_config(ELASTIC_HOST_CONFIG))
+
+    # MemTotal 1500 - reserve 1000 = 500 MB on offer: a 700 MB light lane does not fit.
+    (decision,) = evaluate(
+        [_homelab_job(2)], Ledger(), config, healthy=DESKTOP_ONLY, ram_offers={"powervaro-ci": 500}
+    )
+
+    assert isinstance(decision, DeferDecision)
+    assert BUDGET_FULL in decision.reasons
+
+
+def test_an_elastic_host_admits_once_its_offer_grows(write_config) -> None:
+    config = ControllerConfig.load(write_config(ELASTIC_HOST_CONFIG))
+
+    (decision,) = evaluate(
+        [_homelab_job(2)], Ledger(), config, healthy=DESKTOP_ONLY, ram_offers={"powervaro-ci": 800}
+    )
+
+    assert isinstance(decision, AdmitDecision)
+    assert decision.host == "powervaro-ci"
+
+
+def test_an_offer_above_the_ceiling_is_capped_by_ram_budget_mb(write_config) -> None:
+    config = ControllerConfig.load(write_config(ELASTIC_HOST_CONFIG))
+    ledger = Ledger()
+    ledger.add(
+        Reservation(
+            "p1", 3, "alvaro-francisco-gil/homelab", "light", 2800, False, host="powervaro-ci"
+        )
+    )
+
+    # 2800 + 700 > the 3000 ceiling, however large the offer.
+    (decision,) = evaluate(
+        [_homelab_job(2)], ledger, config, healthy=DESKTOP_ONLY, ram_offers={"powervaro-ci": 30000}
+    )
+
+    assert isinstance(decision, DeferDecision)
+    assert BUDGET_FULL in decision.reasons
+
+
+def test_an_elastic_host_without_an_offer_admits_nothing(write_config) -> None:
+    """No reading must never mean "use the ceiling": that is the silent fallback that
+    would over-admit onto a guest the balloon has shrunk."""
+    config = ControllerConfig.load(write_config(ELASTIC_HOST_CONFIG))
+
+    (decision,) = evaluate([_homelab_job(2)], Ledger(), config, healthy=DESKTOP_ONLY, ram_offers={})
+
+    assert isinstance(decision, DeferDecision)
+    assert BUDGET_FULL in decision.reasons
+
+
+def test_a_host_without_a_reserve_ignores_offers(write_config) -> None:
+    config = ControllerConfig.load(write_config(TWO_HOST_CONFIG))
+
+    (decision,) = evaluate(
+        [_homelab_job(2)], Ledger(), config, healthy=DESKTOP_ONLY, ram_offers={"powervaro-ci": 0}
+    )
+
+    assert isinstance(decision, AdmitDecision)
+    assert decision.host == "powervaro-ci"
+
+
+def test_an_offer_that_shrinks_below_what_is_reserved_defers_new_work(write_config) -> None:
+    """The balloon never squeezes running lanes, but the offer can fall under what they
+    hold. Admission must then stop, not admit against a negative headroom."""
+    config = ControllerConfig.load(write_config(ELASTIC_HOST_CONFIG))
+    ledger = Ledger()
+    ledger.add(
+        Reservation(
+            "p1", 3, "alvaro-francisco-gil/homelab", "light", 700, False, host="powervaro-ci"
+        )
+    )
+
+    grown, shrunk = (
+        evaluate(
+            [_homelab_job(2)], ledger, config, healthy=DESKTOP_ONLY, ram_offers={"powervaro-ci": mb}
+        )[0]
+        for mb in (1400, 600)
+    )
+
+    assert isinstance(grown, AdmitDecision)
+    assert isinstance(shrunk, DeferDecision)
+    assert BUDGET_FULL in shrunk.reasons

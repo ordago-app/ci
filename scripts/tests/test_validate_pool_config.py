@@ -13,6 +13,7 @@ runner_image: fixture/runner:latest
 work_dirs: {ssd: /tmp/ssd, hdd: /tmp/hdd}
 classes:
   light: {ram_mb: 700, work_disk: ssd}
+review_admission: {cheap_classes: [light], session_host: fixture-host, session_ram_mb: 600}
 repos:
   - project: demo
     label_class: {demo-ci: light}

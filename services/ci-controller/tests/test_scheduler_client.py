@@ -37,7 +37,9 @@ def test_plan_parses_decisions():
             },
         )
 
-    decisions = _client(handler).plan([QueuedJob(job_id=1, repo="o/r")], {}, None)
+    decisions = _client(handler).plan(
+        [QueuedJob(job_id=1, repo="o/r")], {}, None, review_sessions=0, ram_offers={}
+    )
 
     assert isinstance(decisions[0], AdmitDecision)
     assert decisions[0].host == "powerserver"
@@ -52,7 +54,7 @@ def test_retries_then_succeeds():
             raise httpx.ConnectError("refused", request=request)
         return httpx.Response(200, json={"decisions": []})
 
-    assert _client(handler).plan([], {}, None) == []
+    assert _client(handler).plan([], {}, None, review_sessions=0, ram_offers={}) == []
     assert len(attempts) == 3
 
 
@@ -61,7 +63,7 @@ def test_raises_after_exhausting_retries():
         raise httpx.ConnectError("refused", request=request)
 
     with pytest.raises(SchedulerUnavailable):
-        _client(handler).plan([], {}, None)
+        _client(handler).plan([], {}, None, review_sessions=0, ram_offers={})
 
 
 def test_update_unknown_lane_raises_keyerror():
@@ -94,7 +96,7 @@ def test_503_is_retried_then_succeeds():
             return httpx.Response(503, json={"detail": "restarting"})
         return httpx.Response(200, json={"decisions": []})
 
-    assert _client(handler).plan([], {}, None) == []
+    assert _client(handler).plan([], {}, None, review_sessions=0, ram_offers={}) == []
     assert len(attempts) == 3
 
 
@@ -103,7 +105,7 @@ def test_503_exhausts_retries_and_raises_scheduler_unavailable():
         return httpx.Response(503, json={"detail": "restarting"})
 
     with pytest.raises(SchedulerUnavailable):
-        _client(handler).plan([], {}, None)
+        _client(handler).plan([], {}, None, review_sessions=0, ram_offers={})
 
 
 def test_400_is_not_retried():
@@ -114,7 +116,7 @@ def test_400_is_not_retried():
         return httpx.Response(400, json={"detail": "bad request"})
 
     with pytest.raises(httpx.HTTPStatusError):
-        _client(handler).plan([], {}, None)
+        _client(handler).plan([], {}, None, review_sessions=0, ram_offers={})
 
     assert len(attempts) == 1
 
@@ -168,3 +170,17 @@ def test_adopt_is_not_retried():
         )
 
     assert len(attempts) == 1
+
+
+def test_plan_sends_the_ram_offers():
+    sent: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"decisions": []})
+
+    _client(handler).plan([], {}, None, review_sessions=0, ram_offers={"powervaro-ci": 5000})
+
+    assert sent[0]["ram_offers"] == {"powervaro-ci": 5000}
