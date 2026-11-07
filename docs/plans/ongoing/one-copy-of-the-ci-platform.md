@@ -17,7 +17,7 @@ pinned to the same commit. Nothing about one consumer belongs in the engine
 | 1. ci-controller superset | done, #26 |
 | 2. github-actions-runner superset | done, #27 |
 | 3. Publish images | done, #28. Each GHCR package must be made public once by an org owner after its first publish, or every consumer needs a pull credential |
-| 4. Roles run the published images, at parity | `ci_controller` and `ci_lane_host`: #29; `github_review`: #30 |
+| 4. Roles run the published images, at parity | done, #29 and #30 |
 | 5. Consumer cut-over | not started; needs each machine's owner to deploy |
 | 6. Stop it reopening | not started |
 
@@ -93,8 +93,9 @@ is `--check` first and is deployed only by that machine's owner.
    pull instead of build, and `ci_controller` refuses a pool config whose
    `runner_image` is another commit's. A consumer must pin a commit at or after
    the images workflow (task 3), because only those commits have images.
-   `github_review` still builds its three images on the host; it moves the same
-   way before the consumer's Task 5b cut-over.
+   `github_review` moved the same way in #30: required `ci_image_tag`, its three
+   images pulled. Órdago's instance in `ops` must add `ci_image_tag` with its next
+   pin bump.
 5. **Consumer cut-over, one tree per deploy:** `ci-controller` with the runner
    image, then `github-review` (the consumer's Task 5b). Each step: bump the pin,
    switch the play to the role, run `--check --diff`, have the owner deploy, then
