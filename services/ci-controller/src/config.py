@@ -63,6 +63,20 @@ class RepoConfig(BaseModel):
     label_class: dict[str, str] = {}
 
 
+class ReviewAdmission(BaseModel):
+    """How the automated review shapes admission (docs/decisions/0032).
+
+    `cheap_classes` go first among heads still under review: a lint failure found
+    early folds into the same fix round, an emulator run on an unreviewed head is
+    the most expensive speculation. `session_host` is where github-review starts
+    its review containers and `session_ram_mb` what each one is charged against
+    that host's budget, so reviews and lanes share one capacity model."""
+
+    cheap_classes: list[str]
+    session_host: str
+    session_ram_mb: int = Field(gt=0)
+
+
 class Mount(BaseModel):
     host: str
     container: str
@@ -94,6 +108,19 @@ class HostConfig(BaseModel):
     disk_budget_gb: dict[str, int] | None = None
     host_free_ram_floor_mb: int | None = None
     host_load_ceiling: float | None = None
+    # Set on a host whose guest the operator's balloon agent resizes
+    # (docs/plans/ongoing/elastic-desktop-lane.md). Its RAM budget is then
+    # min(ram_budget_mb, the guest's MemTotal - this reserve), read from docker /info
+    # on every snapshot; the reserve covers the guest's own kernel, dockerd and
+    # tailscale. Per host only, like allowed_orgs: a MemTotal means "on offer" only
+    # where something sizes the guest to the offer.
+    ram_offer_reserve_mb: int | None = Field(default=None, gt=0)
+    # Placement preference among the hosts that pass every gate for a job: the lowest
+    # rank wins, and only within a rank does the most free headroom decide. A
+    # preference, never a gate -- a job a lower-ranked host cannot take still lands on
+    # a higher-ranked one that can, so ranking never leaves a job queued. Per host
+    # only, like allowed_orgs: a fleet-wide default would rank every host equally.
+    placement_rank: int = Field(default=0, ge=0)
     work_dirs: dict[str, str] | None = None
     shared_mounts: list[Mount] | None = None
     lane_env: dict[str, str] | None = None
@@ -194,6 +221,7 @@ class ControllerConfig(BaseModel):
     lane_env: dict[str, str] = {}
     classes: dict[str, JobClass]
     repos: list[RepoConfig]
+    review_admission: ReviewAdmission
     # A lane that boots into an empty queue (its job was cancelled during the 20-30s boot)
     # holds its full reserve until some later job happens to match it. Reaping it trades
     # warm capacity for budget, so it is only worth doing when something is actually waiting.
@@ -247,6 +275,14 @@ class ControllerConfig(BaseModel):
                         )
         if self.hosts and self.default_host not in self.hosts:
             raise ValueError(f"default_host '{self.default_host}' is not in hosts")
+        for class_name in self.review_admission.cheap_classes:
+            if class_name not in self.classes:
+                raise ValueError(
+                    f"review_admission.cheap_classes references unknown class '{class_name}'"
+                )
+        session_host = self.review_admission.session_host
+        if session_host not in (set(self.hosts) or {self.default_host}):
+            raise ValueError(f"review_admission.session_host '{session_host}' is not a host")
         return self
 
     def resolved_hosts(self) -> dict[str, HostConfig]:

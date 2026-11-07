@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +15,8 @@ from docker.types import Mount as DockerMount
 from src.config import ControllerConfig, HostConfig
 from src.models import AdmitDecision
 
+log = logging.getLogger("ci-controller")
+
 LANE_LABEL = "com.homelab.ci-controller.lane"
 JOB_LABEL = "com.homelab.ci-controller.job"
 # The lane's class, stamped at spawn so a restarted controller can re-adopt the lane at
@@ -22,6 +26,11 @@ CLASS_LABEL = "com.homelab.ci-controller.class"
 # The lane's host, for the same reason: with more than one host the ledger must know
 # WHICH host's budget a re-adopted lane spends.
 HOST_LABEL = "com.homelab.ci-controller.host"
+# github-review's per-review containers: `claude-review-<job>-<account>` and
+# `codex-review-<job>` (services/github-review/src/providers/). Matched by name because
+# that is the contract github-review already keeps; the repo-root
+# tests/test_review_ci_contract.py reads both sources to hold them to it.
+REVIEW_SESSION_NAME = re.compile(r"^(claude|codex)-review-\d+")
 
 
 def _random_suffix() -> str:
@@ -235,6 +244,11 @@ class DockerAdapter:
             )
         return lanes
 
+    def count_review_sessions(self) -> int:
+        """Running github-review containers on this host, so their RAM is in the ledger."""
+        containers = self._client.containers.list(filters={"name": "-review-"})
+        return sum(1 for c in containers if REVIEW_SESSION_NAME.match(c.name))
+
     def ping(self) -> bool:
         """False on ANY exception. A sleeping desktop, an unreachable tailnet
         address, and a dead daemon are the same event to the controller — a
@@ -243,6 +257,11 @@ class DockerAdapter:
             return bool(self._client.ping())
         except Exception:
             return False
+
+    def mem_total_mb(self) -> int:
+        """The daemon host's MemTotal. Raises on any failure: the caller decides what a
+        missing reading means, and for an elastic host that is "no capacity"."""
+        return int(self._client.info()["MemTotal"]) // (1024 * 1024)
 
     def remove(self, container_id: str) -> None:
         try:
@@ -296,9 +315,29 @@ class DockerPool:
             )
             for name, host_config in config.resolved_hosts().items()
         }
+        self._reserves: dict[str, int] = {
+            name: host_config.ram_offer_reserve_mb
+            for name, host_config in config.resolved_hosts().items()
+            if host_config.ram_offer_reserve_mb is not None
+        }
 
     def for_host(self, name: str) -> DockerAdapter:
         return self._adapters[name]
+
+    def ram_offers(self, healthy: set[str]) -> dict[str, int]:
+        """What each healthy elastic host offers this tick: its guest's MemTotal less
+        `ram_offer_reserve_mb`. A failed read is an offer of 0, logged, so the host
+        admits nothing until it answers again rather than falling back to its ceiling."""
+        offers: dict[str, int] = {}
+        for name in sorted(healthy & self._reserves.keys()):
+            try:
+                total = self._adapters[name].mem_total_mb()
+            except Exception as exc:
+                log.warning("ram offer read failed for %s, offering 0: %s", name, exc)
+                offers[name] = 0
+                continue
+            offers[name] = max(0, total - self._reserves[name])
+        return offers
 
     def snapshot(self) -> tuple[set[str], dict[str, list[LaneInfo]]]:
         """One observation per host: which hosts answered, and what they are running.

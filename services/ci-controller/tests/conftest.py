@@ -16,7 +16,7 @@ def write_config(tmp_path: Path):
             "project_repos:\n"
             "  homelab: alvaro-francisco-gil/homelab\n"
             "  ordago-apps: ordago-app/ordago-apps\n"
-            "  cultuvilla: alvaro-francisco-gil/cultuvilla\n"
+            "  cultuvilla: cultuvilla/app\n"
         )
         path = tmp_path / "ci-controller.yml"
         path.write_text(text)
@@ -49,6 +49,10 @@ classes:
   light:
     ram_mb: 700
     work_disk: ssd
+review_admission:
+  cheap_classes: [light]
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: ordago-apps
     label_class:

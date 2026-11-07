@@ -92,7 +92,9 @@ def test_list_queued_jobs() -> None:
     respx.get(
         "https://api.github.com/repos/o/r/actions/runs",
         params={"status": "queued", "per_page": "50"},
-    ).mock(return_value=httpx.Response(200, json={"workflow_runs": [{"id": 555}]}))
+    ).mock(
+        return_value=httpx.Response(200, json={"workflow_runs": [{"id": 555, "head_sha": "abc"}]})
+    )
     respx.get("https://api.github.com/repos/o/r/actions/runs/555/jobs").mock(
         return_value=httpx.Response(
             200,
@@ -126,7 +128,11 @@ def test_queued_jobs_carry_workflow_and_job_name() -> None:
     ).mock(
         return_value=httpx.Response(
             200,
-            json={"workflow_runs": [{"id": 5, "name": "CI", "path": ".github/workflows/ci.yml"}]},
+            json={
+                "workflow_runs": [
+                    {"id": 5, "name": "CI", "path": ".github/workflows/ci.yml", "head_sha": "abc"}
+                ]
+            },
         )
     )
     respx.get("https://api.github.com/repos/o/r/actions/runs/5/jobs").mock(
@@ -619,3 +625,121 @@ def test_a_persistent_401_is_raised_not_retried_forever() -> None:
         gh.mint_registration_token("o/r")
 
     assert reg.call_count == 2, "exactly one retry, then surface it"
+
+
+def _mock_token() -> None:
+    _mock_installation()
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+
+
+@respx.mock
+def test_queued_jobs_carry_their_run_and_head() -> None:
+    """Review tiers key on the head, and a pinned job is told apart by its run label."""
+    _mock_token()
+    respx.get("https://api.github.com/repos/o/r/actions/runs").mock(
+        return_value=httpx.Response(
+            200, json={"workflow_runs": [{"id": 5, "name": "CI", "head_sha": "cafe"}]}
+        )
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/runs/5/jobs").mock(
+        return_value=httpx.Response(
+            200,
+            json={"jobs": [{"id": 77, "status": "queued", "labels": ["self-hosted", "run-5"]}]},
+        )
+    )
+
+    (job,) = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).list_queued_jobs("o/r")
+
+    assert (job.run_id, job.head_sha, job.pinned) == (5, "cafe", True)
+
+
+def _mock_run(status: str, *job_statuses: str) -> None:
+    respx.get("https://api.github.com/repos/o/r/actions/runs/5").mock(
+        return_value=httpx.Response(200, json={"id": 5, "status": status})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/runs/5/jobs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total_count": len(job_statuses),
+                "jobs": [{"id": n, "status": st} for n, st in enumerate(job_statuses)],
+            },
+        )
+    )
+
+
+@respx.mock
+def test_cancel_queued_run_cancels_a_run_none_of_whose_jobs_started() -> None:
+    _mock_token()
+    _mock_run("queued", "queued", "queued")
+    cancel = respx.post("https://api.github.com/repos/o/r/actions/runs/5/cancel").mock(
+        return_value=httpx.Response(202, json={})
+    )
+
+    assert GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).cancel_queued_run("o/r", 5)
+    assert cancel.called
+
+
+@respx.mock
+def test_cancel_queued_run_leaves_a_started_run_alone() -> None:
+    """GitHub cancels whole runs; once one job runs, cancelling would kill it."""
+    _mock_token()
+    _mock_run("in_progress", "in_progress")
+    cancel = respx.post("https://api.github.com/repos/o/r/actions/runs/5/cancel")
+
+    assert not GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).cancel_queued_run("o/r", 5)
+    assert not cancel.called
+
+
+@respx.mock
+def test_cancel_queued_run_reads_a_409_as_the_run_moving_on() -> None:
+    _mock_token()
+    _mock_run("queued", "queued")
+    respx.post("https://api.github.com/repos/o/r/actions/runs/5/cancel").mock(
+        return_value=httpx.Response(409, json={"message": "Cannot cancel"})
+    )
+
+    assert not GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).cancel_queued_run("o/r", 5)
+
+
+@respx.mock
+def test_cancel_queued_run_raises_on_a_refusal() -> None:
+    """A 403 (the App lacks Actions: write) must surface, not read as 'nothing to do'."""
+    _mock_token()
+    _mock_run("queued", "queued")
+    respx.post("https://api.github.com/repos/o/r/actions/runs/5/cancel").mock(
+        return_value=httpx.Response(403, json={"message": "Resource not accessible"})
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).cancel_queued_run("o/r", 5)
+
+
+@respx.mock
+def test_cancel_queued_run_refuses_a_queued_run_with_a_job_in_progress() -> None:
+    """GitHub can report a run `queued` while one of its jobs already runs
+    (cli/cli#13972); the run's status alone would have cancelled live work."""
+    _mock_token()
+    _mock_run("queued", "queued", "in_progress")
+    cancel = respx.post("https://api.github.com/repos/o/r/actions/runs/5/cancel")
+
+    assert not GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).cancel_queued_run("o/r", 5)
+    assert not cancel.called
+
+
+@respx.mock
+def test_cancel_queued_run_refuses_when_the_job_list_is_truncated() -> None:
+    _mock_token()
+    respx.get("https://api.github.com/repos/o/r/actions/runs/5").mock(
+        return_value=httpx.Response(200, json={"id": 5, "status": "queued"})
+    )
+    full_page = [{"id": n, "status": "queued"} for n in range(JOBS_PAGE_SIZE)]
+    respx.get("https://api.github.com/repos/o/r/actions/runs/5/jobs").mock(
+        return_value=httpx.Response(200, json={"jobs": full_page})
+    )
+    cancel = respx.post("https://api.github.com/repos/o/r/actions/runs/5/cancel")
+
+    assert not GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).cancel_queued_run("o/r", 5)
+    assert not cancel.called

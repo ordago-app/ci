@@ -1,30 +1,33 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import shutil
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 
-from src.config import ControllerConfig
+from src.admission import host_pressure_binds, ram_budget_mb
+from src.config import ControllerConfig, HostConfig
 from src.docker_adapter import DockerPool, LaneInfo
 from src.github_adapter import RUNS_SCAN_LIMIT, GitHubAdapter
 from src.host_stats import HostStats
 from src.ledger import Ledger
 from src.metrics import MetricsStore
 from src.models import (
-    BUDGET_FULL,
-    DISK_FULL,
+    ALREADY_RUNNING,
     INFRA_FAILURE,
-    KVM_BUSY,
-    LANE_CEILING,
     LANE_LOST_UNATTRIBUTED,
+    REVIEW_CHANGES_REQUESTED,
     AdmitDecision,
     Decision,
     DeferDecision,
     QueuedJob,
     Reservation,
+    waits_for_lane,
 )
+from src.review_client import ReviewStateClient
 from src.scheduler import LocalScheduler, Scheduler
 
 log = logging.getLogger("ci-controller")
@@ -39,12 +42,9 @@ ATTRIBUTION_WARN_AFTER = 20
 # visible in the events table without one row per tick per lane.
 _REAP_BLOCK_EMIT_EVERY = 20
 
-_PRESSURE_GATES = frozenset({BUDGET_FULL, DISK_FULL, LANE_CEILING})
-# A defer binding one of these cannot be relieved by reaping a lane: freeing RAM or a
-# lane slot does not free the KVM device. Counting it as pressure would make the
-# reaper destroy a warm lane every tick while the job keeps deferring on the gate
-# reaping can never touch.
-_UNRELIEVABLE_GATES = frozenset({KVM_BUSY})
+# github-review unreachable: said at ERROR on the first failed tick and then every Nth
+# (5 min at the 5 s poll), so a long outage stays visible without one line per tick.
+_REVIEW_UNREACHABLE_LOG_EVERY = 60
 
 
 def _now() -> float:
@@ -97,6 +97,7 @@ class Controller:
         docker: DockerPool,
         *,
         host: str,
+        reviews: ReviewStateClient,
         ledger: Ledger | None = None,
         metrics: MetricsStore | None = None,
         host_stats_reader: Callable[[], HostStats] | None = None,
@@ -109,7 +110,19 @@ class Controller:
         self.config = config
         self.github = github
         self.docker = docker
+        self.reviews = reviews
         self.scheduler = scheduler
+        # Consecutive ticks github-review could not be read. While it is down every job
+        # is admitted as if unreviewed (today's largest-first order), never stalled.
+        self._review_unreachable_ticks = 0
+        # Last good count of review containers on the session host. A failed listing on
+        # a host that just answered is a blip; keeping the last figure beats dropping
+        # their RAM out of the ledger for a tick.
+        self._review_sessions = 0
+        # Runs whose cancellation was already attempted, so a refusal (a missing App
+        # permission, a race) is logged once rather than retried every tick. Pruned to
+        # the runs still queued.
+        self._cancel_attempted: set[int] = set()
         self._last_decisions: list[Decision] = []
         # job_id -> the epoch second we FIRST saw it deferred, so /status can say how long
         # a job has been waiting. Deliberately in-memory and therefore reset by a restart:
@@ -140,6 +153,11 @@ class Controller:
         # Populated by reconcile() from docker.snapshot(); status() reads the cached
         # value rather than pinging every host on every /status request.
         self._healthy: set[str] = set()
+        # The elastic hosts' offers from the last tick, so status() reports the budget
+        # admission actually used rather than the configured ceiling.
+        self._ram_offers: dict[str, int] = {}
+        # The live stats the last tick admitted against, so /status shows that very input.
+        self._host_stats: dict[str, HostStats] = {}
         # Consecutive failed health checks per host. Declaring a host lost REAPS every
         # lane it holds, so that verdict is debounced; skipping it for admission is not.
         self._unhealthy_ticks: dict[str, int] = {}
@@ -530,7 +548,16 @@ class Controller:
             except Exception as exc:
                 log.warning("host stats read failed: %s", exc)
 
-        decisions = self.scheduler.plan(jobs, host_stats, self._healthy)
+        self._host_stats = host_stats
+        jobs = self._with_review_state(jobs)
+        self._ram_offers = self.docker.ram_offers(self._healthy)
+        decisions = self.scheduler.plan(
+            jobs,
+            host_stats,
+            self._healthy,
+            review_sessions=self._count_review_sessions(),
+            ram_offers=self._ram_offers,
+        )
         for decision in decisions:
             if isinstance(decision, AdmitDecision):
                 if not self._admit(decision):
@@ -562,13 +589,137 @@ class Controller:
                     workflow=decision.job.workflow,
                     # The closest host, i.e. whose gates these reasons describe. NULL for
                     # the non-capacity defers (already_running, not_allowlisted,
-                    # no_eligible_host), which belong to no host.
+                    # no_eligible_host, review_held), which belong to no host.
                     host=decision.host,
                 )
         self._last_decisions = decisions
         self._track_queue_age(decisions)
         self._reap_idle_lanes(decisions)
+        self._cancel_rejected_under_pressure(decisions)
         return decisions
+
+    def _with_review_state(self, jobs: list[QueuedJob]) -> list[QueuedJob]:
+        """Stamp each job with its head's review state from github-review.
+
+        Unreachable is not a stall: the jobs go to admission without review state,
+        which is exactly the order admission used before review tiers existed, and the
+        outage is logged at ERROR. One failed repo ends the attempt for the tick, so a
+        hung github-review costs one timeout per tick, not one per repo."""
+        heads: dict[str, set[str]] = defaultdict(set)
+        for job in jobs:
+            if job.head_sha is not None:
+                heads[job.repo].add(job.head_sha)
+        if not heads:
+            # Nothing was asked, so nothing was learned: an empty queue must not read as
+            # github-review having answered and clear an outage it never tested.
+            return jobs
+        states: dict[tuple[str, str], str] = {}
+        try:
+            for repo, shas in sorted(heads.items()):
+                for sha, state in self.reviews.head_states(repo, sorted(shas)).items():
+                    states[(repo, sha)] = state
+        except Exception as exc:
+            if self._review_unreachable_ticks % _REVIEW_UNREACHABLE_LOG_EVERY == 0:
+                log.error(
+                    "github-review unreachable (%s): admitting without review tiers, "
+                    "largest-first only, until it answers",
+                    exc,
+                )
+            self._review_unreachable_ticks += 1
+            return jobs
+        if self._review_unreachable_ticks:
+            log.warning(
+                "github-review answering again after %s failed ticks; review tiers back on",
+                self._review_unreachable_ticks,
+            )
+            self._review_unreachable_ticks = 0
+        return [
+            dataclasses.replace(job, review=states.get((job.repo, job.head_sha)))
+            if job.head_sha is not None
+            else job
+            for job in jobs
+        ]
+
+    def _count_review_sessions(self) -> int:
+        host = self.config.review_admission.session_host
+        if host not in self._healthy:
+            # Admission skips an unhealthy host entirely, so its charge binds nothing;
+            # the count is left as last seen rather than invented.
+            return self._review_sessions
+        try:
+            self._review_sessions = self.docker.for_host(host).count_review_sessions()
+        except Exception as exc:
+            log.warning(
+                "review container count failed on %s (%s); keeping the last count, %s",
+                host,
+                exc,
+                self._review_sessions,
+            )
+        return self._review_sessions
+
+    def _cancel_rejected_under_pressure(self, decisions: list[Decision]) -> None:
+        """Cancel the queued runs of heads the review rejected, but only while some other
+        job waits for a lane (`waits_for_lane`).
+
+        Without contention a rejected head's CI is left to run, so the author fixes CI
+        failures and review findings in one round. A run the controller holds a lane for
+        is left alone, whether the lane was admitted this tick or an earlier one (its job
+        defers `already_running`): a booting runner could start a job between the check
+        and the cancel. GitHub cancels whole runs, and `cancel_queued_run` cancels one
+        only while none of its jobs is in progress."""
+        queued_runs = {d.job.run_id for d in decisions if d.job.run_id is not None}
+        self._cancel_attempted &= queued_runs
+        waiting = any(
+            isinstance(d, DeferDecision)
+            and d.job.review != REVIEW_CHANGES_REQUESTED
+            and waits_for_lane(d.reasons)
+            for d in decisions
+        )
+        if not waiting:
+            return
+        runs_with_lanes = {
+            d.job.run_id
+            for d in decisions
+            if isinstance(d, AdmitDecision) or ALREADY_RUNNING in d.reasons
+        }
+        rejected: dict[int, list[DeferDecision]] = defaultdict(list)
+        for d in decisions:
+            if (
+                isinstance(d, DeferDecision)
+                and d.job.review == REVIEW_CHANGES_REQUESTED
+                and d.job.run_id is not None
+                and d.job.run_id not in runs_with_lanes
+                and d.job.run_id not in self._cancel_attempted
+            ):
+                rejected[d.job.run_id].append(d)
+        for run_id, run_decisions in sorted(rejected.items()):
+            self._cancel_attempted.add(run_id)
+            repo = run_decisions[0].job.repo
+            try:
+                cancelled = self.github.cancel_queued_run(repo, run_id)
+            except Exception as exc:
+                log.error("cancelling rejected run %s in %s failed: %s", run_id, repo, exc)
+                continue
+            if not cancelled:
+                continue
+            log.info(
+                "cancelled queued run %s in %s (head %s): review requested changes and "
+                "other jobs are waiting for lanes",
+                run_id,
+                repo,
+                run_decisions[0].job.head_sha,
+            )
+            for d in run_decisions:
+                self._emit(
+                    kind="cancel",
+                    job_id=d.job.job_id,
+                    repo=repo,
+                    class_name=d.class_name,
+                    reason=REVIEW_CHANGES_REQUESTED,
+                    ts=_now(),
+                    job_name=d.job.job_name,
+                    workflow=d.job.workflow,
+                )
 
     def _track_queue_age(self, decisions: list[Decision]) -> None:
         # First-seen wins: a job deferred on five consecutive ticks has been waiting since
@@ -608,11 +759,7 @@ class Controller:
         # Past the absolute cap a lane is not warm capacity, it is a leak: always reaped.
         targets = [r for r in idle if _idle_for(r, now) >= self.config.idle_lane_max_seconds]
         pressure = sum(
-            1
-            for d in decisions
-            if isinstance(d, DeferDecision)
-            and _PRESSURE_GATES.intersection(d.reasons)
-            and not _UNRELIEVABLE_GATES.intersection(d.reasons)
+            1 for d in decisions if isinstance(d, DeferDecision) and waits_for_lane(d.reasons)
         )
         if pressure:
             capped = {r.lane_id for r in targets}
@@ -791,10 +938,38 @@ class Controller:
         )
         return True
 
+    def _pressure(self, name: str, host_cfg: HostConfig) -> dict[str, object] | None:
+        """The live stats the last tick judged this host on, and whether host_pressure
+        bound. None for a host whose /proc this controller cannot read (every host but
+        its own): no reading is not an idle machine."""
+        stats = self._host_stats.get(name)
+        if stats is None:
+            return None
+        floor = (
+            self.config.host_free_ram_floor_mb
+            if host_cfg.host_free_ram_floor_mb is None
+            else host_cfg.host_free_ram_floor_mb
+        )
+        ceiling = (
+            self.config.host_load_ceiling
+            if host_cfg.host_load_ceiling is None
+            else host_cfg.host_load_ceiling
+        )
+        return {
+            "mem_available_mb": stats.mem_available_mb,
+            "load_1m": stats.load_1m,
+            "cpu_pressure_pct": stats.cpu_pressure_pct,
+            "free_ram_floor_mb": floor,
+            "load_ceiling": ceiling,
+            "binding": host_pressure_binds(
+                stats, self.config, free_ram_floor_mb=floor, load_ceiling=ceiling
+            ),
+        }
+
     def status(self) -> dict:
         lanes = self.scheduler.lanes()
         deferred = [d for d in self._last_decisions if isinstance(d, DeferDecision)]
-        hosts: dict[str, dict[str, int | bool]] = {}
+        hosts: dict[str, dict[str, object]] = {}
         for name, host_cfg in self.config.resolved_hosts().items():
             # resolved_hosts() has already inherited these from the top-level config
             # when the per-host key was omitted; the fallback below only narrows the
@@ -804,11 +979,7 @@ class Controller:
                 if host_cfg.max_concurrent_lanes is None
                 else host_cfg.max_concurrent_lanes
             )
-            budget_ram_mb = (
-                self.config.ram_budget_mb
-                if host_cfg.ram_budget_mb is None
-                else host_cfg.ram_budget_mb
-            )
+            budget_ram_mb = ram_budget_mb(host_cfg, self.config, self._ram_offers)
             on_host = _on_host(lanes, name)
             hosts[name] = {
                 "lanes": len(on_host),
@@ -816,6 +987,7 @@ class Controller:
                 "ram_mb": _total_ram(on_host),
                 "budget_ram_mb": budget_ram_mb,
                 "healthy": name in self._healthy,
+                "pressure": self._pressure(name, host_cfg),
             }
         return {
             "budget_ram_mb": self.config.ram_budget_mb,
@@ -825,6 +997,14 @@ class Controller:
             "kvm_in_use": _kvm_in_use(lanes),
             "config_version": self._config_version,
             "admission_mode": self.config.admission_mode,
+            # Review containers on review_admission.session_host, each charged
+            # session_ram_mb against that host's budget. Not in ledger_ram_mb, which
+            # sums lanes only.
+            "review_sessions": self._review_sessions,
+            "review_session_host": self.config.review_admission.session_host,
+            "review_ram_mb": self._review_sessions * self.config.review_admission.session_ram_mb,
+            # False while github-review cannot be read and admission runs without tiers.
+            "review_state_reachable": self._review_unreachable_ticks == 0,
             "disk_gb": {
                 disk: {
                     "used": _disk_gb_in_use(lanes, disk),
@@ -874,9 +1054,22 @@ class Controller:
                     "class": d.class_name,
                     "workflow": d.job.workflow,
                     "job_name": d.job.job_name,
+                    # The head's review state; null when github-review has none for it.
+                    "review": d.job.review,
                     # The closest host, i.e. whose gates `reasons` describes. None for the
                     # non-capacity defers, which belong to no host — same rule as the event.
                     "host": d.host,
+                    # Each evaluated host's own gates: `reasons` above is one host's.
+                    "gates_by_host": {h: list(g) for h, g in d.gates_by_host.items()},
+                    # The reserve the job asks for, so budget_full can be checked against
+                    # a host's free reserve. None when no class maps, or for a class this
+                    # dispatcher's config no longer has: the scheduler is its own process
+                    # and can lag a config edit, and /status is the healthcheck.
+                    "ram_mb": (
+                        self.config.classes[d.class_name].ram_mb
+                        if d.class_name in self.config.classes
+                        else None
+                    ),
                     # Since this controller first saw the job deferred, so it resets on a
                     # restart rather than pretending to know a history it no longer holds.
                     "waiting_seconds": (

@@ -20,6 +20,20 @@ for name, h in sorted(hosts.items()):
         f"{name:<14} lanes {h['lanes']}/{h['max_lanes']}"
         f"   ram {h['ram_mb']}/{h['budget_ram_mb']} MB{health}"
     )
+    # The reserve above cannot show a host out of CPU or free memory, which admission
+    # holds lanes on (host_pressure): 2026-11-07, 5/11 GB reserved and nothing starting.
+    # A pressure dict of another shape names the skew, like the lane states below.
+    p = h.get("pressure")
+    if p:
+        keys = ("load_1m", "load_ceiling", "mem_available_mb", "free_ram_floor_mb", "binding")
+        if any(k not in p for k in keys):
+            print(f"{'':<14} pressure: (unexpected shape from the deployed controller: {p})")
+        else:
+            hold = "  HOLDING new lanes (host_pressure)" if p["binding"] else ""
+            print(
+                f"{'':<14} load {p['load_1m']:.1f}/{p['load_ceiling']:g}"
+                f"   free {p['mem_available_mb']}/{p['free_ram_floor_mb']} MB floor{hold}"
+            )
 
 total_max = sum(h["max_lanes"] for h in hosts.values()) if hosts else d["max_lanes"]
 print(f"TOTAL          lanes {d['lanes_running']}/{total_max}   ram {d['ledger_ram_mb']} MB")
@@ -58,4 +72,20 @@ else:
             f"idle {r['idle_seconds']}s — {why}{streak}"
         )
 print("deferred: ", dict(Counter(x["reason"] for x in d["deferred"])))
+# Every host's own gates: `reason` is only the closest host's and can name a full
+# budget elsewhere while the roomy host is holding on its CPU.
+by_host = Counter(
+    f"{host}: {'+'.join(gates)}"
+    for x in d["deferred"]
+    for host, gates in (x.get("gates_by_host") or {}).items()
+)
+if by_host:
+    print("  by host:", dict(by_host))
 print(f"mode:      {d['admission_mode']}")
+# Same version-skew rule as the lane states above: say so rather than default it.
+if "review_sessions" not in d:
+    print("reviews:    (deployed controller predates review-aware admission — deploy to see it)")
+else:
+    reach = "" if d["review_state_reachable"] else "  github-review UNREACHABLE: tiers off"
+    tiers = dict(Counter(x["review"] for x in d["deferred"] if x.get("review")))
+    print(f"reviews:   {d['review_sessions']} running   deferred by head state {tiers}{reach}")

@@ -544,6 +544,10 @@ classes:
   light:
     ram_mb: 700
     work_disk: ssd
+review_admission:
+  cheap_classes: []
+  session_host: powerserver
+  session_ram_mb: 600
 repos:
   - project: homelab
     label_class:
@@ -747,3 +751,67 @@ def test_an_unusable_start_time_is_unknown_rather_than_zero(write_config) -> Non
     (lane,) = adapter.list_lanes()
 
     assert lane.started_at is None
+
+
+def test_count_review_sessions_counts_only_github_reviews_containers(write_config) -> None:
+    adapter, client, _ = _adapter(write_config)
+    names = [
+        "claude-review-62228-work",
+        "codex-review-8729",
+        "github-review",
+        "peer-review-3",
+        "claude-review-notanumber",
+    ]
+    containers = []
+    for name in names:
+        container = MagicMock()
+        container.name = name
+        containers.append(container)
+    client.containers.list.return_value = containers
+
+    assert adapter.count_review_sessions() == 2
+    _, kwargs = client.containers.list.call_args
+    assert kwargs["filters"] == {"name": "-review-"}
+
+
+ELASTIC_HOSTS_CONFIG = HOSTS_CONFIG.replace(
+    "    cpu_shares: 128\n", "    cpu_shares: 128\n    ram_offer_reserve_mb: 1000\n"
+)
+
+
+def _elastic_pool(write_config) -> tuple[DockerPool, MagicMock, MagicMock]:
+    cfg = ControllerConfig.load(write_config(ELASTIC_HOSTS_CONFIG))
+    clients: defaultdict[str, MagicMock] = defaultdict(MagicMock)
+    pool = DockerPool(cfg, client_factory=lambda endpoint: clients[endpoint])
+    return pool, clients["tcp://docker-socket-proxy:2375"], clients["tcp://100.64.0.1:2375"]
+
+
+def test_ram_offers_read_an_elastic_hosts_memtotal_minus_its_reserve(write_config) -> None:
+    pool, powerserver, desktop = _elastic_pool(write_config)
+    desktop.info.return_value = {"MemTotal": 6 * 1024**3}
+
+    offers = pool.ram_offers({"powerserver", "powervaro-ci"})
+
+    assert offers == {"powervaro-ci": 6 * 1024 - 1000}
+    powerserver.info.assert_not_called()  # no reserve, so nothing to read there
+
+
+def test_ram_offers_never_go_negative(write_config) -> None:
+    pool, _powerserver, desktop = _elastic_pool(write_config)
+    desktop.info.return_value = {"MemTotal": 512 * 1024**2}
+
+    assert pool.ram_offers({"powervaro-ci"}) == {"powervaro-ci": 0}
+
+
+def test_an_unreadable_offer_is_zero_not_the_ceiling(write_config) -> None:
+    pool, _powerserver, desktop = _elastic_pool(write_config)
+    desktop.info.side_effect = docker.errors.DockerException("403 INFO denied")
+
+    assert pool.ram_offers({"powervaro-ci"}) == {"powervaro-ci": 0}
+
+
+def test_ram_offers_skip_unhealthy_hosts(write_config) -> None:
+    pool, _powerserver, desktop = _elastic_pool(write_config)
+
+    assert pool.ram_offers({"powerserver"}) == {}
+    desktop.info.assert_not_called()

@@ -228,9 +228,63 @@ class GitHubAdapter:
                             labels=[str(label) for label in job.get("labels", [])],
                             workflow=str(run.get("name") or ""),
                             job_name=str(job.get("name") or ""),
+                            run_id=int(run["id"]),
+                            head_sha=str(run["head_sha"]),
                         )
                     )
         return jobs
+
+    def cancel_queued_run(self, repo: str, run_id: int) -> bool:
+        """Cancel a run only while none of its jobs has started. False when it was left
+        alone.
+
+        GitHub cancels runs, not single jobs, so "cancel its queued jobs, never a running
+        one" is "cancel the run while no job of it is in progress". The run's own status
+        cannot answer that: GitHub can report a run `queued` while one of its jobs is
+        already `in_progress`. So every job is read, and a listing cut short at
+        MAX_JOBS_PAGES refuses rather than guesses. What remains is the window between
+        this read and the cancel; the caller narrows it by never cancelling a run it
+        holds a lane for."""
+        resp = self._repo_request(
+            "GET", repo, f"{self._base_url}/repos/{repo}/actions/runs/{run_id}"
+        )
+        resp.raise_for_status()
+        if resp.json().get("status") != "queued":
+            return False
+        for page in range(1, MAX_JOBS_PAGES + 1):
+            jobs_resp = self._repo_request(
+                "GET",
+                repo,
+                f"{self._base_url}/repos/{repo}/actions/runs/{run_id}/jobs",
+                params={"per_page": JOBS_PAGE_SIZE, "page": page},
+            )
+            jobs_resp.raise_for_status()
+            body = jobs_resp.json()
+            batch = body.get("jobs", [])
+            if any(job.get("status") == "in_progress" for job in batch):
+                return False
+            total = body.get("total_count")
+            if len(batch) < JOBS_PAGE_SIZE or (
+                total is not None and page * JOBS_PAGE_SIZE >= int(total)
+            ):
+                break
+        else:
+            log.warning(
+                "not cancelling run %s in %s: its job list is truncated at %s pages, so a "
+                "started job may sit past it",
+                run_id,
+                repo,
+                MAX_JOBS_PAGES,
+            )
+            return False
+        resp = self._repo_request(
+            "POST", repo, f"{self._base_url}/repos/{repo}/actions/runs/{run_id}/cancel"
+        )
+        # 409: the run left the cancellable states between the two calls.
+        if resp.status_code == 409:
+            return False
+        resp.raise_for_status()
+        return True
 
     def list_runners(self, repo: str) -> RunnerList:
         """Registered self-hosted runners. RUNNER_NAME is the lane_id, so this joins to

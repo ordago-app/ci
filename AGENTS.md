@@ -55,9 +55,10 @@ over another org's placement, it is wrong regardless of how much simpler it look
 - [`services/ci-lane-host/`](services/ci-lane-host/) — what a machine runs to
   *offer* capacity: a scoped Docker socket proxy plus a fabric sidecar.
 - [`services/github-review/`](services/github-review/) — the PR review bot.
-- [`docs/decisions/`](docs/decisions/) — ADRs. **Numbers 0012–0026 were imported
-  from homelab and keep their original numbers** so that history, incidents and
-  cross-references still resolve. This repo's own series starts at **0100**, which
+- [`docs/decisions/`](docs/decisions/) — ADRs. **Numbers below 0100 were imported
+  from homelab and keep their original numbers** (0012–0026 at the extraction, 0027
+  and 0032 when the controller code was reconciled on 2026-11-07) so that history,
+  incidents and cross-references still resolve. This repo's own series starts at **0100**, which
   is why there is a gap: the two repos can then never collide as both keep
   numbering.
 - [`docs/incidents/`](docs/incidents/) — postmortems. Read these before changing

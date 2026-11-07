@@ -47,7 +47,7 @@ def scheduler(write_config) -> HttpScheduler:
 
 
 def _plan(scheduler: HttpScheduler, stats: HostStats):
-    return scheduler.plan([JOB], {"powerserver": stats}, None)[0]
+    return scheduler.plan([JOB], {"powerserver": stats}, None, review_sessions=0, ram_offers={})[0]
 
 
 def test_io_wait_load_admits_through_the_wire(scheduler) -> None:
@@ -71,6 +71,7 @@ def test_a_plan_without_the_field_keeps_the_load_only_gate(write_config) -> None
         "jobs": [{"job_id": 1, "repo": "ordago-app/ordago-apps", "labels": ["ordago-ci"]}],
         "host_stats": {"powerserver": {"mem_available_mb": 9000, "load_1m": 40.0}},
         "healthy": None,
+        "review_sessions": 0,
     }
     decision = app.post("/plan", json=body).json()["decisions"][0]
     assert decision["kind"] == "defer"

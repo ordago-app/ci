@@ -12,6 +12,29 @@ HOST_PRESSURE = "host_pressure"
 # No configured host is enabled, healthy, and allowed to run the job's class. Distinct
 # from a capacity gate: no amount of freed capacity would let this job in.
 NO_ELIGIBLE_HOST = "no_eligible_host"
+# The job's head was rejected by the automated review and some other job is waiting for a
+# lane (`waits_for_lane`). Not a capacity verdict: the job would fit, but lanes go to heads
+# still likely to merge first (docs/decisions/0032).
+REVIEW_HELD = "review_held"
+
+_LANE_PRESSURE_GATES = frozenset({BUDGET_FULL, DISK_FULL, LANE_CEILING})
+# A defer binding one of these cannot be relieved by freeing a lane: freeing RAM or a lane
+# slot does not free the KVM device.
+_UNRELIEVABLE_GATES = frozenset({KVM_BUSY})
+
+
+def waits_for_lane(reasons: tuple[str, ...]) -> bool:
+    """True when freeing a lane's RAM, slot or disk could admit the deferred job.
+
+    The one definition of "a job is waiting for a lane": the idle reaper spends warm
+    lanes on it, and review-aware admission holds and cancels rejected heads' CI on it.
+    `kvm_busy` and `host_pressure` alone do not count: no lane freed or withheld here
+    would admit that job."""
+    return bool(
+        _LANE_PRESSURE_GATES.intersection(reasons)
+    ) and not _UNRELIEVABLE_GATES.intersection(reasons)
+
+
 # events.conclusion sentinel for a lane reaped because its HOST went away (ping()
 # failed) while it still held a reservation — the desktop slept, or WSL shut down —
 # AND the lane had already been attributed, so the row's job_id is a job we observed
@@ -37,6 +60,20 @@ INFRA_FAILURE = "infra_failure"
 LANE_LOST_UNATTRIBUTED = "lane_lost_unattributed"
 
 
+# Per-head review states, as github-review's GET /heads names them.
+REVIEW_PENDING = "pending"
+REVIEW_RUNNING = "running"
+REVIEW_APPROVED = "approved"
+REVIEW_CHANGES_REQUESTED = "changes_requested"
+REVIEW_FAILED = "failed"
+REVIEW_SKIPPED = "skipped"
+
+# A job whose `runs-on` carries `run-<its run id>` can only be taken by a runner
+# registered with that label, i.e. a lane spawned for its own run. Without it GitHub
+# hands the lane any queued job with the same labels, so admission order cannot bind.
+RUN_LABEL_PREFIX = "run-"
+
+
 @dataclass(frozen=True)
 class QueuedJob:
     job_id: int
@@ -44,6 +81,15 @@ class QueuedJob:
     labels: list[str] = field(default_factory=list)
     workflow: str = ""
     job_name: str = ""
+    run_id: int | None = None
+    head_sha: str | None = None
+    # The head's state in github-review; None when github-review has no row for it
+    # (no reviewer on this repo, an unlabelled PR, a branch push) or was unreachable.
+    review: str | None = None
+
+    @property
+    def pinned(self) -> bool:
+        return self.run_id is not None and f"{RUN_LABEL_PREFIX}{self.run_id}" in self.labels
 
 
 @dataclass(frozen=True)
@@ -113,8 +159,8 @@ class DeferDecision:
     reasons: tuple[str, ...]
     # The host whose gates `reasons` describes: the closest host, i.e. the one that came
     # nearest to admitting. None only when no host was evaluated at all (already_running,
-    # not_allowlisted, no_eligible_host) — those are not capacity verdicts and belong to
-    # no host. Recording it is what makes ci_bench's per-host binding-gate table work;
+    # not_allowlisted, no_eligible_host, review_held) — those are not capacity verdicts and
+    # belong to no host. Recording it is what makes ci_bench's per-host binding-gate table work;
     # with it always NULL that report section could never contain a real controller row.
     host: str | None = None
     # The class this job would run as. None only for already_running (the class belongs to
@@ -124,6 +170,11 @@ class DeferDecision:
     # opaque job ids, and six waiting node_heavy jobs read the same as six light ones that
     # an idle second host could have absorbed.
     class_name: str | None = None
+    # Every evaluated host's own binding gates, keyed by host name. `reasons` is only the
+    # closest host's, and on its own it hid why a roomier host refused: 2026-11-07, node
+    # jobs read budget_full (the elastic host was 42 MB short) while powerserver held them
+    # on host_pressure. Empty for the same non-capacity defers that carry no `host`.
+    gates_by_host: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def reason(self) -> str:

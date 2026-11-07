@@ -9,8 +9,10 @@ from src.config import ControllerConfig
 from src.controller import ATTRIBUTION_WARN_AFTER, Controller
 from src.docker_adapter import LaneInfo
 from src.github_adapter import JobLookup, RunnerInfo, RunnerList
+from src.host_stats import HostStats
 from src.ledger import Ledger
 from src.models import (
+    BUDGET_FULL,
     INFRA_FAILURE,
     LANE_LOST_UNATTRIBUTED,
     AdmitDecision,
@@ -70,6 +72,7 @@ def _pool(docker, host="powerserver"):
         return pool.strangers.setdefault(name, MagicMock(name=f"adapter-{name}"))
 
     pool.for_host.side_effect = _for_host
+    pool.ram_offers.return_value = {}
     pool.snapshot.side_effect = lambda: (
         set(pool.up),
         {host: docker.list_lanes()} if host in pool.up else {},
@@ -77,8 +80,15 @@ def _pool(docker, host="powerserver"):
     return pool
 
 
-def _controller(write_config, queued, metrics=None):
-    cfg = ControllerConfig.load(write_config(VALID_CONFIG))
+def _no_reviews() -> MagicMock:
+    """A github-review that has no row for any head: every job admits as unreviewed."""
+    reviews = MagicMock()
+    reviews.head_states.return_value = {}
+    return reviews
+
+
+def _controller(write_config, queued, metrics=None, config_text=VALID_CONFIG):
+    cfg = ControllerConfig.load(write_config(config_text))
     github = MagicMock()
     github.list_queued_jobs.side_effect = lambda repo: [j for j in queued if j.repo == repo]
     github.mint_registration_token.return_value = "ARRT"
@@ -97,6 +107,7 @@ def _controller(write_config, queued, metrics=None):
 
     docker.spawn.side_effect = _spawn
     docker.sample.return_value = (2900, 140.0)
+    docker.count_review_sessions.return_value = 0
     ctrl = Controller(
         host="powerserver",
         config=cfg,
@@ -104,11 +115,12 @@ def _controller(write_config, queued, metrics=None):
         docker=_pool(docker),
         ledger=Ledger(),
         metrics=metrics,
+        reviews=_no_reviews(),
     )
     return ctrl, github, docker
 
 
-def _multi_host_controller(write_config, queued, metrics=None):
+def _multi_host_controller(write_config, queued, metrics=None, config_text=MULTI_HOST_CONFIG):
     """Two healthy hosts (powerserver, desktop) wired as a DockerPool double.
 
     Tests mutate `pool.up` to simulate a host going away, and
@@ -118,7 +130,7 @@ def _multi_host_controller(write_config, queued, metrics=None):
     real DockerPool. A double that let the two disagree (or that could not express a
     disagreement) would hide the reap path this suite exists to pin.
     """
-    cfg = ControllerConfig.load(write_config(MULTI_HOST_CONFIG))
+    cfg = ControllerConfig.load(write_config(config_text))
     github = MagicMock()
     github.list_queued_jobs.side_effect = lambda repo: [j for j in queued if j.repo == repo]
     github.mint_registration_token.return_value = "ARRT"
@@ -133,17 +145,25 @@ def _multi_host_controller(write_config, queued, metrics=None):
             f"cid-{_name}-{decision.job.job_id}",
         )
         adapter.sample.return_value = (2900, 140.0)
+        adapter.count_review_sessions.return_value = 0
         adapters[name] = adapter
 
     pool = MagicMock()
     pool.for_host.side_effect = lambda name: adapters[name]
     pool.up = {"powerserver", "desktop"}
+    pool.ram_offers.return_value = {}
     pool.snapshot.side_effect = lambda: (
         set(pool.up),
         {name: a.list_lanes() for name, a in adapters.items() if name in pool.up},
     )
     ctrl = Controller(
-        host="powerserver", config=cfg, github=github, docker=pool, ledger=Ledger(), metrics=metrics
+        host="powerserver",
+        config=cfg,
+        github=github,
+        docker=pool,
+        ledger=Ledger(),
+        metrics=metrics,
+        reviews=_no_reviews(),
     )
     return ctrl, github, adapters, pool
 
@@ -219,7 +239,12 @@ def test_reconcile_deletes_work_dir_when_lane_reaped(write_config, tmp_path) -> 
     docker = MagicMock()
     docker.list_lanes.return_value = []  # lane finished + auto-removed
     ctrl = Controller(
-        host="powerserver", config=cfg, github=MagicMock(), docker=_pool(docker), ledger=Ledger()
+        host="powerserver",
+        config=cfg,
+        github=MagicMock(),
+        docker=_pool(docker),
+        ledger=Ledger(),
+        reviews=_no_reviews(),
     )
 
     lane_id = "powerserver-cici-1"
@@ -260,7 +285,12 @@ def test_reconcile_does_not_delete_outside_work_base_for_malicious_lane_id(
     docker = MagicMock()
     docker.list_lanes.return_value = []
     ctrl = Controller(
-        host="powerserver", config=cfg, github=MagicMock(), docker=_pool(docker), ledger=Ledger()
+        host="powerserver",
+        config=cfg,
+        github=MagicMock(),
+        docker=_pool(docker),
+        ledger=Ledger(),
+        reviews=_no_reviews(),
     )
 
     # lane_id from an unconstrained Docker label: {work_base}/{lane_id}-work escapes ssd.
@@ -1601,6 +1631,113 @@ def test_status_says_what_kind_of_job_is_queued_and_every_gate_holding_it(
     assert queued["host"] == "powerserver"
 
 
+def test_status_names_every_hosts_gates_and_the_reserve_a_queued_job_needs(
+    write_config, monkeypatch
+) -> None:
+    """`reasons` is one host's verdict. A reader looking at a half-empty host needs that
+    host's own answer, and "budget_full" needs the size of the ask to be checkable."""
+    monkeypatch.setattr("src.controller._now", lambda: 10_000.0)
+    job = QueuedJob(job_id=700, repo=HOMELAB, labels=["homelab"])  # see the id note above
+    ctrl, _github, _docker = _controller(write_config, [job])
+    _fill_lanes(ctrl, _docker)
+
+    ctrl.tick()
+    (queued,) = ctrl.status()["deferred"]
+
+    assert queued["gates_by_host"] == {"powerserver": ["lane_ceiling"]}
+    assert queued["ram_mb"] == 700
+
+
+def test_status_names_no_reserve_for_a_job_with_no_class(write_config) -> None:
+    job = QueuedJob(job_id=700, repo=HOMELAB, labels=["no-such-label"])
+    ctrl, _github, _docker = _controller(write_config, [job])
+
+    ctrl.tick()
+    (queued,) = ctrl.status()["deferred"]
+
+    assert queued["class"] is None
+    assert queued["ram_mb"] is None
+
+
+def test_status_survives_a_class_the_scheduler_still_has_but_this_config_dropped(
+    write_config,
+) -> None:
+    """The scheduler is its own process and can lag a config edit. /status is the
+    dispatcher's healthcheck, so a KeyError here would restart-loop it."""
+    job = QueuedJob(job_id=700, repo=HOMELAB, labels=["homelab"])
+    ctrl, _github, _docker = _controller(write_config, [job])
+    stale = DeferDecision(job, ("budget_full",), host="powerserver", class_name="retired")
+    ctrl.scheduler = MagicMock(wraps=ctrl.scheduler)
+    ctrl.scheduler.plan.return_value = [stale]
+
+    ctrl.tick()
+    (queued,) = ctrl.status()["deferred"]
+
+    assert queued["class"] == "retired"
+    assert queued["ram_mb"] is None
+
+
+GUARDED_CONFIG = VALID_CONFIG.replace(
+    "ram_budget_mb: 12000",
+    "admission_mode: reservation_plus_guard\n"
+    "host_free_ram_floor_mb: 3500\n"
+    "host_load_ceiling: 16.0\n"
+    "ram_budget_mb: 12000",
+)
+
+
+def _controller_reading(write_config, config_text, stats):
+    ctrl, _github, _docker = _controller(write_config, [], config_text=config_text)
+    ctrl._host_stats_reader = lambda: stats
+    return ctrl
+
+
+def test_status_reports_the_live_pressure_admission_judged(write_config) -> None:
+    """A RAM-reservation bar cannot show a host that is out of CPU. On 2026-11-07
+    powerserver held every job on host_pressure (load 28, PSI 80 %) while its reserve
+    read 5 of 11 GB, and the page looked like a scheduler ignoring free room."""
+    busy = HostStats(mem_available_mb=11000, load_1m=28.0, cpu_pressure_pct=80.0)
+    ctrl = _controller_reading(write_config, GUARDED_CONFIG, busy)
+
+    ctrl.tick()
+
+    assert ctrl.status()["hosts"]["powerserver"]["pressure"] == {
+        "mem_available_mb": 11000,
+        "load_1m": 28.0,
+        "cpu_pressure_pct": 80.0,
+        "free_ram_floor_mb": 3500,
+        "load_ceiling": 16.0,
+        "binding": True,
+    }
+
+
+def test_status_pressure_binds_only_when_admission_would_hold_on_it(write_config) -> None:
+    """High load with idle CPUs is IO wait, which the gate ignores (2026-10-20); and in
+    plain reservation mode the guard is off whatever the stats say."""
+    io_wait = HostStats(mem_available_mb=11000, load_1m=28.0, cpu_pressure_pct=5.0)
+    guarded = _controller_reading(write_config, GUARDED_CONFIG, io_wait)
+    guarded.tick()
+    assert guarded.status()["hosts"]["powerserver"]["pressure"]["binding"] is False
+
+    starved = HostStats(mem_available_mb=100, load_1m=1.0, cpu_pressure_pct=0.0)
+    unguarded = _controller_reading(write_config, VALID_CONFIG, starved)
+    unguarded.tick()
+    assert unguarded.status()["hosts"]["powerserver"]["pressure"]["binding"] is False
+
+
+def test_status_reports_no_pressure_for_a_host_it_cannot_read(write_config) -> None:
+    """The controller reads /proc on its own box only; a remote host gets null, never a
+    zero that would read as an idle machine."""
+    ctrl, _github, _adapters, _pool = _multi_host_controller(write_config, [])
+    ctrl._host_stats_reader = lambda: HostStats(mem_available_mb=9000, load_1m=1.0)
+
+    ctrl.tick()
+    hosts = ctrl.status()["hosts"]
+
+    assert hosts["powerserver"]["pressure"] is not None
+    assert hosts["desktop"]["pressure"] is None
+
+
 def test_a_defer_event_records_the_class_so_the_queue_can_be_grouped_later(
     write_config, monkeypatch
 ) -> None:
@@ -1780,9 +1917,11 @@ def test_controller_admits_via_the_scheduler(make_controller, monkeypatch):
     calls: list[int] = []
     original = controller.scheduler.plan
 
-    def spy(jobs, host_stats, healthy):
+    def spy(jobs, host_stats, healthy, *, review_sessions, ram_offers):
         calls.append(len(jobs))
-        return original(jobs, host_stats, healthy)
+        return original(
+            jobs, host_stats, healthy, review_sessions=review_sessions, ram_offers=ram_offers
+        )
 
     monkeypatch.setattr(controller.scheduler, "plan", spy)
     controller.tick()
@@ -1817,3 +1956,316 @@ def test_status_still_reports_per_host_totals(make_controller):
     assert isinstance(status["lanes_running"], int)
     assert isinstance(status["ledger_ram_mb"], int)
     assert set(status["disk_gb"]) == set(ctrl.config.disk_budget_gb)
+
+
+# --- review-aware admission (ADR 0032) -------------------------------------------------
+
+HOMELAB = "alvaro-francisco-gil/homelab"
+
+
+def _reviewed_job(job_id: int, run_id: int, head_sha: str) -> QueuedJob:
+    return QueuedJob(
+        job_id=job_id,
+        repo=HOMELAB,
+        labels=["self-hosted", "homelab", f"run-{run_id}"],
+        run_id=run_id,
+        head_sha=head_sha,
+    )
+
+
+def test_tick_stamps_each_job_with_its_heads_review_state(write_config) -> None:
+    ctrl, _github, _docker = _controller(
+        write_config, [_reviewed_job(1, 10, "good"), _reviewed_job(2, 20, "unknown")]
+    )
+    ctrl.reviews.head_states.return_value = {"good": "approved"}
+
+    decisions = ctrl.tick()
+
+    assert {d.job.job_id: d.job.review for d in decisions} == {1: "approved", 2: None}
+    ctrl.reviews.head_states.assert_called_once_with(HOMELAB, ["good", "unknown"])
+
+
+def test_github_review_down_degrades_to_untiered_admission_and_says_so(
+    write_config, caplog
+) -> None:
+    ctrl, github, _docker = _controller(write_config, [_reviewed_job(1, 10, "sha")])
+    ctrl.reviews.head_states.side_effect = ConnectionError("refused")
+
+    with caplog.at_level(logging.ERROR, logger="ci-controller"):
+        decisions = ctrl.tick()
+        ctrl.tick()
+        # The queue drains mid-outage: asking nothing proves nothing, so the outage stands.
+        github.list_queued_jobs.side_effect = lambda repo: []
+        ctrl.tick()
+        assert ctrl.status()["review_state_reachable"] is False
+        github.list_queued_jobs.side_effect = lambda repo: (
+            [_reviewed_job(1, 10, "sha")] if repo == HOMELAB else []
+        )
+        ctrl.tick()
+
+    assert isinstance(decisions[0], AdmitDecision)
+    assert decisions[0].job.review is None
+    unreachable = [r for r in caplog.records if "github-review unreachable" in r.message]
+    assert len(unreachable) == 1, "an outage is said once, not once per tick"
+    assert ctrl.status()["review_state_reachable"] is False
+
+    ctrl.reviews.head_states.side_effect = None
+    ctrl.reviews.head_states.return_value = {}
+    ctrl.tick()
+    assert ctrl.status()["review_state_reachable"] is True
+
+
+def test_review_containers_are_counted_on_the_session_host_and_charged(write_config) -> None:
+    ctrl, _github, docker = _controller(write_config, [])
+    docker.count_review_sessions.return_value = 3
+    plan = MagicMock(wraps=ctrl.scheduler.plan)
+    ctrl.scheduler.plan = plan  # type: ignore[method-assign]
+
+    ctrl.tick()
+
+    assert plan.call_args.kwargs["review_sessions"] == 3
+    status = ctrl.status()
+    assert status["review_sessions"] == 3
+    # Where they run and what they are charged, so a reader can put them on that
+    # host's budget without reading the controller's config.
+    assert status["review_session_host"] == ctrl.config.review_admission.session_host
+    assert status["review_ram_mb"] == 3 * ctrl.config.review_admission.session_ram_mb
+
+
+def test_a_failed_review_container_count_keeps_the_last_figure(write_config) -> None:
+    ctrl, _github, docker = _controller(write_config, [])
+    docker.count_review_sessions.return_value = 2
+    ctrl.tick()
+    docker.count_review_sessions.side_effect = RuntimeError("proxy blip")
+
+    ctrl.tick()
+
+    assert ctrl.status()["review_sessions"] == 2
+
+
+def _contended(write_config, extra_lanes_mb: int = 11300):
+    """VALID_CONFIG's 12000 MB with `extra_lanes_mb` already reserved: one 700 MB lane
+    fits at most, so a second job waits on budget."""
+    rejected = _reviewed_job(1, 10, "bad")
+    pending = _reviewed_job(2, 20, "maybe")
+    ctrl, github, docker = _controller(write_config, [rejected, pending])
+    ctrl.ledger.add(Reservation("full", 99, HOMELAB, "light", extra_lanes_mb, False))
+    docker.list_lanes.return_value = [LaneInfo("full", 99, "cid-full")]
+    ctrl.reviews.head_states.return_value = {"bad": "changes_requested", "maybe": "pending"}
+    github.cancel_queued_run.return_value = True
+    return ctrl, github
+
+
+def test_a_rejected_heads_queued_run_is_cancelled_while_others_wait(write_config) -> None:
+    ctrl, github = _contended(write_config, extra_lanes_mb=11500)
+
+    decisions = ctrl.tick()
+
+    reasons = {d.job.job_id: d.reasons for d in decisions if isinstance(d, DeferDecision)}
+    assert reasons == {2: ("budget_full",), 1: ("review_held",)}
+    github.cancel_queued_run.assert_called_once_with(HOMELAB, 10)
+
+
+def test_a_rejected_head_is_left_to_run_when_nothing_waits(write_config) -> None:
+    ctrl, github = _contended(write_config, extra_lanes_mb=0)
+
+    ctrl.tick()
+
+    github.cancel_queued_run.assert_not_called()
+
+
+def test_a_run_with_a_job_admitted_this_tick_is_not_cancelled(write_config) -> None:
+    """Unpinned, the rejected head ranks with everything else and one of its run's jobs
+    takes the last 700 MB. Its other job and the pending job both wait, but cancelling
+    run 10 now would strand the lane just spawned for it."""
+    rejected_a = _reviewed_job(1, 10, "bad")
+    rejected_b = _reviewed_job(3, 10, "bad")
+    waiting = _reviewed_job(2, 20, "maybe")
+    ctrl, github, docker = _controller(write_config, [rejected_a, rejected_b, waiting])
+    ctrl.ledger.add(Reservation("full", 99, HOMELAB, "light", 11300, False))
+    docker.list_lanes.return_value = [LaneInfo("full", 99, "cid-full")]
+    ctrl.reviews.head_states.return_value = {"bad": "changes_requested", "maybe": "pending"}
+    github.list_queued_jobs.side_effect = lambda repo: [
+        QueuedJob(
+            job_id=j.job_id,
+            repo=j.repo,
+            labels=["self-hosted", "homelab"],
+            run_id=j.run_id,
+            head_sha=j.head_sha,
+        )
+        for j in (rejected_a, rejected_b, waiting)
+        if j.repo == repo
+    ]
+
+    decisions = ctrl.tick()
+
+    verdicts = {d.job.job_id: isinstance(d, AdmitDecision) for d in decisions}
+    assert verdicts == {1: True, 3: False, 2: False}
+    github.cancel_queued_run.assert_not_called()
+
+
+def test_a_refused_cancel_is_logged_once_not_retried_every_tick(write_config, caplog) -> None:
+    ctrl, github = _contended(write_config, extra_lanes_mb=11500)
+    github.cancel_queued_run.side_effect = RuntimeError("403 Resource not accessible")
+
+    with caplog.at_level(logging.ERROR, logger="ci-controller"):
+        ctrl.tick()
+        ctrl.tick()
+
+    assert github.cancel_queued_run.call_count == 1
+    assert sum("cancelling rejected run 10" in r.message for r in caplog.records) == 1
+
+
+def test_a_cancel_is_recorded_per_job_in_the_metrics_db(write_config, tmp_path) -> None:
+    from src.metrics import MetricsStore
+
+    metrics = MetricsStore(str(tmp_path / "m.db"))
+    rejected = _reviewed_job(1, 10, "bad")
+    pending = _reviewed_job(2, 20, "maybe")
+    ctrl, github, docker = _controller(write_config, [rejected, pending], metrics=metrics)
+    ctrl.ledger.add(Reservation("full", 99, HOMELAB, "light", 11500, False))
+    docker.list_lanes.return_value = [LaneInfo("full", 99, "cid-full")]
+    ctrl.reviews.head_states.return_value = {"bad": "changes_requested", "maybe": "pending"}
+    github.cancel_queued_run.return_value = True
+
+    ctrl.tick()
+
+    rows = metrics.conn.execute(
+        "SELECT job_id, reason FROM events WHERE kind = 'cancel'"
+    ).fetchall()
+    assert rows == [(1, "changes_requested")]
+
+
+def test_status_names_each_deferred_jobs_review_state(write_config) -> None:
+    ctrl, _github = _contended(write_config, extra_lanes_mb=11500)
+
+    ctrl.tick()
+
+    assert {d["job_id"]: d["review"] for d in ctrl.status()["deferred"]} == {
+        1: "changes_requested",
+        2: "pending",
+    }
+
+
+def test_a_run_holding_a_lane_from_an_earlier_tick_is_not_cancelled(write_config) -> None:
+    """The lane admitted last tick may be booting and about to start one of the run's
+    jobs; the check-then-cancel window must not include a runner we spawned for it."""
+    rejected = _reviewed_job(1, 10, "bad")
+    sibling = _reviewed_job(3, 10, "bad")
+    pending = _reviewed_job(2, 20, "maybe")
+    ctrl, github, docker = _controller(write_config, [rejected, sibling, pending])
+    ctrl.ledger.add(Reservation("full", 99, HOMELAB, "light", 10800, False))
+    ctrl.ledger.add(Reservation("booting", 1, HOMELAB, "light", 700, False))
+    docker.list_lanes.return_value = [
+        LaneInfo("full", 99, "cid-full"),
+        LaneInfo("booting", 1, "cid-booting"),
+    ]
+    ctrl.reviews.head_states.return_value = {"bad": "changes_requested", "maybe": "pending"}
+    github.cancel_queued_run.return_value = True
+
+    decisions = ctrl.tick()
+
+    reasons = {d.job.job_id: d.reasons for d in decisions if isinstance(d, DeferDecision)}
+    assert reasons == {
+        1: ("already_running",),
+        2: ("budget_full",),
+        3: ("review_held",),
+    }
+    github.cancel_queued_run.assert_not_called()
+
+
+def test_a_job_held_only_by_kvm_does_not_hold_or_cancel_a_rejected_head(write_config) -> None:
+    """Withholding a light lane cannot free the KVM device, so an emulator job waiting on
+    it is not waiting for anything a rejected head's CI is taking. Cancelling is
+    irreversible; it must not happen for a gate it cannot relieve."""
+    emulator = QueuedJob(
+        job_id=5,
+        repo="ordago-app/ordago-apps",
+        labels=["android-e2e", "run-50"],
+        run_id=50,
+        head_sha="approved",
+    )
+    rejected = _reviewed_job(1, 10, "bad")
+    ctrl, github, docker = _controller(write_config, [emulator, rejected])
+    ctrl.ledger.add(Reservation("emu", 99, "ordago-app/ordago-apps", "emulator", 2500, True))
+    docker.list_lanes.return_value = [LaneInfo("emu", 99, "cid-emu")]
+    ctrl.reviews.head_states.side_effect = lambda repo, shas: {
+        "approved": "approved",
+        "bad": "changes_requested",
+    }
+
+    decisions = ctrl.tick()
+
+    verdicts = {
+        d.job.job_id: ("admit" if isinstance(d, AdmitDecision) else d.reasons) for d in decisions
+    }
+    assert verdicts == {5: ("kvm_busy",), 1: "admit"}
+    github.cancel_queued_run.assert_not_called()
+
+
+def test_status_reports_the_budget_an_elastic_host_was_admitted_against(write_config) -> None:
+    """ci-status must show what admission used: the offer, not the configured ceiling."""
+    text = MULTI_HOST_CONFIG.replace(
+        "    docker_endpoint: tcp://desktop:2375\n",
+        "    docker_endpoint: tcp://desktop:2375\n    ram_offer_reserve_mb: 1000\n",
+    )
+    assert text != MULTI_HOST_CONFIG
+    cfg = ControllerConfig.load(write_config(text))
+    pool = MagicMock()
+    pool.snapshot.return_value = ({"powerserver", "desktop"}, {"powerserver": [], "desktop": []})
+    pool.ram_offers.return_value = {"desktop": 2500}
+    pool.for_host.return_value.count_review_sessions.return_value = 0
+    github = MagicMock()
+    github.list_queued_jobs.return_value = []
+    ctrl = Controller(
+        host="powerserver",
+        config=cfg,
+        github=github,
+        docker=pool,
+        ledger=Ledger(),
+        reviews=_no_reviews(),
+    )
+
+    ctrl.tick()
+
+    assert ctrl.status()["hosts"]["desktop"]["budget_ram_mb"] == 2500
+    pool.ram_offers.assert_called_with({"powerserver", "desktop"})
+
+
+ELASTIC_DESKTOP_CONFIG = MULTI_HOST_CONFIG.replace(
+    "    docker_endpoint: tcp://desktop:2375\n",
+    "    docker_endpoint: tcp://desktop:2375\n    ram_offer_reserve_mb: 1000\n",
+)
+
+
+@pytest.mark.parametrize(
+    ("offers", "admitted"),
+    [({"desktop": 2500}, True), ({"desktop": 500}, False), ({}, False)],
+    ids=["offer-fits", "offer-too-small", "no-offer"],
+)
+def test_a_tick_admits_to_an_elastic_host_only_within_its_offer(
+    write_config, offers, admitted
+) -> None:
+    """The pool's offers must reach admission through tick(): forwarding {} instead
+    would defer every job on the elastic host and no admission-level test would see it."""
+    assert ELASTIC_DESKTOP_CONFIG != MULTI_HOST_CONFIG
+    job = QueuedJob(
+        job_id=1, repo="alvaro-francisco-gil/homelab", labels=["self-hosted", "homelab"]
+    )
+    ctrl, _github, adapters, pool = _multi_host_controller(
+        write_config, [job], config_text=ELASTIC_DESKTOP_CONFIG
+    )
+    pool.up = {"desktop"}
+    pool.ram_offers.return_value = offers
+
+    decisions = ctrl.tick()
+
+    assert pool.ram_offers.call_args.args == ({"desktop"},)
+    if admitted:
+        (admit,) = [d for d in decisions if isinstance(d, AdmitDecision)]
+        assert admit.host == "desktop"
+        adapters["desktop"].spawn.assert_called_once()
+    else:
+        (defer,) = [d for d in decisions if isinstance(d, DeferDecision)]
+        assert BUDGET_FULL in defer.reasons
+        adapters["desktop"].spawn.assert_not_called()

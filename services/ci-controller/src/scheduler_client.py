@@ -64,11 +64,16 @@ class HttpScheduler:
         jobs: list[QueuedJob],
         host_stats: dict[str, HostStats],
         healthy: set[str] | None,
+        *,
+        review_sessions: int,
+        ram_offers: dict[str, int],
     ) -> list[Decision]:
         body = {
             "jobs": [asdict(j) for j in jobs],
             "host_stats": {name: asdict(s) for name, s in host_stats.items()},
             "healthy": sorted(healthy) if healthy is not None else None,
+            "review_sessions": review_sessions,
+            "ram_offers": ram_offers,
         }
         # A plan is a pure computation over state the scheduler already holds, so it is
         # safe to retry despite the verb.
