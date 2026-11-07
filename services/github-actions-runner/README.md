@@ -106,6 +106,44 @@ runs-on: [self-hosted, linux, x64, powerserver, ordago-ci]
 
 No workflow should use only `self-hosted`.
 
+## What the image has, and why that is a contract
+
+The image is **not** `ubuntu-latest`. A job moved here from a GitHub-hosted runner
+keeps its labels and its price tag, but silently changes its **toolchain** — and
+nothing type-checks a shell script's assumptions, so the only signal is exit 127
+at run time.
+
+That is not hypothetical. On 2026-09-01 an `ordago-apps` cost sweep moved four
+`gh`-calling jobs onto these lanes. The announce poller's `disarm` job failed on
+every tick from that day, so the poller could not switch itself off and burned a
+scheduled run every 30 minutes; a sibling job (`arm-announce`, the release
+recovery endpoint) broke identically but in silence, having simply not run since.
+Neither failure is visible in a cost dashboard, which is what the change was
+reviewed against.
+
+So the image deliberately carries the cheap, widely-assumed tools a workflow
+author will reach for without thinking: **`gh`**, `jq`, `curl`, `git`, `unzip`,
+`zip`, `xz-utils`, `openssl`, plus Node (with corepack) and a JDK. Removing one
+of these is a breaking change for every repo on the pool, not a size optimisation
+— the saving is megabytes and the cost is a class of silent, per-repo
+rediscovery. `test_image_installs_the_whole_contract_toolbox` enforces the list,
+so this section is checked rather than aspirational.
+
+**`pnpm` is baked in but deliberately outside the contract.** `ubuntu-latest`
+does not ship it, so no workflow author assumes it; it is here because the repos
+on this pool happen to use it, and a repo that needs a different package manager
+should install its own.
+
+Adding to the list is cheap and usually right. Before you decide a tool is too
+niche to include, check whether `ubuntu-latest` ships it: if it does, a workflow
+author has no reason to expect its absence — and add it to
+`CONTRACT_APT_PACKAGES` in the test, or the contract is prose again.
+
+One consequence worth knowing: declaring the GitHub CLI apt repo means every
+later `apt-get update` in the image (and any a job runs) also depends on
+`cli.github.com` being reachable, where it previously needed only the Ubuntu
+archive and NodeSource. Same tradeoff the NodeSource layer already takes.
+
 ## State
 
 Host state lives under the pool's `work_root` from
@@ -127,13 +165,16 @@ These directories are persistent caches, not source of truth.
 1. Create a dedicated GitHub App owned by the operator account.
 2. Disable webhooks; this service only uses outbound REST API calls.
 3. Grant repository `Administration: Read and Write`; this is required to mint
-   self-hosted runner registration/remove tokens.
+   self-hosted runner registration/remove tokens. Grant `Actions: Read and write`
+   too: `ci-controller` lists queued runs and cancels a rejected head's queued runs
+   under contention (ADR 0032).
 4. Install the App on every **account** owning a repository listed in
    `personal/repos.yml` — personal and org alike. The installation id is never
    configured: both the entrypoint and `ci-controller` resolve it per repo, so
    one App serves repos across owners.
-5. Store `app_id` and the downloaded PEM private key in
-   `secrets/secrets.prod.yml` under `github_actions_runner_app`.
+5. Store `app_id` and the downloaded PEM private key under
+   `github_actions_runner_app` in the operator's encrypted secrets store
+   (`make secrets-edit`).
 6. Confirm root disk has enough headroom for Android SDK and AVD caches:
 
    ```bash
