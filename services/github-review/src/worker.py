@@ -29,6 +29,8 @@ CARRIED_REVIEW_MARKER = "<!-- ai-review:carried-approval -->"
 
 # Opens a PR comment saying no review is coming for a head, and why.
 NO_REVIEW_MARKER = "<!-- ai-review:no-review -->"
+# A queued head whose repo was paused or left this reviewer's config.
+REPO_NOT_CONFIGURED = "repo no longer configured in this reviewer"
 
 # Every `_budget_spent` reason starts with this, so a budget skip is told apart
 # from a `head moved` skip by the row alone.
@@ -430,7 +432,7 @@ class ReviewWorker:
             if repo_policy is None:
                 # Queued before its repo was removed or handed to another reviewer:
                 # retrying it would only end in a "failed" comment on someone else's PR.
-                self._store.mark_skipped(job.id, "repo no longer configured in this reviewer")
+                self._store.mark_skipped(job.id, REPO_NOT_CONFIGURED)
                 return
             pr = self._github.get_pull_request(job.repo, job.pr_number)
             if pr.state != "open":
@@ -675,15 +677,21 @@ class ReviewWorker:
 
         An explicit request reviews regardless of `review_mode` and the draft rule:
         the caller asked for this PR by number. It is idempotent per head. A head
-        whose job ran out of attempts gets a fresh set, so asking again is how a
-        stuck review is retried. The run cap still bounds what that can spend.
+        whose job ran out of attempts, or was skipped while its repo was paused or
+        absent, gets a fresh set, so asking again is how a stuck review is retried.
+        The run cap still bounds what that can spend.
 
         Raises KeyError for a repo with no enabled policy."""
         project = self._project_for_repo(repo)
         pr = self._github.get_pull_request(repo, pr_number)
         chain = next(r for r in self._config.enabled_repos() if r.project == project).providers
         job = self._store.enqueue(repo, project, chain[0], pr_number, pr.head_sha, pr.base_sha)
-        if job.status == JobStatus.FAILED and job.attempts >= self._max_attempts:
+        out_of_attempts = job.status == JobStatus.FAILED and job.attempts >= self._max_attempts
+        # Skipped while its repo was paused or absent; the repo is enabled again now.
+        skipped_while_absent = (
+            job.status == JobStatus.SKIPPED and job.last_error == REPO_NOT_CONFIGURED
+        )
+        if out_of_attempts or skipped_while_absent:
             self._store.requeue(job.id)
             job = self._store.get(job.id) or job
         return job
