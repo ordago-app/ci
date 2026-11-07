@@ -20,6 +20,9 @@ secrets) and the commit it runs. Every merge to `main` publishes the platform's
 images to `ghcr.io/ordago-app/<image>:<commit sha>`
 ([`.github/workflows/images.yml`](.github/workflows/images.yml)), and the roles
 run those images. Nothing is built on a host, so no host holds a copy of the code.
+Pin a commit whose `images` run on `main` succeeded: when merges land close
+together, GitHub skips the runs queued in between, and those commits have no
+images.
 
 ## Using the roles
 
