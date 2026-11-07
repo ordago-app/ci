@@ -1,0 +1,88 @@
+name: images
+
+# The platform ships as images. A consumer, whether a homelab, a VPS or a cloud VM,
+# runs these at a commit SHA it chose; it never builds from source (plan
+# one-copy-of-the-ci-platform). Every merge to main publishes each image tagged
+# with that commit's full SHA. There is no `latest`: an image that moves on its own
+# would let a commit here reach a host its owner never chose to update
+# (AGENTS.md invariant 5).
+#
+# GitHub-hosted, like every workflow here: a broken pool must not stop the fix to
+# the pool. No secret is baked into any image; credentials arrive at deploy or
+# spawn time.
+#
+# A PR builds every image without pushing, so a Dockerfile that does not build
+# fails here instead of on someone's host. On a PR the full runner image is built
+# without its ~10 GB Android layers (WITH_ANDROID=0): the slow, hang-prone
+# sdkmanager download is only worth paying for the image that ships.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "image ${{ matrix.image }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ci-controller
+            context: services/ci-controller
+          - image: ci-runner
+            context: services/github-actions-runner
+          # Same image without the ~10 GB Android SDK, for a lane host whose classes
+          # never need it. Published as ci-runner:<sha>-light.
+          - image: ci-runner
+            variant: light
+            context: services/github-actions-runner
+          - image: github-review
+            context: services/github-review
+          - image: github-review-claude
+            context: services/github-review/claude-review
+          - image: github-review-codex
+            context: services/github-review/codex-review
+    env:
+      REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ github.sha }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
+      PUBLISH: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The full runner image needs ~25 GB of build space; a hosted runner starts
+      # with ~14 GB free. These preinstalled toolchains are never used here.
+      - name: Free disk for the runner image
+        if: matrix.image == 'ci-runner' && matrix.variant != 'light' && env.PUBLISH == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Build
+        run: |
+          args=()
+          if [ "${{ matrix.image }}" = ci-runner ] && { [ "$PUBLISH" != true ] || [ "${{ matrix.variant }}" = light ]; }; then
+            args+=(--build-arg WITH_ANDROID=0)
+          fi
+          docker build "${args[@]}" \
+            --label org.opencontainers.image.source="${{ github.server_url }}/${{ github.repository }}" \
+            --label org.opencontainers.image.revision="${{ github.sha }}" \
+            -t "$REF" "${{ matrix.context }}"
+
+      - name: Publish
+        if: env.PUBLISH == 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$REF"

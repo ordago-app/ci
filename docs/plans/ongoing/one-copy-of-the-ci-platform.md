@@ -15,8 +15,8 @@ pinned to the same commit. Nothing about one consumer belongs in the engine
 | Task | State |
 |---|---|
 | 1. ci-controller superset | done, #26 |
-| 2. github-actions-runner superset | PR open; Dockerfile and entrypoint are a hard stop, so a human merges it |
-| 3. Publish images | not started |
+| 2. github-actions-runner superset | done, #27 |
+| 3. Publish images | done, #28. Each GHCR package must be made public once by an org owner after its first publish, or every consumer needs a pull credential |
 | 4. Roles run the published images, at parity | not started |
 | 5. Consumer cut-over | not started; needs each machine's owner to deploy |
 | 6. Stop it reopening | not started |
