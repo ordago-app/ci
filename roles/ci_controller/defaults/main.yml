@@ -40,3 +40,11 @@ ci_controller_repos_config: "{{ personal_root }}/repos.yml"
 # ci_controller_work_dirs:
 #   - /mnt/your-ssd/ci-controller
 # ci_controller_cache_root: /mnt/your-ssd/caches
+
+# The commit of this repository whose published images this stack runs. NO DEFAULT:
+# it is the consumer's pin, and must equal the SHA its requirements.yml pins this
+# collection to, so the role and the images it runs come from one commit.
+# ci_image_tag: <40-hex commit SHA>
+#
+# Where the images are published (.github/workflows/images.yml).
+ci_image_registry: ghcr.io/ordago-app

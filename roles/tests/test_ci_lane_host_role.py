@@ -61,22 +61,24 @@ def test_lane_host_no_longer_computes_a_bind_address() -> None:
     )
 
 
-def test_lane_host_playbook_builds_the_runner_image_locally() -> None:
+def test_lane_host_pulls_the_runner_image_of_the_pinned_commit() -> None:
     """The proxy denies IMAGES and BUILD, so the controller can never install it.
 
-    Without a locally-built image every admission to this host 404s, which reads
-    like a controller bug and is not one.
+    Without the image every admission to this host 404s, which reads like a
+    controller bug and is not one. It is pulled, never built: a host holds no copy
+    of the code, so nothing on it can drift from the pinned commit.
     """
     tasks = _lane_host_tasks()
-    built = [
-        t.get("community.docker.docker_image")
-        for t in tasks
-        if t.get("community.docker.docker_image")
+    images = [
+        t["community.docker.docker_image"] for t in tasks if t.get("community.docker.docker_image")
     ]
-    assert any(
-        img.get("name") == "homelab/github-actions-runner" and img.get("source") == "build"
-        for img in built
-    ), "ci_lane_host's tasks must build homelab/github-actions-runner locally"
+    assert [img.get("source") for img in images] == ["pull"], (
+        "ci_lane_host must pull exactly one image, the runner, and build none"
+    )
+    assert images[0]["name"] == "{{ ci_lane_runner_image }}"
+    assert not any(t.get("ansible.posix.synchronize") for t in tasks), (
+        "no build context may be copied to a lane host any more"
+    )
 
 
 def test_lane_host_prunes_its_own_stale_work_dirs() -> None:
@@ -165,56 +167,31 @@ def _lane_firewall_script() -> str:
     return (scripts[0].get("ansible.builtin.copy") or scripts[0]["copy"])["content"]
 
 
-def test_runner_image_tag_and_android_flag_come_from_variables() -> None:
-    """A consumer's scheduling check reads this host's image TAG to decide which job
-    classes it may run -- `light` means "no Android SDK, never an emulator lane".
-
-    That check lives in the consumer, because only there is the pool config visible.
-    So the consumer must be able to SUPPLY the tag, not copy it. If these were
-    literals here, a consumer could only hand-mirror them in its own config: its test
-    would compare its mirror against itself, pass forever, and drift silently the
-    moment this role's literal changed. Same argument as ci_lane_work_dir.
-    """
-    built = [
-        t.get("community.docker.docker_image")
-        for t in _lane_host_tasks()
-        if t.get("community.docker.docker_image")
-    ]
-    runner = [img for img in built if img.get("name") == "homelab/github-actions-runner"]
-    assert len(runner) == 1, f"expected one runner image build, found {len(runner)}"
-    img = runner[0]
-
-    assert "ci_lane_runner_image_tag" in str(img.get("tag")), (
-        f"tag is {img.get('tag')!r}: it must come from ci_lane_runner_image_tag, or a "
-        "consumer can only mirror a literal and its scheduling test guards nothing"
-    )
-    assert "ci_lane_runner_with_android" in str(img.get("build", {}).get("args", {})), (
-        "WITH_ANDROID must derive from ci_lane_runner_with_android, or the tag a "
-        "consumer supplies can silently disagree with what the image actually holds"
-    )
-
+def test_the_runner_image_is_the_pinned_commits_and_says_whether_it_has_android() -> None:
+    """A consumer's scheduling check compares this host's runner_image in its pool
+    config with ci_lane_runner_image, so the rule lives here once. `-light` means
+    "no Android SDK, never an emulator lane"; it is derived from the flag, so the two
+    cannot contradict each other."""
     defaults = yaml.safe_load((ROLE / "defaults" / "main.yml").read_text())
-    assert defaults["ci_lane_runner_image_tag"] == "light"
+
+    assert "ci_image_tag" not in defaults, "the pin has no default: it is the consumer's"
     assert defaults["ci_lane_runner_with_android"] is False
+    image = defaults["ci_lane_runner_image"]
+    for part in ("ci_image_registry", "/ci-runner:", "ci_image_tag", "-light"):
+        assert part in image, f"ci_lane_runner_image must derive from {part}: {image!r}"
+    assert "ci_lane_runner_with_android" in image
 
 
-def test_a_contradictory_tag_and_android_flag_stop_the_play() -> None:
-    """The consumer's inference "tag == light therefore no Android SDK" is only sound
-    if the two cannot contradict each other. An image tagged `light` that carried the
-    SDK -- or a `latest` that lacked it -- would make every consumer's scheduling
-    check wrong while still passing. The role must refuse to build it."""
+def test_a_tag_that_is_not_a_full_sha_stops_the_play() -> None:
+    """A branch, a short SHA or `latest` would let the image move under the host
+    without its owner choosing it (AGENTS.md invariant 5)."""
     asserts = [
-        t
+        t["ansible.builtin.assert"]
         for t in _lane_host_tasks()
-        if t.get("ansible.builtin.assert")
-        and "ci_lane_runner_image_tag" in str(t["ansible.builtin.assert"])
+        if t.get("ansible.builtin.assert") and "ci_image_tag" in str(t["ansible.builtin.assert"])
     ]
-    assert len(asserts) == 1, "expected exactly one tag/Android-flag consistency assert"
-    conditions = " ".join(asserts[0]["ansible.builtin.assert"]["that"])
-    assert "light" in conditions and "latest" in conditions, (
-        "the assert must pin BOTH named tags; guarding only one leaves the other "
-        f"free to lie about what the image holds. Got: {conditions}"
-    )
+    assert len(asserts) == 1
+    assert "^[0-9a-f]{40}$" in " ".join(asserts[0]["that"])
 
 
 def test_the_role_installs_no_host_firewall_for_2375() -> None:
@@ -306,7 +283,7 @@ def test_every_lane_host_knob_is_documented_in_the_readme() -> None:
 
     A knob added to defaults/ and not mentioned there is invisible: the consumer takes
     the default, and finds out it was wrong when a deploy behaves oddly. That already
-    happened twice -- ci_lane_runner_image_tag and ci_lane_runner_with_android shipped
+    happened twice -- the runner image tag and ci_lane_runner_with_android shipped
     undocumented, while the README still listed a variable the role had stopped
     reading.
 
