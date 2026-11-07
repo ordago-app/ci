@@ -512,3 +512,28 @@ def test_a_later_round_builds_on_the_last_review_instead_of_starting_over(
     assert store.find("alvaro-francisco-gil/homelab", 1, "head").review_body == (
         "1. `README.md:1` is wrong."
     )
+
+
+def test_a_job_for_a_repo_no_longer_configured_is_skipped_silently(tmp_path: Path) -> None:
+    """A repo handed to another reviewer may still have jobs queued here. They are
+    skipped with a reason, never retried into a "failed 3 times" comment on its PR."""
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    job = store.enqueue("acme/departed", "departed", "codex", 1, "head", "base")
+    gh = EmptyGitHub()
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=gh,
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": BombProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+    )
+
+    tick_and_drain(worker)
+
+    skipped = store.get(job.id)
+    assert skipped.status == JobStatus.SKIPPED
+    assert "no longer configured" in (skipped.last_error or "")
+    assert gh.comments == [] and gh.posted == []
