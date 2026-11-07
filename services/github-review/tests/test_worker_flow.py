@@ -6,7 +6,7 @@ from src.config import ReviewConfig
 from src.github_client import PullRequest
 from src.job_store import JobStatus, ReviewJobStore
 from src.provider import ReviewResult, SessionRef
-from src.worker import NO_REVIEW_MARKER, ReviewWorker
+from src.worker import NO_REVIEW_MARKER, REPO_NOT_CONFIGURED, ReviewWorker
 
 from tests.helpers import begin_attempt, tick_and_drain, write_config
 
@@ -537,3 +537,24 @@ def test_a_job_for_a_repo_no_longer_configured_is_skipped_silently(tmp_path: Pat
     assert skipped.status == JobStatus.SKIPPED
     assert "no longer configured" in (skipped.last_error or "")
     assert gh.comments == [] and gh.posted == []
+
+
+def test_asking_again_requeues_a_head_skipped_while_its_repo_was_away(tmp_path: Path) -> None:
+    """Pausing a repo (`enabled: false`) skips its queued heads; once it is enabled
+    again, an explicit request must run that head rather than report the skip as done."""
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    job = store.enqueue("alvaro-francisco-gil/homelab", "homelab", "codex", 1, "head", "base")
+    begin_attempt(store, job.id)
+    store.mark_skipped(job.id, REPO_NOT_CONFIGURED)
+    worker = ReviewWorker(
+        config=config(tmp_path),
+        store=store,
+        github=FakeGitHub(),
+        worktrees=FakeWorktrees(tmp_path / "wt"),
+        providers={"codex": FakeProvider()},
+        projects_root=tmp_path / "projects",
+        reviewer_bot="reviewer[bot]",
+    )
+
+    assert worker.request_review("alvaro-francisco-gil/homelab", 1).status == JobStatus.QUEUED

@@ -34,5 +34,6 @@ as `BUDGET_EXHAUSTED` in the workflow instead of a plain `REQUEST_CHANGES`.
   real review does `GET /pulls/N/files` → `GET /commits/<sha>/check-runs` →
   `POST /pulls/N/reviews`; a capped one does only `GET /pulls/N`.
 - Batch review fixes into one push — five rounds go fast when plan/doc updates each burn one.
-- `homelab` has `run_ci_first: true`, so the review lands after CI is green, not in parallel;
-  `ordago-apps` has `run_ci_first: false`.
+- `run_ci_first` does not delay a review: it only puts the head's CI status into the prompt.
+  Every labelled head is queued at once and runs in parallel with CI; green heads go first.
+  (Corrected 2026-11-07; this line used to say the opposite.)
