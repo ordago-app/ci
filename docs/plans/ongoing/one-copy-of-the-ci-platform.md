@@ -14,9 +14,9 @@ pinned to the same commit. Nothing about one consumer belongs in the engine
 
 | Task | State |
 |---|---|
-| 1. ci-controller superset | PR open (this file moved to `ongoing/` with it) |
+| 1. ci-controller superset | done, #26 |
 | 2. github-actions-runner superset | not started |
-| 3. Publish images | not started |
+| 3. Publish images | PR open (`.github/workflows/images.yml`); a hard stop, so a human merges it. After the first publish, each GHCR package must be made public once by an org owner, or every consumer needs a pull credential |
 | 4. Roles run the published images, at parity | not started |
 | 5. Consumer cut-over | not started; needs each machine's owner to deploy |
 | 6. Stop it reopening | not started |
