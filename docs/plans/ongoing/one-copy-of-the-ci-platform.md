@@ -15,8 +15,8 @@ pinned to the same commit. Nothing about one consumer belongs in the engine
 | Task | State |
 |---|---|
 | 1. ci-controller superset | done, #26 |
-| 2. github-actions-runner superset | not started |
-| 3. Publish images | PR open (`.github/workflows/images.yml`); a hard stop, so a human merges it. After the first publish, each GHCR package must be made public once by an org owner, or every consumer needs a pull credential |
+| 2. github-actions-runner superset | done, #27 |
+| 3. Publish images | done, #28. Each GHCR package must be made public once by an org owner after its first publish, or every consumer needs a pull credential |
 | 4. Roles run the published images, at parity | not started |
 | 5. Consumer cut-over | not started; needs each machine's owner to deploy |
 | 6. Stop it reopening | not started |
@@ -72,8 +72,11 @@ is `--check` first and is deployed only by that machine's owner.
    dashboard is not part of this platform.) **Verify:** the full suite, ruff, ruff format and mypy are green,
    and the only differences left against the consumer's copy are the extraction's
    edits.
-2. **Same for `github-actions-runner`.** Diff the 7 files, decide which side is
-   ahead, and make this tree the superset.
+2. **Same for `github-actions-runner`.** The consumer's copy was ahead: `gh` in
+   the image as part of a tested toolbox contract, the runner at 2.338.2 with its
+   ARG moved below the Android layers, and the App's Actions: write documented.
+   Its toolbox tests lived in the render test this repo dropped, so they come
+   across as `tests/test_image_contract.py`.
 3. **Publish images.** On every push to `main`, this repo's CI builds the
    dispatcher/scheduler image and the runner image and pushes them to GHCR,
    tagged with the full commit SHA. GitHub-hosted runners, as for the rest of this

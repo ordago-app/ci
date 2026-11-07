@@ -1,6 +1,5 @@
 FROM ubuntu:24.04
 
-ARG ACTIONS_RUNNER_VERSION=2.335.1
 ARG ANDROID_CMDLINE_TOOLS_VERSION=13114758
 ARG MAESTRO_VERSION=1.39.0
 
@@ -55,13 +54,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && corepack enable \
  && rm -rf /var/lib/apt/lists/*
 
-# ── Android SDK + maestro: skippable, because a light-only host cannot use them ──
-# WITH_ANDROID=0 drops ~10 GB from the image. It exists for lane hosts whose
-# `allowed_classes` is [light] (see personal/ci-controller.yml): they can never be
-# scheduled an emulator or android job, so the SDK is pure cost -- and downloading it
-# is the least reliable part of this build. sdkmanager blocks in a socket read with
-# no timeout, which wedged the powervaro-ci provision twice with no output at all.
-# Keep the default 1 so powerserver's image is unchanged.
+# ── Android SDK + maestro: skippable for a host that never schedules them ──
+# WITH_ANDROID=0 drops ~10 GB from the image, for a host whose `allowed_classes` holds
+# no class with needs_android_sdk -- downloading the SDK is the least reliable part of
+# this build (sdkmanager blocks in a socket read with no timeout). No homelab host builds
+# it now: powervaro-ci takes `emulator` and builds `latest` like powerserver. The guards
+# stay because rewriting these RUN lines would invalidate their cache and re-run the
+# ~10 GB SDK download on powerserver's next build, for no change in what it produces.
 ARG WITH_ANDROID=1
 
 RUN test "${WITH_ANDROID}" = "1" || exit 0; \
@@ -91,14 +90,40 @@ RUN test "${WITH_ANDROID}" = "1" || exit 0; \
  && rm /tmp/maestro.zip \
  && ln -sf /opt/maestro/bin/maestro /usr/local/bin/maestro
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libatomic1 \
+# `gh` rides along with this layer on purpose. `ubuntu-latest` preinstalls it;
+# this image did not, and a repo moving jobs onto these lanes has no way to find
+# that out except at run time, as exit 127. ordago-apps hit it on 2026-09-01: one
+# cost sweep moved four `gh`-calling jobs here, and the announce poller lost its
+# ability to switch itself OFF — so it burned a scheduled run every 30 minutes
+# until someone read the log. A sibling job broke the same way in silence, having
+# simply not run since.
+#
+# Placed HERE rather than above the Android SDK for the reason the next comment
+# gives: `services.yml` builds with `build: always`, so putting a ~10 MB apt
+# package above those layers would re-run the ~10 GB, hours-long, historically
+# hang-prone sdkmanager download on the next deploy to add it.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends libatomic1 gh \
  && rm -rf /var/lib/apt/lists/*
 
 # Runner download is kept LAST of the heavy layers, after the Android SDK and
-# maestro: it is the only consumer of ACTIONS_RUNNER_VERSION, so bumping the
-# runner version invalidates the build cache only from here down — the slow
-# (~hours) Android-SDK/maestro layers above stay cached.
+# maestro, so bumping the runner version invalidates the build cache only from
+# here down — the slow (~hours) Android-SDK/maestro layers above stay cached.
+#
+# ACTIONS_RUNNER_VERSION is DECLARED here rather than at the top of the file, and
+# that placement is load-bearing: ansible builds this image through
+# community.docker.docker_image, which drives the daemon's CLASSIC builder, and
+# there an ARG whose default changes invalidates every layer BELOW the ARG --
+# not just the ones referencing it. Declared at the top, a runner bump therefore
+# re-ran ~10 GB of sdkmanager (hours). Same rule as WITH_ANDROID and PNPM_VERSION
+# below: declare an ARG immediately above its consumer.
+ARG ACTIONS_RUNNER_VERSION=2.338.2
 RUN mkdir -p /opt/actions-runner \
  && curl -fsSL "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" \
       -o /tmp/actions-runner.tar.gz \
