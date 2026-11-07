@@ -11,6 +11,8 @@
 #                             as this user's uid, so the clones stay theirs.
 #   github_review_config    — path, on the Ansible controller, to this instance's
 #                             agent-review.yml (schema: README.md).
+#   ci_image_tag            — the full commit SHA this collection is pinned to. The
+#                             instance runs the images published at that commit.
 # A default for any of these would be one operator's machine wearing a neutral
 # name, inherited by every other operator without their noticing.
 
@@ -35,3 +37,6 @@ github_review_secret_files: {}
 # it in place and its refresh token is single-use, so overwriting a live login
 # with this (by then spent) copy would log the account out.
 github_review_codex_seeds: {}
+
+# Where this repository's images are published (.github/workflows/images.yml).
+ci_image_registry: ghcr.io/ordago-app

@@ -1,7 +1,7 @@
 ---
 # ── github-review: one reviewer instance on one Docker host ──
-# Everything the instance needs is built from this collection or given as a role
-# variable. Two instances on one host are two runs of this role with different
+# Everything the instance needs is an image this repository published at the pinned
+# commit, or a role variable. Two instances on one host are two runs of this role with different
 # github_review_instance and github_review_root.
 - name: This operator has said which instance, where, and with what config
   ansible.builtin.assert:
@@ -16,6 +16,15 @@
       github_review needs github_review_instance ([a-z0-9-]), github_review_root
       (an absolute path), github_review_owner and github_review_config, from the
       OPERATOR's inventory. This collection ships no instance of its own.
+
+- name: ci_image_tag pins a commit of this repository
+  ansible.builtin.assert:
+    that:
+      - ci_image_tag is defined
+      - ci_image_tag is match('^[0-9a-f]{40}$')
+    fail_msg: >-
+      ci_image_tag must be the full commit SHA this collection is pinned to. A branch,
+      a short SHA or `latest` would let the image move without the owner choosing it.
 
 - name: The config names the same instance as the inventory
   ansible.builtin.assert:
@@ -49,20 +58,13 @@
   loop_control:
     label: "{{ item.path or '.' }}"
 
-# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
-- name: github-review build context (service, sandbox images, compose file)
-  ansible.posix.synchronize:
-    src: "{{ role_path }}/../../services/github-review/"
-    dest: "{{ github_review_root }}/app/"
-    rsync_opts:
-      - "--exclude=tests"
-      - "--exclude=__pycache__"
-      - "--exclude=.venv"
-      - "--exclude=.pytest_cache"
-      - "--checksum"
-      - "--no-times"
-  become: true
-  become_user: "{{ github_review_owner }}"
+- name: The compose file is in place
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../services/github-review/compose.yml"
+    dest: "{{ github_review_root }}/app/compose.yml"
+    owner: "{{ github_review_owner }}"
+    group: "{{ github_review_owner }}"
+    mode: "0644"
 
 - name: This instance's config is in place
   ansible.builtin.copy:
@@ -87,6 +89,9 @@
       GITHUB_REVIEW_NETWORK={{ github_review_network }}
       GITHUB_REVIEW_RUN_AS_UID={{ ansible_facts.getent_passwd[github_review_owner][1] }}
       GITHUB_REVIEW_RUN_AS_GID={{ ansible_facts.getent_passwd[github_review_owner][2] }}
+      GITHUB_REVIEW_IMAGE={{ ci_image_registry }}/github-review:{{ ci_image_tag }}
+      CLAUDE_REVIEW_IMAGE={{ ci_image_registry }}/github-review-claude:{{ ci_image_tag }}
+      CODEX_REVIEW_IMAGE={{ ci_image_registry }}/github-review-codex:{{ ci_image_tag }}
 
 - name: Every env credential can be single-quoted in the env file
   ansible.builtin.assert:
@@ -154,23 +159,16 @@
     name: "{{ github_review_network }}"
     state: present
 
-# Spawned by the service rather than run by compose, so no `up` would build them.
-# force_source so a bumped CLI pin rebuilds; an unchanged Dockerfile is a cache
-# hit. Tagged per instance: two instances pinned to different SHAs of this repo
-# must not overwrite each other's sandbox.
-- name: The review sandbox images are built
+# Spawned by the service rather than run by compose, so no `up` would pull them.
+# One tag per commit, so two instances pinned to different commits never share one.
+- name: The review sandbox images are present
   community.docker.docker_image:
-    name: "ordago-ci/{{ item }}"
-    tag: "{{ github_review_instance }}"
-    source: build
-    force_source: true
+    name: "{{ ci_image_registry }}/{{ item }}:{{ ci_image_tag }}"
+    source: pull
     state: present
-    build:
-      path: "{{ github_review_root }}/app/{{ item }}"
-      pull: false
   loop:
-    - claude-review
-    - codex-review
+    - github-review-claude
+    - github-review-codex
 
 # Compose recreates the service for a changed image or env file, but not for a
 # changed agent-review.yml: it is a single-file bind mount, and copy replaces the
@@ -181,7 +179,8 @@
   community.docker.docker_compose_v2:
     project_src: "{{ github_review_root }}/app"
     state: present
-    build: always
+    build: never
+    pull: missing
     recreate: >-
       {{ 'always' if (github_review_config_file is changed
                       or github_review_env_file is changed

@@ -93,14 +93,17 @@ form the compose file uses.
 | `github_review_root` | yes | absolute host dir holding everything the instance owns |
 | `github_review_owner` | yes | host user owning it; git in the service runs as its uid |
 | `github_review_config` | yes | controller-side path to this instance's `agent-review.yml` |
+| `ci_image_tag` | yes | the full commit SHA you pinned this collection to; the instance runs that commit's images |
+| `ci_image_registry` | no | where those images live (default `ghcr.io/ordago-app`) |
 | `github_review_network` | no | Docker network `/status` and `/heads` are served on (default `github-review-<instance>`, created if absent) |
 | `github_review_secrets` | no | `{VAR: value}` for credentials the config names by `env:` (rendered 0600, never logged) |
 | `github_review_secret_files` | no | `{filename: content}` for credentials named by `file:`; seen at `/run/secrets/github-review/<filename>` |
 | `github_review_codex_seeds` | no | `{account: auth.json content}`: a codex account's first login, written only while it has none (below) |
 
-The role builds the service and both sandbox images (`claude-review/`,
-`codex-review/`) from this repo, tagged per instance, so an instance needs no
-image from anywhere else. Nothing is pulled from the operator's other services.
+The role pulls the service image and both sandbox images (`github-review`,
+`github-review-claude`, `github-review-codex`) that this repo published at the
+pinned commit, and builds nothing on the host. Nothing comes from the operator's
+other services.
 
 A **codex login** is the one credential the role never overwrites: the service
 refreshes it in place (its refresh token is single-use), so redeploying it would

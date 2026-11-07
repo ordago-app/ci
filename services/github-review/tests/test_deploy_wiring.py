@@ -55,6 +55,9 @@ def test_compose_names_no_operator_and_borrows_no_image() -> None:
         "GITHUB_REVIEW_NETWORK",
         "GITHUB_REVIEW_RUN_AS_UID",
         "GITHUB_REVIEW_RUN_AS_GID",
+        "GITHUB_REVIEW_IMAGE",
+        "CLAUDE_REVIEW_IMAGE",
+        "CODEX_REVIEW_IMAGE",
     }
     # `:?` on every one: unset stops compose with the name, never a default.
     assert set(re.findall(r"\$\{(\w+)\}|\$\{(\w+):[-=]", text)) == set()
@@ -75,10 +78,15 @@ def test_secrets_reach_the_service_without_landing_in_compose() -> None:
     assert not any("KEY" in e or "TOKEN" in e for e in svc["environment"])
 
 
-def test_the_sandbox_images_are_this_instances_own() -> None:
-    env = dict(e.split("=", 1) for e in _service()["environment"])
-    assert env["CLAUDE_REVIEW_IMAGE"] == "ordago-ci/claude-review:${GITHUB_REVIEW_INSTANCE:?}"
-    assert env["CODEX_REVIEW_IMAGE"] == "ordago-ci/codex-review:${GITHUB_REVIEW_INSTANCE:?}"
+def test_every_image_is_the_one_the_role_pinned() -> None:
+    """The service and both sandboxes run the images published at the pinned commit;
+    an unset one stops compose with its name instead of running something else."""
+    svc = _service()
+    assert svc["image"] == "${GITHUB_REVIEW_IMAGE:?}"
+    assert "build" not in svc
+    env = dict(e.split("=", 1) for e in svc["environment"])
+    assert env["CLAUDE_REVIEW_IMAGE"] == "${CLAUDE_REVIEW_IMAGE:?}"
+    assert env["CODEX_REVIEW_IMAGE"] == "${CODEX_REVIEW_IMAGE:?}"
 
 
 def test_the_build_context_keeps_config_and_secrets_out_of_the_image() -> None:
