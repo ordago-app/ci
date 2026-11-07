@@ -161,9 +161,9 @@ trap cleanup EXIT INT TERM
 mkdir -p "${RUNNER_WORKDIR}"
 
 if [ "${SKIP_ANDROID_SDK:-0}" != "1" ] && [ ! -x "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" ]; then
-  # Images built with WITH_ANDROID=0 carry no seed (lane hosts allow only `light`,
-  # which sets SKIP_ANDROID_SDK=1 and never gets here). If an SDK-needing job ever
-  # does land on one, say so plainly -- the bare `cp` failure reads as a corrupt
+  # Images built with WITH_ANDROID=0 carry no seed, and a host running one must not
+  # allow a class with needs_android_sdk (the consumer's pool-config tests). If such a job
+  # ever does land on one, say so plainly -- the bare `cp` failure reads as a corrupt
   # image rather than a job scheduled onto the wrong host.
   # Overridable only so the tests can exercise both branches for real; the image
   # always bakes the seed at the default path.
