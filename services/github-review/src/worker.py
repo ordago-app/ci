@@ -424,8 +424,14 @@ class ReviewWorker:
         worktree = None
         try:
             repo_policy = next(
-                repo for repo in self._config.enabled_repos() if repo.project == job.project
+                (repo for repo in self._config.enabled_repos() if repo.project == job.project),
+                None,
             )
+            if repo_policy is None:
+                # Queued before its repo was removed or handed to another reviewer:
+                # retrying it would only end in a "failed" comment on someone else's PR.
+                self._store.mark_skipped(job.id, "repo no longer configured in this reviewer")
+                return
             pr = self._github.get_pull_request(job.repo, job.pr_number)
             if pr.state != "open":
                 self._store.mark_skipped(job.id, f"PR {pr.state}")
