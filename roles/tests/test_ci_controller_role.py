@@ -183,3 +183,53 @@ def test_the_compose_probe_can_see_a_dead_namespace() -> None:
     assert "/healthz" not in probe
     assert hc.get("retries", 0) >= 2
     assert "start_period" in hc
+
+
+def test_the_stack_runs_the_published_image_of_the_pinned_commit() -> None:
+    """Nothing is built on the host and no source is copied to it, so the host holds
+    no copy of the code that could drift from the pinned commit."""
+    tasks = _tasks()
+    assert not any(t.get("ansible.posix.synchronize") for t in tasks)
+    images = [
+        t["community.docker.docker_image"] for t in tasks if t.get("community.docker.docker_image")
+    ]
+    assert images and all(img.get("source") == "pull" for img in images)
+
+    (up,) = [
+        t["community.docker.docker_compose_v2"]
+        for t in tasks
+        if t.get("community.docker.docker_compose_v2")
+    ]
+    assert up["build"] == "never"
+
+    (env,) = [
+        t["ansible.builtin.copy"]
+        for t in tasks
+        if str((t.get("ansible.builtin.copy") or {}).get("dest", "")).endswith("ci-controller/.env")
+    ]
+    assert env["content"].strip() == (
+        "CI_CONTROLLER_IMAGE={{ ci_image_registry }}/ci-controller:{{ ci_image_tag }}"
+    )
+
+    compose = yaml.safe_load((REPO / "services" / "ci-controller" / "compose.yml").read_text())
+    for name in ("ci-controller", "ci-scheduler"):
+        service = compose["services"][name]
+        assert "build" not in service, f"{name} must not build on the host"
+        assert service["image"].startswith("${CI_CONTROLLER_IMAGE:?"), (
+            f"{name} must run the image the role pinned, and fail loudly without it"
+        )
+
+
+def test_the_pin_and_every_runner_image_are_checked_before_anything_runs() -> None:
+    """A pool config naming another commit's runner would spawn lanes this pin never
+    chose; a tag that is not a full SHA would let every image move on its own."""
+    tasks = _tasks()
+    names = [t.get("name", "") for t in tasks]
+    tag = names.index("ci_image_tag pins a commit of this repository")
+    runner = names.index("Every runner_image in the pool config is this commit's")
+    first_change = next(i for i, t in enumerate(tasks) if t.get("ansible.builtin.file"))
+    assert tag < first_change and runner < first_change
+
+    assert "^[0-9a-f]{40}$" in " ".join(tasks[tag]["ansible.builtin.assert"]["that"])
+    condition = " ".join(tasks[runner]["ansible.builtin.assert"]["that"])
+    assert "_runner ~ '-light'" in condition

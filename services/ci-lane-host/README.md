@@ -40,7 +40,8 @@ Two steps, both operator-run — see the "Second CI lane host" section of
 
 The proxy denies `IMAGES` and `BUILD`, so the controller can only **run** an
 image that is already present on this host — it can never pull or build one.
-The playbook builds `homelab/github-actions-runner:light` locally for exactly
+The `ordago.ci.ci_lane_host` role pulls the runner image this repository
+published at the consumer's pinned commit (`ci_lane_runner_image`) for exactly
 that reason.
 
 If it is missing, every admission to this host fails with a 404 from the docker

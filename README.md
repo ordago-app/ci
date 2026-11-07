@@ -14,17 +14,34 @@ Start at [`AGENTS.md`](AGENTS.md), then
 Consumers pin this repo **by commit SHA**. That pin is what keeps deployment
 authority with each machine's owner.
 
+This repo is the engine; a consumer is any place that runs it: a homelab, a VPS,
+a cloud VM. A consumer holds only its configuration (machines, repos, classes,
+secrets) and the commit it runs. Every merge to `main` publishes the platform's
+images to `ghcr.io/ordago-app/<image>:<commit sha>`
+([`.github/workflows/images.yml`](.github/workflows/images.yml)), and the roles
+run those images. Nothing is built on a host, so no host holds a copy of the code.
+
 ## Using the roles
 
 This collection ships three roles. Every play using any of them must set
 `become: true` — the source plays had it, the roles assume it, and `become`
 cannot be asserted from inside a role.
 
+`ci_controller` and `ci_lane_host` both take:
+  - `ci_image_tag` — required: the full commit SHA you pinned this collection to.
+    The roles run the images published at that commit, so the code that deploys
+    and the code that runs are one commit. Never a branch or `latest`.
+  - `ci_image_registry` — where those images live; defaults to
+    `ghcr.io/ordago-app`.
+
 - **`ordago.ci.ci_controller`** — the dispatcher (controller, scheduler,
   fabric sidecar). Requires:
   - `services_root`, `personal_root`, `operator_user` — from your inventory.
   - `ci_controller_pool_config` — path to your own `ci-controller.yml`. No
-    default; this collection ships no pool config for you.
+    default; this collection ships no pool config for you. Every `runner_image`
+    in it must be `<ci_image_registry>/ci-runner:<ci_image_tag>`, optionally
+    with `-light`: the role refuses a pool config that would spawn lanes from
+    another commit's image.
   - `ci_controller_repos_config` — path to your own `repos.yml`. Not placed
     by this role (it's rendered outside the ported range); it must already
     exist on the target host before the role runs. Defaults to
@@ -53,11 +70,12 @@ cannot be asserted from inside a role.
   - `services_root`, `operator_user`.
   - `ci_lane_work_dir`, `ci_lane_pnpm_store` — defaulted, but must match the
     matching host entry in the dispatcher's pool config.
-  - `ci_lane_runner_image_tag`, `ci_lane_runner_with_android` — defaulted to
-    `light` / `false` (no Android SDK, ~10 GB smaller). Set both or neither:
-    the role refuses a `light` image carrying the SDK, or a `latest` lacking
-    it, because consumers read the tag to decide which job classes a host may
-    run. `runner_image` in your pool config must name the tag you set here.
+  - `ci_lane_runner_with_android` — defaulted to `false`: the host pulls
+    `ci-runner:<ci_image_tag>-light`, ~10 GB smaller and without the Android
+    SDK, so it must allow no class with `needs_android_sdk`. `true` pulls the
+    full image.
+  - `ci_lane_runner_image` — derived from the above; read it, do not set it.
+    `runner_image` for this host in your pool config must equal it.
 
   There is **no `ci_lane_allowed_dispatchers`** and no host firewall. Who may
   reach a lane host's port 2375 is decided by the CI fabric's tailnet ACL,

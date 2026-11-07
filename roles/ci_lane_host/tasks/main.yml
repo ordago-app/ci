@@ -64,64 +64,24 @@
     mode: "0755"
 
 # ── The runner image, which the controller can never install itself ──
-# The socket proxy denies IMAGES and BUILD, so the controller can only `run`
-# an image already present here. Build it locally or every admission to this
-# host 404s — see services/ci-lane-host/README.md.
-# Installed collections rewrite every file's mtime, so rsync's default size+mtime
-# comparison reports changed on every deploy. Content comparison alone (checksum
-# flag) detects genuine changes; preventing mtime-only syncs (no-times flag) keeps
-# both required. Measured: with mtime ".f..t...", without mtime "(nothing changed)".
-# Same reason on the other three `synchronize` tasks in this collection.
-- name: github-actions-runner build context synced (Dockerfile + entrypoint.sh)
-  ansible.posix.synchronize:
-    src: "{{ role_path }}/../../services/github-actions-runner/"
-    dest: "{{ services_root }}/github-actions-runner/"
-    rsync_opts:
-      - "--exclude=compose.yml.j2"
-      - "--exclude=tests"
-      - "--exclude=README.md"
-      - "--exclude=__pycache__"
-      - "--exclude=.pytest_cache"
-      - "--checksum"
-      - "--no-times"
-  become: true
-  become_user: "{{ operator_user }}"
-
-# The image every lane on this host runs. Which image that is -- and whether it
-# carries the Android SDK -- is the consumer's call, supplied through
-# ci_lane_runner_image_tag and ci_lane_runner_with_android; see defaults/main.yml
-# for the default pairing and why it is a variable rather than a literal.
-#
-# Whatever the consumer picks, its own pool config must name the same tag as this
-# host's runner image, and must not admit a job class needing a tool the image
-# lacks. Neither fact is visible from here, so neither is checked here.
-- name: lane runner image tag and Android SDK choice agree
-  # A consumer reads the TAG to decide which job classes this host may be
-  # scheduled -- `light` means "no Android SDK, so never an emulator lane". That
-  # inference is only sound if the two cannot contradict each other here. An
-  # image tagged `light` that carried the SDK, or a `latest` that lacked it,
-  # would make every consumer's scheduling check wrong while still passing.
-  # Any other tag name is free: the consumer simply cannot infer from it.
+# The socket proxy denies IMAGES and BUILD, so the controller can only `run` an
+# image already present here. Pull it, or every admission to this host 404s --
+# see services/ci-lane-host/README.md. The image is the one this repository
+# published at the consumer's pinned commit; nothing is built on the host.
+- name: ci_image_tag pins a commit of this repository
   ansible.builtin.assert:
     that:
-      - not (ci_lane_runner_image_tag == 'light' and ci_lane_runner_with_android)
-      - not (ci_lane_runner_image_tag == 'latest' and not ci_lane_runner_with_android)
+      - ci_image_tag is defined
+      - ci_image_tag is match('^[0-9a-f]{40}$')
     fail_msg: >-
-      ci_lane_runner_image_tag={{ ci_lane_runner_image_tag }} contradicts
-      ci_lane_runner_with_android={{ ci_lane_runner_with_android }}. `light` means
-      no Android SDK and `latest` means it is present; consumers schedule on that.
+      ci_image_tag must be the full commit SHA this collection is pinned to. A branch,
+      a short SHA or `latest` would let the image move without the owner choosing it.
 
-- name: github-actions-runner lane image built locally
+- name: The lane runner image is present
   community.docker.docker_image:
-    name: homelab/github-actions-runner
-    tag: "{{ ci_lane_runner_image_tag }}"
-    source: build
-    force_source: true
-    build:
-      path: "{{ services_root }}/github-actions-runner"
-      pull: true
-      args:
-        WITH_ANDROID: "{{ '1' if ci_lane_runner_with_android else '0' }}"
+    name: "{{ ci_lane_runner_image }}"
+    source: pull
+    state: present
 
 # ── The scoped socket proxy ──
 # No bind address is computed any more. The proxy shares the fabric sidecar's

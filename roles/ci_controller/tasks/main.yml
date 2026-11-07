@@ -24,6 +24,35 @@
       deliberately ships neither one operator's pool config nor one operator's mount
       points — set all four in your own inventory.
 
+- name: ci_image_tag pins a commit of this repository
+  ansible.builtin.assert:
+    that:
+      - ci_image_tag is defined
+      - ci_image_tag is match('^[0-9a-f]{40}$')
+    fail_msg: >-
+      ci_image_tag must be the full commit SHA this collection is pinned to. A branch,
+      a short SHA or `latest` would let the image move without the owner choosing it.
+
+# The dispatcher spawns lanes from whatever runner_image the pool config names. One
+# naming another commit's image would run a runner this pin never chose, so every
+# runner_image must be this commit's, full or -light. Read on the controller node:
+# the pool config is the consumer's file, not the host's.
+- name: Every runner_image in the pool config is this commit's
+  vars:
+    _pool: "{{ lookup('ansible.builtin.file', ci_controller_pool_config) | from_yaml }}"
+    _runner: "{{ ci_image_registry }}/ci-runner:{{ ci_image_tag }}"
+    _named: >-
+      {{ [_pool.runner_image]
+         + ((_pool.hosts | default({})).values() | selectattr('runner_image', 'defined')
+            | map(attribute='runner_image') | list) }}
+  ansible.builtin.assert:
+    that:
+      - item in [_runner, _runner ~ '-light']
+    fail_msg: >-
+      runner_image {{ item }} in {{ ci_controller_pool_config }} is not this commit's
+      runner ({{ _runner }} or {{ _runner }}-light).
+  loop: "{{ _named }}"
+
 - name: repos.yml is already in place for this stack to mount
   # repos.yml is placed OUTSIDE the ported range in the source playbook (a
   # generic loop that renders every operator's repo map, not part of this
@@ -106,26 +135,23 @@
     dest: "{{ services_root }}/ci-controller/compose.yml"
     mode: "0644"
 
-# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
-- name: ci-controller build context (Dockerfile + src/ + pyproject.toml + uv.lock)
-  ansible.posix.synchronize:
-    src: "{{ role_path }}/../../services/ci-controller/"
-    dest: "{{ services_root }}/ci-controller/"
-    rsync_opts:
-      - "--exclude=tests"
-      - "--exclude=__pycache__"
-      - "--exclude=.venv"
-      - "--exclude=.pytest_cache"
-      - "--checksum"
-      - "--no-times"
-  become: true
-  become_user: "{{ operator_user }}"
+# compose.yml names its image through this variable, so the stack runs the image
+# published at the pinned commit and nothing is built on the host.
+- name: ci-controller image pinned for compose
+  ansible.builtin.copy:
+    dest: "{{ services_root }}/ci-controller/.env"
+    content: |
+      CI_CONTROLLER_IMAGE={{ ci_image_registry }}/ci-controller:{{ ci_image_tag }}
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0644"
 
 - name: ci-controller stack up
   community.docker.docker_compose_v2:
     project_src: "{{ services_root }}/ci-controller"
     state: present
-    build: always
+    build: never
+    pull: missing
 
 # A healthcheck alone is a control that cannot fire: compose marks a container
 # unhealthy and does nothing about it. ci-controller shares ci-fabric's network
@@ -247,36 +273,13 @@
     state: started
   become: true
 
-# The controller spawns ephemeral lanes from homelab/github-actions-runner:latest,
-# so it OWNS that image's existence — decoupled from the static runner pool. Once
-# the homelab pool is retired, the pool's compose has no services and can no longer
-# build the image; these two tasks keep a build path that needs no static runner.
-# Content comparison + skip mtime-only updates: see ci_lane_host role for details.
-- name: ci-controller runner image build context synced (Dockerfile + entrypoint.sh)
-  ansible.posix.synchronize:
-    src: "{{ role_path }}/../../services/github-actions-runner/"
-    dest: "{{ services_root }}/ci-controller/runner-image/"
-    rsync_opts:
-      - "--exclude=compose.yml.j2"
-      - "--exclude=tests"
-      - "--exclude=README.md"
-      - "--exclude=__pycache__"
-      - "--exclude=.pytest_cache"
-      - "--checksum"
-      - "--no-times"
-  become: true
-  become_user: "{{ operator_user }}"
-
-# Builds only if the image is ABSENT (force_source false) so routine deploys are
-# a no-op. To rebuild after a Dockerfile/entrypoint change (the ~hours Android-SDK
-# build), pass -e ci_controller_rebuild_runner_image=true.
-- name: ci-controller ensures runner image exists (build if absent)
+# The controller spawns its local lanes from the pool config's runner_image, and the
+# socket proxy cannot pull, so the image must already be here. Checked above to be
+# this commit's.
+- name: The local lane runner image is present
+  vars:
+    _pool: "{{ lookup('ansible.builtin.file', ci_controller_pool_config) | from_yaml }}"
   community.docker.docker_image:
-    name: homelab/github-actions-runner
-    tag: latest
-    source: build
-    force_source: "{{ ci_controller_rebuild_runner_image | default(false) | bool }}"
+    name: "{{ _pool.runner_image }}"
+    source: pull
     state: present
-    build:
-      path: "{{ services_root }}/ci-controller/runner-image"
-      pull: false

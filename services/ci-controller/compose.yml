@@ -51,8 +51,8 @@ services:
       - ci-internal
 
   ci-controller:
-    image: homelab/ci-controller:latest
-    build: .
+    # Published by .github/workflows/images.yml; the role pins the commit in .env.
+    image: ${CI_CONTROLLER_IMAGE:?set by roles/ci_controller from ci_image_tag}
     container_name: ci-controller
     restart: unless-stopped
     init: true
@@ -209,8 +209,8 @@ services:
       ci-internal:
 
   ci-scheduler:
-    image: homelab/ci-controller:latest
-    build: .
+    # Published by .github/workflows/images.yml; the role pins the commit in .env.
+    image: ${CI_CONTROLLER_IMAGE:?set by roles/ci_controller from ci_image_tag}
     container_name: ci-scheduler
     restart: unless-stopped
     init: true
