@@ -18,7 +18,7 @@ pinned to the same commit. Nothing about one consumer belongs in the engine
 | 2. github-actions-runner superset | done, #27 |
 | 3. Publish images | done, #28. Each GHCR package must be made public once by an org owner after its first publish, or every consumer needs a pull credential |
 | 4. Roles run the published images, at parity | done, #29 and #30 |
-| 5. Consumer cut-over | Órdago's reviewer (`ops`) runs the published images at 8c3155a since 2026-11-08 (ops#7). homelab: in progress (ci-controller and runner first, then its personal reviewer) |
+| 5. Consumer cut-over | Órdago's reviewer (`ops`) runs the published images at 8c3155a since 2026-11-08 (ops#7). homelab: ci-controller and runner deployed from the role at 15677b4 on 2026-11-08 (homelab#373); its personal reviewer next |
 | 6. Stop it reopening | not started |
 
 ## Why there are two copies today
@@ -121,3 +121,9 @@ for `requireApprovingReview: false` holds again.
 
 - Whether the second operator already deploys every tree from the roles. Confirm
   before task 4, so there is one consumer to migrate rather than two.
+- **Lesson from homelab's cut-over (2026-11-08):** pull the runner image on *every* pool
+  host before deploying a new controller. The controller switched `runner_image` at once,
+  and the lane host that did not have it yet refused every spawn (its socket proxy forbids
+  `images/create`) until its 16 GB pull finished. ci#34 fixes the order on the controller
+  host only; a lane host's image arrives with its own `ci_lane_host` deploy, so deploy the
+  lane hosts first.
