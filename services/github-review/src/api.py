@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -77,21 +77,31 @@ def _head_state(job: ReviewJob, worker: ReviewWorker) -> str:
 # zero on its own once you have dealt with it — or once it has stopped mattering.
 STUCK_WINDOW_SECONDS = 7 * 24 * 3600
 
+# The poll loop counts as hung after this many intervals with no finished tick.
+# A tick only polls GitHub and queues heads, so it is short; several intervals of
+# silence means the loop itself is stuck, while the HTTP side still answers.
+POLL_STALE_INTERVALS = 5
+
 
 def create_app(
     worker: ReviewWorker,
     poll_interval: int = 0,
     stuck_window_seconds: float = STUCK_WINDOW_SECONDS,
+    clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     # Set by every enqueue, so a requested review starts now rather than on the
     # next scheduled tick. A set that lands mid-tick is not lost: the wait after
     # that tick returns at once.
     wake = asyncio.Event()
+    # When the last tick finished, failed ticks included: a tick that raised
+    # still proves the loop is alive. Seeded with startup for its grace period.
+    last_tick_done = [clock()]
 
     async def _poll_loop() -> None:
         _log.info("poll loop started (interval=%ss)", poll_interval)
         while True:
             await _safe_tick(worker)
+            last_tick_done[0] = clock()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(wake.wait(), timeout=poll_interval)
             wake.clear()
@@ -114,6 +124,12 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
+        if poll_interval > 0:
+            silent_for = clock() - last_tick_done[0]
+            if silent_for > POLL_STALE_INTERVALS * poll_interval:
+                raise HTTPException(
+                    status_code=503, detail=f"poll loop silent for {int(silent_for)}s"
+                )
         return {"status": "ok"}
 
     @app.get("/status")

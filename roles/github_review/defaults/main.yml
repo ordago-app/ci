@@ -21,6 +21,22 @@
 # join it.
 github_review_network: "github-review-{{ github_review_instance }}"
 
+# Where jobs.db and the codex logins live (mounted at /var/lib/github-review), and
+# where the clones are (mounted at this same path). Inside github_review_root, as by
+# default, the role creates each and sets its owner and mode. A path outside it is
+# one something else uses too, such as a reviewer's existing state or clones shared
+# with other agents, so the role only checks that it exists and never changes its
+# owner or mode.
+github_review_state_dir: "{{ github_review_root }}/state"
+github_review_projects_dir: "{{ github_review_root }}/projects"
+
+# Codex logins kept outside the state dir, as {account: host dir holding its
+# auth.json}. Each dir is mounted read-write at /var/lib/github-review/codex/<account>,
+# where the README tells the account's `credential.file` to point, and keeps its
+# owner and mode. For a login other processes on the host also read: the service
+# stays its only refresher (README). An account here takes no seed.
+github_review_codex_login_dirs: {}
+
 # Credentials the config names by `env:`, as {VARIABLE: value}. Rendered into a
 # 0600 file the service loads; pass them from your own secret store, never
 # inline. Names only are in README.md.

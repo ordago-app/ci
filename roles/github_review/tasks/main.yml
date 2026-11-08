@@ -50,13 +50,46 @@
   loop:
     - { path: "", owner: "{{ github_review_owner }}", mode: "0750" }
     - { path: app, owner: "{{ github_review_owner }}", mode: "0750" }
-    # jobs.db and each codex login. The service runs as root.
-    - { path: state, owner: root, mode: "0700" }
-    # Clones and review worktrees, mounted at this same path inside the service.
-    - { path: projects, owner: "{{ github_review_owner }}", mode: "0750" }
     - { path: secrets, owner: root, mode: "0700" }
   loop_control:
     label: "{{ item.path or '.' }}"
+
+- name: State and clones dirs inside the instance root exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode }}"
+  loop:
+    # jobs.db and each codex login. The service runs as root.
+    - { path: "{{ github_review_state_dir }}", owner: root, mode: "0700" }
+    # Clones and review worktrees, mounted at this same path inside the service.
+    - { path: "{{ github_review_projects_dir }}", owner: "{{ github_review_owner }}", mode: "0750" }
+  loop_control:
+    label: "{{ item.path }}"
+  when: item.path.startswith(github_review_root ~ '/')
+
+- name: State and clones dirs outside the instance root are looked up
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ github_review_state_dir }}"
+    - "{{ github_review_projects_dir }}"
+  when: not item.startswith(github_review_root ~ '/')
+  register: github_review_outside_dirs
+
+- name: A state or clones dir outside the instance root already exists
+  ansible.builtin.assert:
+    that:
+      - item.item is match('^/')
+      - item.stat.isdir | default(false)
+    fail_msg: >-
+      {{ item.item }} is outside github_review_root, so the role does not create
+      it or change its owner: it must be an existing absolute directory.
+  loop: "{{ github_review_outside_dirs.results | rejectattr('skipped', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
 
 - name: The compose file is in place
   ansible.builtin.copy:
@@ -83,8 +116,8 @@
     mode: "0640"
     content: |
       GITHUB_REVIEW_INSTANCE={{ github_review_instance }}
-      GITHUB_REVIEW_PROJECTS_DIR={{ github_review_root }}/projects
-      GITHUB_REVIEW_STATE_DIR={{ github_review_root }}/state
+      GITHUB_REVIEW_PROJECTS_DIR={{ github_review_projects_dir }}
+      GITHUB_REVIEW_STATE_DIR={{ github_review_state_dir }}
       GITHUB_REVIEW_SECRETS_DIR={{ github_review_root }}/secrets
       GITHUB_REVIEW_NETWORK={{ github_review_network }}
       GITHUB_REVIEW_RUN_AS_UID={{ ansible_facts.getent_passwd[github_review_owner][1] }}
@@ -134,7 +167,7 @@
 
 - name: Each seeded codex account has a login dir
   ansible.builtin.file:
-    path: "{{ github_review_root }}/state/codex/{{ item }}"
+    path: "{{ github_review_state_dir }}/codex/{{ item }}"
     state: directory
     owner: root
     group: root
@@ -143,7 +176,7 @@
 
 - name: A codex account with no login yet gets its seed, and a live one is left alone
   ansible.builtin.copy:
-    dest: "{{ github_review_root }}/state/codex/{{ item.key }}/auth.json"
+    dest: "{{ github_review_state_dir }}/codex/{{ item.key }}/auth.json"
     content: "{{ item.value }}"
     owner: root
     group: root
@@ -153,6 +186,54 @@
   loop_control:
     label: "{{ item.key }}"
   no_log: true
+
+- name: Codex login dirs outside the state dir are looked up
+  ansible.builtin.stat:
+    path: "{{ item.value }}"
+  loop: "{{ github_review_codex_login_dirs | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: github_review_codex_login_stats
+
+- name: Each codex login dir is an existing absolute dir, for an unseeded account
+  ansible.builtin.assert:
+    that:
+      - item.item.key is match('^[a-z0-9][a-z0-9-]{0,39}$')
+      - item.item.value is match('^/')
+      - item.stat.isdir | default(false)
+      - item.item.key not in github_review_codex_seeds
+    fail_msg: >-
+      github_review_codex_login_dirs.{{ item.item.key }} must be an account name
+      mapped to an existing absolute directory, and that account must have no
+      github_review_codex_seeds entry: a seed would land under the mount, unseen.
+      A missing dir would be created by docker, empty and root-owned.
+  loop: "{{ github_review_codex_login_stats.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+# Compose reads compose.override.yml beside compose.yml on its own, so the mounts
+# apply to `docker compose` run by hand in the app dir as well.
+- name: Codex login dirs are mounted where the service looks for each account's login
+  ansible.builtin.copy:
+    dest: "{{ github_review_root }}/app/compose.override.yml"
+    owner: "{{ github_review_owner }}"
+    group: "{{ github_review_owner }}"
+    mode: "0644"
+    content: |
+      # Rendered by roles/github_review from github_review_codex_login_dirs.
+      services:
+        github-review:
+          volumes:
+      {% for account, dir in github_review_codex_login_dirs | dictsort %}
+            - "{{ dir }}:/var/lib/github-review/codex/{{ account }}:rw"
+      {% endfor %}
+  when: github_review_codex_login_dirs | length > 0
+
+- name: No codex login dir, no compose override
+  ansible.builtin.file:
+    path: "{{ github_review_root }}/app/compose.override.yml"
+    state: absent
+  when: github_review_codex_login_dirs | length == 0
 
 - name: The network /status and /heads are served on exists
   community.docker.docker_network:

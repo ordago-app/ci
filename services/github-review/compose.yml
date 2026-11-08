@@ -15,6 +15,14 @@ services:
     # git, whose transient helper processes get reparented to PID 1; without an
     # init they linger as zombies.
     init: true
+    # /healthz fails once the poll loop has finished no tick for five intervals,
+    # so a hung loop shows as unhealthy while the HTTP side would still answer.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
     environment:
       - AGENT_REVIEW_CONFIG=/etc/github-review/agent-review.yml
       - STATE_DIR=/var/lib/github-review

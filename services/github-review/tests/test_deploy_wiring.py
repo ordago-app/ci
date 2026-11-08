@@ -41,6 +41,17 @@ def test_compose_runs_an_init_to_reap_zombies() -> None:
     assert _service().get("init") is True
 
 
+def test_compose_marks_a_hung_poll_loop_unhealthy() -> None:
+    """/healthz answers 503 once the poll loop has finished no tick for five
+    intervals (src/api.py); the healthcheck is what turns that into a container
+    state an operator's monitoring can read. It probes from inside the container,
+    so it needs no network of its own."""
+    check = _service()["healthcheck"]
+    assert "http://127.0.0.1:8000/healthz" in " ".join(check["test"])
+    # The first tick clones every repo, so startup gets its own grace.
+    assert check["start_period"] and check["retries"] >= 1
+
+
 def test_compose_names_no_operator_and_borrows_no_image() -> None:
     """Portability: everything host- or instance-specific is a required variable."""
     text = (SERVICE_ROOT / "compose.yml").read_text()
