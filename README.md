@@ -89,6 +89,15 @@ cannot be asserted from inside a role.
   sidecar's network namespace, so lane-host traffic never traverses the host's
   FORWARD chain). If you add a machine, the ACL is what you edit.
 
+**Bumping the pin: lane hosts first, then the controller.** A new `ci_image_tag`
+moves `runner_image` for every host at once, and a lane host's socket proxy
+forbids `images/create`, so the controller cannot pull the new runner image there:
+every spawn on a lane host that lacks it is refused until it arrives. The
+`ci_lane_host` deploy is what pulls it (16 GB for the full image). The
+`ci_controller` role pulls its own host's runner image before it starts the
+dispatcher, so the controller host needs no extra step. Learned in homelab's
+cut-over on 2026-11-08.
+
 ## GitHub review instances
 
 `services/github-review` polls the PRs of the repos it is given and posts one

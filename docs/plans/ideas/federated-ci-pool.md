@@ -281,7 +281,7 @@ Staged, so nothing is rebuilt before it is needed. Each stage leaves a working s
 |---|---|---|
 | 0 | *(done)* Convert `alvaro-francisco-gil/ordago-apps` to a real GitHub org; add cofounder | equal footing is possible at all |
 | 1 | *(done, homelab#175)* Split the controller **inside homelab**: extract the scheduler; today's controller becomes the personal dispatcher | two components, one org, no behaviour change |
-| 2 | Create `ordago-app/ci`; move `ci-controller`, `github-actions-runner`, `ci-lane-host`, `github-review` and the plays they need; homelab consumes them as a pinned ansible collection. Done for `ci-lane-host`; the rest is [`../ongoing/one-copy-of-the-ci-platform.md`](../ongoing/one-copy-of-the-ci-platform.md) | shared code, unchanged behaviour |
+| 2 | *(done 2026-11-08: ci#26–#36, homelab#373 and #375, ops#7)* Create `ordago-app/ci`; move `ci-controller`, `github-actions-runner`, `ci-lane-host`, `github-review` and the plays they need; homelab consumes them as a pinned ansible collection | shared code, unchanged behaviour |
 | 3 | Stand up sidecars and the tagged ACL generated from `allowed_orgs`, on the fabric tailnet *(created 2026-08-25)* | dispatcher↔host traffic on the fabric |
 | 3a | *(done, homelab#177)* lane-host allowlist reads `ci_lane_allowed_dispatchers` from config instead of naming one host | a lane host can admit more than one dispatcher |
 | 4 | Cofounder's VPS joins as a lane host (`allowed_orgs: [ordago]`); Ordago dispatcher deployed in Ordago's trust domain | pooling live |
@@ -293,12 +293,15 @@ reader to trip over.** Stage 2 also required (a) neutralising five source defaul
 named one operator's machine, and (b) building an ansible collection seam that had no prior
 art in the repo — `ansible/roles/` was empty and every play was flat. Stage 3 likewise
 turned out to need a measured userspace-vs-tun distinction the design had assumed away.
-Read [`../ongoing/one-copy-of-the-ci-platform.md`](../ongoing/one-copy-of-the-ci-platform.md)
-before treating any remaining stage as "just a move".
+The `one-copy-of-the-ci-platform` plan that finished stage 2 (retired 2026-11-08; read it
+in `git log --all -- docs/plans/ongoing/one-copy-of-the-ci-platform.md`) is the record
+of what a "just a move" stage really cost.
 
 **Stage 2 left two copies of the platform** (found 2026-09-28 for `github-review`, 2026-11-07
 for the rest): the consumer kept deploying its own trees and development kept landing
-there. Ending that is [`../ongoing/one-copy-of-the-ci-platform.md`](../ongoing/one-copy-of-the-ci-platform.md).
+there. That ended on 2026-11-08: every consumer deploys from the roles at a pinned SHA,
+the published images are the only build, and homelab has a test that fails if any of the
+four trees comes back.
 
 **Why the refactor comes before the extraction** (reordered 2026-08-22, after reading the
 code): `Controller.reconcile()` simultaneously reads GitHub, mutates the ledger and reaps
