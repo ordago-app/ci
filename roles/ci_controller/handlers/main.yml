@@ -1,0 +1,9 @@
+---
+# Safe to bounce mid-flight: the scheduler's ledger is in memory, and reconcile()
+# re-adopts every running lane it does not know about, taking each lane's class from
+# its own docker label (ADR 0020).
+- name: restart ci-controller
+  community.docker.docker_compose_v2:
+    project_src: "{{ services_root }}/ci-controller"
+    services: [ci-controller, ci-scheduler]
+    state: restarted

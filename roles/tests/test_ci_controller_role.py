@@ -233,3 +233,17 @@ def test_the_pin_and_every_runner_image_are_checked_before_anything_runs() -> No
     assert "^[0-9a-f]{40}$" in " ".join(tasks[tag]["ansible.builtin.assert"]["that"])
     condition = " ".join(tasks[runner]["ansible.builtin.assert"]["that"])
     assert "_runner ~ '-light'" in condition
+
+
+def test_a_changed_pool_config_restarts_both_processes() -> None:
+    """The dispatcher and the scheduler read ci-controller.yml once, at startup, from a
+    read-only bind mount, and `state: present` does not recreate a container for a
+    changed mounted file. Without a restart a config-only deploy reports `changed`
+    and the pool keeps admitting against the old budgets and classes."""
+    place = next(t for t in _tasks() if t.get("name") == "place ci-controller.yml on host")
+    handlers = yaml.safe_load((ROLE / "handlers" / "main.yml").read_text())
+    by_name = {h["name"]: h for h in handlers}
+    assert place.get("notify") in by_name, "placing the pool config must notify a handler"
+    compose = by_name[place["notify"]]["community.docker.docker_compose_v2"]
+    assert compose["state"] == "restarted"
+    assert set(compose["services"]) == {"ci-controller", "ci-scheduler"}
