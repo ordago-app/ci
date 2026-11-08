@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call
@@ -132,6 +133,83 @@ def test_an_enqueue_wakes_the_poll_loop_instead_of_waiting_out_the_interval(stor
 def test_healthz() -> None:
     client = TestClient(create_app(MagicMock()))
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _CountingTicks:
+    """A worker.tick that counts, and can be made to hang from a given tick on."""
+
+    def __init__(self, *, raises: bool = False, hang_from: int | None = None) -> None:
+        self.started = 0
+        self.raises = raises
+        self.hang_from = hang_from
+        self.release = threading.Event()
+
+    def __call__(self) -> None:
+        self.started += 1
+        if self.hang_from is not None and self.started >= self.hang_from:
+            self.release.wait(10)
+        if self.raises:
+            raise RuntimeError("github down")
+
+
+def _until_ticks(ticks: _CountingTicks, count: int) -> None:
+    deadline = time.time() + 10
+    while ticks.started < count and time.time() < deadline:
+        time.sleep(0.01)
+    assert ticks.started >= count
+
+
+def _health_app(store, ticks: _CountingTicks, clock: _FakeClock):
+    worker = MagicMock()
+    worker.store = store
+    worker.tick.side_effect = ticks
+    # poll_interval=1: unhealthy after 5 s of clock without a finished tick.
+    return create_app(worker, poll_interval=1, clock=clock)
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["ok-ticks", "failing-ticks"])
+def test_each_finished_tick_keeps_the_service_healthy(store, raises: bool) -> None:
+    """A tick that raises is a GitHub problem, already logged: the loop is alive.
+    Measured past the startup grace, so only the tick's heartbeat can pass it."""
+    clock, ticks = _FakeClock(), _CountingTicks(raises=raises)
+    with TestClient(_health_app(store, ticks, clock)) as client:
+        _until_ticks(ticks, 1)
+        clock.now = 1000.0
+        # Tick 3 starting means tick 2, which began after the jump, has finished.
+        _until_ticks(ticks, 3)
+
+        assert client.get("/healthz").status_code == 200
+
+
+def test_health_measures_from_the_last_finished_tick(store) -> None:
+    """Healthy up to five intervals of silence, unhealthy past it, and healthy
+    again the moment the stalled tick finishes."""
+    clock, ticks = _FakeClock(), _CountingTicks(hang_from=2)
+    with TestClient(_health_app(store, ticks, clock)) as client:
+        _until_ticks(ticks, 2)  # tick 1 finished at 0.0; tick 2 is now hanging
+
+        clock.now = 5.0
+        assert client.get("/healthz").status_code == 200
+        clock.now = 5.5
+        stalled = client.get("/healthz")
+
+        ticks.hang_from = None
+        ticks.release.set()
+        _until_ticks(ticks, 3)  # tick 2 finished, its heartbeat at 5.5
+        clock.now = 10.0
+        recovered = client.get("/healthz")
+
+    assert stalled.status_code == 503
+    assert "poll loop silent for 5s" in stalled.json()["detail"]
+    assert recovered.status_code == 200
 
 
 def test_app_starts_without_background_poll() -> None:

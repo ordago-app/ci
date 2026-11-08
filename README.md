@@ -120,6 +120,14 @@ form the compose file uses.
 | `github_review_secrets` | no | `{VAR: value}` for credentials the config names by `env:` (rendered 0600, never logged) |
 | `github_review_secret_files` | no | `{filename: content}` for credentials named by `file:`; seen at `/run/secrets/github-review/<filename>` |
 | `github_review_codex_seeds` | no | `{account: auth.json content}`: a codex account's first login, written only while it has none (below) |
+| `github_review_state_dir` | no | host dir for `jobs.db` and the codex logins (default `<github_review_root>/state`) |
+| `github_review_projects_dir` | no | host dir for the clones, mounted at the same path (default `<github_review_root>/projects`) |
+| `github_review_codex_login_dirs` | no | `{account: host dir}`: a codex login kept outside the state dir, mounted read-write at `/var/lib/github-review/codex/<account>` (below) |
+
+A state or clones dir inside `github_review_root` is the role's: it creates it and
+sets its owner and mode. One outside it is shared with something else, such as an
+existing reviewer's state or clones other agents also use, so it must already exist
+and the role never changes its owner or mode.
 
 The role pulls the service image and both sandbox images (`github-review`,
 `github-review-claude`, `github-review-codex`) that this repo published at the
@@ -137,6 +145,12 @@ the account at `/var/lib/github-review/codex/<account>/auth.json`. Never give tw
 instances, or any other process that refreshes, the same login. A seed is spent
 once the service first refreshes it; to replace a broken login, delete the
 host's file and seed a fresh one.
+
+A login that other processes on the host also read (sessions that run on
+refresh-less copies of it, say) can stay where it is: name its dir in
+`github_review_codex_login_dirs.<account>` and the service becomes its refresher,
+keeping the file's owner and mode. The role mounts that dir and nothing else: it
+never creates, chowns or seeds it, and refuses an account that also has a seed.
 
 ### Config (`agent-review.yml`)
 

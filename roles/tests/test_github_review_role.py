@@ -154,3 +154,119 @@ def test_a_changed_config_or_credential_recreates_the_service() -> None:
     assert "always" in recreate
     for name in registered:
         assert f"{name} is changed" in recreate, f"{name} does not force a recreate"
+
+
+def _defaults() -> dict:
+    return yaml.safe_load((ROLE / "defaults" / "main.yml").read_text()) or {}
+
+
+def _env_content() -> str:
+    return next(
+        t["ansible.builtin.copy"]["content"]
+        for t in _tasks()
+        if str((t.get("ansible.builtin.copy") or {}).get("dest", "")).endswith("/app/.env")
+    )
+
+
+def test_state_and_clones_default_to_the_instance_root() -> None:
+    """An instance that sets neither keeps them where every instance always had
+    them, so an existing deploy renders the same .env and the same dirs."""
+    defaults = _defaults()
+    assert defaults["github_review_state_dir"] == "{{ github_review_root }}/state"
+    assert defaults["github_review_projects_dir"] == "{{ github_review_root }}/projects"
+    env = _env_content()
+    assert "GITHUB_REVIEW_STATE_DIR={{ github_review_state_dir }}" in env
+    assert "GITHUB_REVIEW_PROJECTS_DIR={{ github_review_projects_dir }}" in env
+    seeded = {
+        t["name"]: t for t in _tasks() if "github_review_codex_seeds" in str(t.get("loop", ""))
+    }
+    for task in seeded.values():
+        body = yaml.dump(task)
+        assert "github_review_root }}/state" not in body, f"{task['name']} ignores the state dir"
+        assert "github_review_state_dir" in body
+
+
+def test_a_dir_outside_the_root_is_checked_never_taken_over() -> None:
+    """A state or clones dir outside github_review_root is one something else
+    uses too: a reviewer's existing state, clones shared with other agents. The
+    role creates and chowns only what lies inside its root; a dir outside it must
+    already exist, and keeps its owner and mode."""
+    tasks = _tasks()
+    managed = next(
+        t
+        for t in tasks
+        if "ansible.builtin.file" in t and "github_review_state_dir" in str(t.get("loop", ""))
+    )
+    assert "github_review_projects_dir" in str(managed["loop"])
+    assert "github_review_root ~ '/'" in str(managed["when"])
+
+    stat = next(
+        t
+        for t in tasks
+        if "ansible.builtin.stat" in t and "github_review_state_dir" in str(t.get("loop", ""))
+    )
+    assert "not" in str(stat["when"]) and "github_review_root ~ '/'" in str(stat["when"])
+    check = next(
+        t
+        for t in tasks
+        if "ansible.builtin.assert" in t and stat["register"] in str(t.get("loop", ""))
+    )
+    assert "isdir" in " ".join(check["ansible.builtin.assert"]["that"])
+    assert not any(
+        "ansible.builtin.file" in t and stat["register"] in str(t.get("loop", "")) for t in tasks
+    )
+
+
+def test_codex_login_dirs_default_to_none_and_add_no_compose_file() -> None:
+    assert _defaults()["github_review_codex_login_dirs"] == {}
+    tasks = {t["name"]: t for t in _tasks()}
+    absent = next(
+        t
+        for t in tasks.values()
+        if str((t.get("ansible.builtin.file") or {}).get("path", "")).endswith(
+            "/app/compose.override.yml"
+        )
+    )
+    assert absent["ansible.builtin.file"]["state"] == "absent"
+    assert "github_review_codex_login_dirs | length == 0" in str(absent["when"])
+
+
+def test_a_codex_login_dir_is_mounted_where_the_service_looks_for_that_account() -> None:
+    """A login kept outside the state dir (one other consumers on the host read)
+    is mounted read-write at /var/lib/github-review/codex/<account>, the dir the
+    README tells every codex account's `credential.file` to name. The service
+    replaces auth.json through a sibling temp file, so the mount is the dir."""
+    tasks = _tasks()
+    override = next(
+        t
+        for t in tasks
+        if str((t.get("ansible.builtin.copy") or {}).get("dest", "")).endswith(
+            "/app/compose.override.yml"
+        )
+    )
+    body = str(override["ansible.builtin.copy"]["content"])
+    assert "/var/lib/github-review/codex/" in body and ":rw" in body
+    assert "github_review_codex_login_dirs" in body
+    assert "github_review_codex_login_dirs | length > 0" in str(override["when"])
+
+    guard = next(
+        t
+        for t in tasks
+        if "ansible.builtin.assert" in t
+        and "github_review_codex_login_dirs" in t["ansible.builtin.assert"]["fail_msg"]
+    )
+    assert tasks.index(guard) < tasks.index(override)
+    checks = " ".join(guard["ansible.builtin.assert"]["that"])
+    assert "match('^/')" in checks, "a relative host path would mount from compose's cwd"
+    assert "github_review_codex_seeds" in checks, "a seed would land under the mount, unseen"
+    assert "isdir" in checks, "docker would create a missing dir as an empty root-owned one"
+
+
+def test_a_codex_login_dir_is_never_chowned() -> None:
+    """The dir is shared with whatever else reads that login; the service keeps
+    the file's owner and mode when it refreshes (codex_auth.py), and so must the role."""
+    for task in _tasks():
+        file = task.get("ansible.builtin.file") or {}
+        assert "github_review_codex_login_dirs" not in str(task.get("loop", "")) or not file, (
+            f"{task['name']} manages a codex login dir"
+        )
