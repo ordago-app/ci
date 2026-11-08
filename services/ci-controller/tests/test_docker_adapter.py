@@ -11,6 +11,7 @@ from src.docker_adapter import (
     HOST_LABEL,
     JOB_LABEL,
     LANE_LABEL,
+    REVIEW_INSTANCE_LABEL,
     DockerAdapter,
     DockerPool,
 )
@@ -753,25 +754,21 @@ def test_an_unusable_start_time_is_unknown_rather_than_zero(write_config) -> Non
     assert lane.started_at is None
 
 
-def test_count_review_sessions_counts_only_github_reviews_containers(write_config) -> None:
+def test_count_review_sessions_counts_every_reviewer_instances_review_containers(
+    write_config,
+) -> None:
+    """github-review labels each review container with its instance's name, and two
+    instances may share a host: every one of them is RAM this host's lanes compete
+    for, so the count is by the label's presence, whatever instance set it. Matching
+    by name missed every review once the reviewer named them
+    `review-<instance>-<account>-<job>`."""
     adapter, client, _ = _adapter(write_config)
-    names = [
-        "claude-review-62228-work",
-        "codex-review-8729",
-        "github-review",
-        "peer-review-3",
-        "claude-review-notanumber",
-    ]
-    containers = []
-    for name in names:
-        container = MagicMock()
-        container.name = name
-        containers.append(container)
-    client.containers.list.return_value = containers
+    client.containers.list.return_value = [MagicMock(), MagicMock(), MagicMock()]
 
-    assert adapter.count_review_sessions() == 2
+    assert adapter.count_review_sessions() == 3
     _, kwargs = client.containers.list.call_args
-    assert kwargs["filters"] == {"name": "-review-"}
+    assert kwargs["filters"] == {"label": REVIEW_INSTANCE_LABEL}
+    assert not kwargs.get("all"), "a stopped review container holds no RAM"
 
 
 ELASTIC_HOSTS_CONFIG = HOSTS_CONFIG.replace(
