@@ -247,3 +247,13 @@ def test_a_changed_pool_config_restarts_both_processes() -> None:
     compose = by_name[place["notify"]]["community.docker.docker_compose_v2"]
     assert compose["state"] == "restarted"
     assert set(compose["services"]) == {"ci-controller", "ci-scheduler"}
+
+
+def test_the_runner_image_is_pulled_before_the_dispatcher_starts() -> None:
+    """The dispatcher spawns lanes from runner_image the moment it is up. Pulling the
+    image after stack-up leaves a window, as long as a ~16 GB pull, in which every
+    admitted job fails to start because the image is not on the host."""
+    names = [t.get("name") for t in _tasks()]
+    assert names.index("The local lane runner image is present") < names.index(
+        "ci-controller stack up"
+    )
