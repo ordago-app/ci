@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,11 +25,11 @@ CLASS_LABEL = "com.homelab.ci-controller.class"
 # The lane's host, for the same reason: with more than one host the ledger must know
 # WHICH host's budget a re-adopted lane spends.
 HOST_LABEL = "com.homelab.ci-controller.host"
-# github-review's per-review containers: `claude-review-<job>-<account>` and
-# `codex-review-<job>` (services/github-review/src/providers/). Matched by name because
-# that is the contract github-review already keeps; the repo-root
-# tests/test_review_ci_contract.py reads both sources to hold them to it.
-REVIEW_SESSION_NAME = re.compile(r"^(claude|codex)-review-\d+")
+# github-review stamps every review container with this label, valued with its
+# instance's name (services/github-review/src/providers/_agent_container.py). Counted by
+# the label's presence, so every instance on the host is in the ledger;
+# tests/test_review_contract.py holds the two sides to one name.
+REVIEW_INSTANCE_LABEL = "ordago.ci.github-review.instance"
 
 
 def _random_suffix() -> str:
@@ -246,8 +245,7 @@ class DockerAdapter:
 
     def count_review_sessions(self) -> int:
         """Running github-review containers on this host, so their RAM is in the ledger."""
-        containers = self._client.containers.list(filters={"name": "-review-"})
-        return sum(1 for c in containers if REVIEW_SESSION_NAME.match(c.name))
+        return len(self._client.containers.list(filters={"label": REVIEW_INSTANCE_LABEL}))
 
     def ping(self) -> bool:
         """False on ANY exception. A sleeping desktop, an unreachable tailnet

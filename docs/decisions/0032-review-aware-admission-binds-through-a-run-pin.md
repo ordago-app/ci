@@ -118,3 +118,12 @@ Mechanisms looked at:
   it every cancel logs one ERROR per run and nothing else changes.
 - `review_held` is a new defer reason in `metrics.db`; `make ci-report`'s per-reason
   tables show it as its own row.
+
+## Amendment (2026-11-08)
+
+Decision 5's contract is now the label, not the name. The reviewer had renamed its
+containers `review-<instance>-<account>-<job>` and labels each with
+`ordago.ci.github-review.instance`, so the name pattern above matched none of them and
+no review was charged to the ledger. The controller counts running containers carrying
+that label, whatever instance set it, and
+`services/ci-controller/tests/test_review_contract.py` holds both sides to the one name.
