@@ -18,7 +18,7 @@ pinned to the same commit. Nothing about one consumer belongs in the engine
 | 2. github-actions-runner superset | done, #27 |
 | 3. Publish images | done, #28. Each GHCR package must be made public once by an org owner after its first publish, or every consumer needs a pull credential |
 | 4. Roles run the published images, at parity | done, #29 and #30 |
-| 5. Consumer cut-over | Órdago's reviewer (`ops`) runs the published images at 8c3155a since 2026-11-08 (ops#7). homelab: ci-controller and runner deployed from the role at 15677b4 on 2026-11-08 (homelab#373); its personal reviewer next |
+| 5. Consumer cut-over | Órdago's reviewer (`ops`) runs the published images at 8c3155a since 2026-11-08 (ops#7). homelab: ci-controller and runner deployed from the role at 15677b4 on 2026-11-08 (homelab#373); its personal reviewer moves to the role at ff82aa0 in homelab#375 (ci#35 gave the role optional state, clones and codex-login dirs; ci#36 fixed the controller counting no review container), awaiting review and deploy |
 | 6. Stop it reopening | not started |
 
 ## Why there are two copies today
