@@ -149,6 +149,18 @@
     group: "{{ operator_user }}"
     mode: "0644"
 
+# The controller spawns its local lanes from the pool config's runner_image, and the
+# socket proxy cannot pull, so the image must already be here. Checked above to be
+# this commit's. Pulled before stack-up: the dispatcher admits jobs as soon as it
+# starts, and a ~16 GB pull after it would fail every lane spawned meanwhile.
+- name: The local lane runner image is present
+  vars:
+    _pool: "{{ lookup('ansible.builtin.file', ci_controller_pool_config) | from_yaml }}"
+  community.docker.docker_image:
+    name: "{{ _pool.runner_image }}"
+    source: pull
+    state: present
+
 - name: ci-controller stack up
   community.docker.docker_compose_v2:
     project_src: "{{ services_root }}/ci-controller"
@@ -275,14 +287,3 @@
     enabled: true
     state: started
   become: true
-
-# The controller spawns its local lanes from the pool config's runner_image, and the
-# socket proxy cannot pull, so the image must already be here. Checked above to be
-# this commit's.
-- name: The local lane runner image is present
-  vars:
-    _pool: "{{ lookup('ansible.builtin.file', ci_controller_pool_config) | from_yaml }}"
-  community.docker.docker_image:
-    name: "{{ _pool.runner_image }}"
-    source: pull
-    state: present
