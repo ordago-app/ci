@@ -18,7 +18,7 @@ pinned to the same commit. Nothing about one consumer belongs in the engine
 | 2. github-actions-runner superset | done, #27 |
 | 3. Publish images | done, #28. Each GHCR package must be made public once by an org owner after its first publish, or every consumer needs a pull credential |
 | 4. Roles run the published images, at parity | done, #29 and #30 |
-| 5. Consumer cut-over | not started; needs each machine's owner to deploy |
+| 5. Consumer cut-over | Órdago's reviewer (`ops`) runs the published images at 8c3155a since 2026-11-08 (ops#7). homelab: in progress (ci-controller and runner first, then its personal reviewer) |
 | 6. Stop it reopening | not started |
 
 ## Why there are two copies today
@@ -94,8 +94,8 @@ is `--check` first and is deployed only by that machine's owner.
    `runner_image` is another commit's. A consumer must pin a commit at or after
    the images workflow (task 3), because only those commits have images.
    `github_review` moved the same way in #30: required `ci_image_tag`, its three
-   images pulled. Órdago's instance in `ops` must add `ci_image_tag` with its next
-   pin bump.
+   images pulled. Órdago's instance in `ops` did so in ops#7, reading the tag from
+   its `requirements.yml` pin so the SHA is written once.
 5. **Consumer cut-over, one tree per deploy:** `ci-controller` with the runner
    image, then `github-review` (the consumer's Task 5b). Each step: bump the pin,
    switch the play to the role, run `--check --diff`, have the owner deploy, then
