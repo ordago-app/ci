@@ -154,6 +154,9 @@ def create_app(
             # dashboard that predates the field renders one card fewer, not a
             # broken page.
             "reviewer_quota": worker.reviewer_quota(),
+            # The subscriptions reordered by expiring weekly credit, with the
+            # readings behind the order; null when the instance ranks nothing.
+            "quota_ranking": worker.quota_ranking(),
             # Reported run cost per account, over the last day and 30 days. An
             # api_key account spends somebody's credit, and this is where the
             # owner reads how much.

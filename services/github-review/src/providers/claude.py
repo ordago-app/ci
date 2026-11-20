@@ -48,6 +48,7 @@ from ..provider import (
     classify_unavailable,
     parse_verdict,
 )
+from ..quota_rank import QuotaLedger, Window, window_kind
 from ._agent_container import (
     WORKSPACE,
     container_name,
@@ -111,8 +112,10 @@ class ClaudeReviewProvider:
         image: str,
         instance: str,
         environ: Mapping[str, str] | None = None,
+        quota_ledger: QuotaLedger | None = None,
     ) -> None:
         self._account = account
+        self._quota_ledger = quota_ledger
         self._settings = settings
         self._docker = docker_client
         self._worktrees = worktrees
@@ -297,7 +300,7 @@ class ClaudeReviewProvider:
             # "the CLI reported no number", which is NOT zero — coercing it to
             # 0.0 would render a silent account as a freshly-reset one.
             raw_utilization = info.get("utilization")
-            self._last_quota = QuotaReading(
+            self._last_quota = reading = QuotaReading(
                 account=self._account,
                 status=str(info.get("status") or "unknown"),
                 limit_type=str(info.get("rateLimitType") or ""),
@@ -311,6 +314,18 @@ class ClaudeReviewProvider:
                 ),
                 observed_at=time.time(),
             )
+            kind = window_kind(reading.limit_type)
+            if (
+                self._quota_ledger is not None
+                and kind is not None
+                and reading.utilization is not None
+                and reading.resets_at is not None
+            ):
+                self._quota_ledger.record(
+                    self._account,
+                    kind,
+                    Window(reading.utilization, reading.resets_at, reading.observed_at),
+                )
             return
 
     def cleanup(self, session: SessionRef) -> None:

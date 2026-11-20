@@ -11,6 +11,7 @@ from src.main import build_providers, required_env
 from src.provider import ProviderUnavailable
 from src.providers.claude import ClaudeReviewProvider
 from src.providers.codex import CodexReviewProvider
+from src.quota_rank import QuotaLedger
 
 from tests.helpers import write_config
 
@@ -48,6 +49,7 @@ def _build(tmp_path: Path, environ: dict[str, str], raw: MagicMock | None = None
         docker_client=raw if raw is not None else _docker(),
         worktrees=worktrees,
         projects_root=tmp_path / "projects",
+        quota_ledger=QuotaLedger(),
     )
 
 
@@ -97,6 +99,7 @@ def test_the_review_images_have_no_default(tmp_path: Path, image: str) -> None:
             docker_client=MagicMock(),
             worktrees=MagicMock(),
             projects_root=tmp_path,
+            quota_ledger=QuotaLedger(),
         )
 
 

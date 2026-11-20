@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -179,6 +180,46 @@ class Limits(_Strict):
     stuck_running_seconds: int = Field(default=10800, ge=1)
 
 
+class QuotaRanking(_Strict):
+    """Which subscriptions the reviewer reorders by expiring weekly credit, and
+    when it reads their quota (see quota_rank.py).
+
+    Each probe is a one-token request that opens the account's 5-hour window,
+    so `probe_at` should be the times the operator wants windows to open."""
+
+    # Claude subscription accounts only: an API key has no weekly window, and
+    # codex reports no quota. Their slots in a chain never move.
+    accounts: list[str] = Field(min_length=2)
+    probe_at: list[str] = Field(min_length=1)
+    timezone: str = Field(min_length=1)
+    # The cheapest model the subscriptions serve: the probe needs only headers.
+    probe_model: str = Field(min_length=1)
+
+    @field_validator("accounts")
+    @classmethod
+    def accounts_are_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("quota_ranking.accounts must not repeat")
+        return value
+
+    @field_validator("probe_at")
+    @classmethod
+    def times_are_hh_mm(cls, value: list[str]) -> list[str]:
+        for hhmm in value:
+            if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", hhmm):
+                raise ValueError(f"probe_at {hhmm!r} is not HH:MM")
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def timezone_exists(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown timezone {value!r}") from exc
+        return value
+
+
 class _RawConfig(_Strict):
     instance: str = Field(pattern=NAME_PATTERN)
     reviewer_bot: str = Field(min_length=1)
@@ -186,6 +227,7 @@ class _RawConfig(_Strict):
     accounts: dict[str, Account] = Field(min_length=1)
     repos: dict[str, RepoPolicy]
     limits: Limits = Limits()
+    quota_ranking: QuotaRanking | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +238,7 @@ class ReviewConfig:
     accounts: dict[str, ClaudeAccount | CodexAccount]
     repos: dict[str, RepoPolicy]
     limits: Limits
+    quota_ranking: QuotaRanking | None = None
 
     @classmethod
     def load(cls, path: Path) -> ReviewConfig:
@@ -224,6 +267,15 @@ class ReviewConfig:
                         "log it out"
                     )
                 logins[login] = name
+        if raw.quota_ranking is not None:
+            for name in raw.quota_ranking.accounts:
+                ranked = raw.accounts.get(name)
+                if not isinstance(ranked, ClaudeAccount) or ranked.auth != "subscription":
+                    raise ConfigError(
+                        f"{source}: quota_ranking names {name!r}, which is not a declared "
+                        "Claude subscription account; only subscriptions have a weekly "
+                        "window to rank by"
+                    )
 
         repos: dict[str, RepoPolicy] = {}
         for name, repo in raw.repos.items():
@@ -250,6 +302,7 @@ class ReviewConfig:
             accounts=dict(raw.accounts),
             repos=repos,
             limits=raw.limits,
+            quota_ranking=raw.quota_ranking,
         )
 
     def enabled_repos(self) -> list[RepoPolicy]:

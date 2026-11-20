@@ -208,6 +208,33 @@ repos:
     review_mode: labeled                # only PRs labelled `ai-review`
 ```
 
+#### Ranking subscriptions by expiring credit (`quota_ranking`, optional)
+
+A subscription's weekly allowance expires at its reset whether it was spent or
+not. With `quota_ranking`, every review reorders the listed subscriptions among
+the chain slots they already hold, putting first the one that would lose the
+most weekly credit per hour left before its reset. Every other account keeps its
+place, so `[codex, claude-api, sub-a, sub-b]` can become
+`[codex, claude-api, sub-b, sub-a]` and never moves codex.
+
+```yaml
+quota_ranking:
+  accounts: [claude-work, claude-personal]  # Claude subscriptions only, two or more
+  probe_at: ["07:00", "12:01", "17:02"]     # local times to read each account's quota
+  timezone: Europe/Madrid
+  probe_model: claude-haiku-5-5             # the probe needs only response headers
+```
+
+The readings come from a one-token request per account at each `probe_at`
+time (a `claude setup-token` token cannot read the usage API), plus whatever the
+reviews themselves report. **Each probe opens that account's 5-hour window**, so
+set `probe_at` to when you want windows to open. An account above 95% of its
+week, or above 85% of a 5-hour window read in the last 15 minutes, moves last;
+one with no reading under a day old keeps its configured order behind the
+ranked ones. With no readings at all, as after a restart, reviews follow the
+configured chain exactly. `/status` shows the current order and the readings
+behind it under `quota_ranking`. The rules are in `src/quota_rank.py`.
+
 Órdago's, with a second person's key added by config alone:
 
 ```yaml
