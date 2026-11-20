@@ -11,3 +11,8 @@ The property it guards is that a tick never *blocks* on a running review, not th
 fast. Assert that directly: hold the `GatedProvider` gate closed for the whole test and
 check both ticks returned (for example, run them in a thread joined with a generous
 timeout well under the gate's), so load can slow the test but cannot fail it.
+
+A second one, same file: `test_a_job_that_fails_mid_drain_waits_for_the_next_wake` failed
+1 run in 4 on an idle workstation on 2026-11-20 (writing #37) and passed alone three times.
+Read it for the same shape, a wall-clock bound standing in for "did not block", and fix
+both together.
