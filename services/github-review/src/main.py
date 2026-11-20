@@ -20,6 +20,7 @@ from .provider import ReviewProvider
 from .providers._agent_container import reap_review_containers
 from .providers.claude import ClaudeReviewProvider
 from .providers.codex import CodexReviewProvider
+from .quota_rank import QuotaLedger, QuotaProber, run_probes
 from .worker import ReviewWorker
 
 
@@ -39,6 +40,7 @@ def build_providers(
     docker_client: DockerClient,
     worktrees: GitWorktreeManager,
     projects_root: Path,
+    quota_ledger: QuotaLedger,
 ) -> dict[str, ReviewProvider]:
     """One provider per declared account, keyed by the name chains use.
 
@@ -60,6 +62,7 @@ def build_providers(
                 image=claude_image,
                 instance=config.instance,
                 environ=environ,
+                quota_ledger=quota_ledger,
             )
         elif isinstance(account, CodexAccount):
             providers[name] = CodexReviewProvider(
@@ -77,6 +80,31 @@ def build_providers(
                 account.credential.describe(),
             )
     return providers
+
+
+def start_quota_probes(
+    config: ReviewConfig,
+    *,
+    environ: Mapping[str, str],
+    quota_ledger: QuotaLedger,
+    stop: threading.Event,
+) -> threading.Thread | None:
+    """The thread that reads the ranked subscriptions' quota at `probe_at`, if any."""
+    ranking = config.quota_ranking
+    if ranking is None:
+        return None
+    accounts = {name: config.accounts[name] for name in ranking.accounts}
+    prober = QuotaProber(
+        accounts={n: a for n, a in accounts.items() if isinstance(a, ClaudeAccount)},
+        ledger=quota_ledger,
+        model=ranking.probe_model,
+        environ=environ,
+    )
+    thread = threading.Thread(
+        target=run_probes, args=(ranking, prober, stop), name="quota-probes", daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def main() -> None:
@@ -106,18 +134,21 @@ def main() -> None:
         run_as_gid=int(required_env(environ, "WORKTREE_RUN_AS_GID")),
         tokens=tokens,
     )
+    quota_ledger = QuotaLedger()
     providers = build_providers(
         config,
         environ=environ,
         docker_client=docker_client,
         worktrees=worktrees,
         projects_root=projects_root,
+        quota_ledger=quota_ledger,
     )
     stop = threading.Event()
     for provider in providers.values():
         # Each codex account's only login refresher (codex_auth.py).
         if isinstance(provider, CodexReviewProvider):
             provider.start_auth_keeper(stop)
+    start_quota_probes(config, environ=environ, quota_ledger=quota_ledger, stop=stop)
 
     store = ReviewJobStore(state_dir / "jobs.db")
     store.init()
@@ -137,6 +168,7 @@ def main() -> None:
         concurrency=limits.concurrency,
         max_restart_refunds=limits.max_restart_refunds,
         stuck_running_seconds=limits.stuck_running_seconds,
+        quota_ledger=quota_ledger,
     )
 
     app = create_app(worker, poll_interval=limits.poll_interval_seconds)

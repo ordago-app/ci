@@ -19,6 +19,7 @@ from .provider import (
     ReviewResult,
     run_cost,
 )
+from .quota_rank import QuotaLedger, order_chain, rank
 
 _log = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ class ReviewWorker:
         concurrency: int = 1,
         max_restart_refunds: int = 2,
         stuck_running_seconds: float = 3 * 3600,
+        quota_ledger: QuotaLedger | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError(f"concurrency must be at least 1, got {concurrency}")
@@ -97,6 +99,7 @@ class ReviewWorker:
                 f"possible review ({longest_review} s: max_runtime_minutes x providers)"
             )
         self._config = config
+        self._quota_ledger = quota_ledger if quota_ledger is not None else QuotaLedger()
         self._store = store
         self._github = github
         self._worktrees = worktrees
@@ -190,6 +193,32 @@ class ReviewWorker:
                 }
             )
         return rows
+
+    def review_chain(self, providers: list[str]) -> list[str]:
+        """The order this review tries accounts in: the configured chain, with the
+        `quota_ranking` subscriptions reordered by expiring weekly credit."""
+        ranking = self._config.quota_ranking
+        if ranking is None:
+            return list(providers)
+        return order_chain(providers, ranking.accounts, self._quota_ledger, time.time())
+
+    def quota_ranking(self) -> dict[str, object] | None:
+        """For /status: each ranked account's last windows and the order they rank in now."""
+        ranking = self._config.quota_ranking
+        if ranking is None:
+            return None
+        return {
+            "order": rank(ranking.accounts, self._quota_ledger, time.time()),
+            "probe_at": ranking.probe_at,
+            "timezone": ranking.timezone,
+            "accounts": {
+                name: {
+                    kind: window.as_dict()
+                    for kind, window in self._quota_ledger.windows(name).items()
+                }
+                for name in ranking.accounts
+            },
+        }
 
     def is_degraded(self, repo: str, used: str | None) -> bool:
         """True when this repo's preferred provider is not the one that answered."""
@@ -467,10 +496,11 @@ class ReviewWorker:
                 ),
                 previous=self._previous_round(job, repo_dir),
             )
+            chain = self.review_chain(repo_policy.providers)
             result, used, outages = self._review_with_failover(
-                job, worktree, repo_policy.max_runtime_minutes * 60, prompt, repo_policy.providers
+                job, worktree, repo_policy.max_runtime_minutes * 60, prompt, chain
             )
-            body = self._disclose(result.body, used, repo_policy.providers[0], outages)
+            body = self._disclose(result.body, used, chain[0], outages)
             self._github.post_review(
                 job.repo, job.pr_number, body, result.event, commit_id=job.head_sha
             )
