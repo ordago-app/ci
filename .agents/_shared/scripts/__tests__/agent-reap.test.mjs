@@ -98,3 +98,55 @@ test('a real reap of a merged, clean worktree leaves no worktree and no branch',
     fs.rmSync(f.tmp, { recursive: true, force: true });
   }
 });
+
+// The cleanup half. Each worker carries the two scripts a real worktree has, as stubs that
+// log who ran them and from where; they are committed, so the worktree stays clean.
+function withCleanupStubs(f, names) {
+  const log = path.join(f.tmp, 'cleanup.log');
+  for (const name of names) {
+    const wt = path.join(f.root, '.claude', 'worktrees', name);
+    if (!fs.existsSync(wt)) git(f.root, 'worktree', 'add', '-q', '-b', `feat/${name}`, wt, 'origin/develop');
+    fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'scripts', 'pr-land-bg.sh'), '#!/usr/bin/env bash\necho "lander $1 $PWD" >> "$REAP_TEST_LOG"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(wt, 'scripts', 'agent-env.sh'), 'echo "slot $1 $PWD" >> "$REAP_TEST_LOG"\n');
+    git(wt, 'add', 'scripts');
+    git(wt, 'commit', '-q', '-m', `stubs for ${name}`);
+    git(f.root, 'merge', '-q', '--no-ff', '-m', `merge ${name}`, git(wt, 'rev-parse', '--abbrev-ref', 'HEAD'));
+  }
+  git(f.root, 'push', '-q', 'origin', 'develop');
+  const run = (...args) => spawnSync('bash', [SCRIPT, '--session', 'no-such-session-reap-test', ...args],
+    { cwd: f.root, encoding: 'utf8', env: { ...process.env, REAP_TEST_LOG: log } });
+  const lines = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []);
+  return { run, lines };
+}
+
+test('a reap stops the lander, then frees the slot, in the selected worktree only, before deleting it', () => {
+  const f = fixture();
+  try {
+    const { run, lines } = withCleanupStubs(f, ['w1-thing', 'w2-other']);
+    const other = path.join(f.root, '.claude', 'worktrees', 'w2-other');
+    const r = run('w1-thing');
+    assert.equal(r.status, 0, r.stderr);
+    // Each stub ran from inside w1-thing, which proves the worktree still existed when it ran.
+    assert.deepEqual(lines(), [`lander --kill ${f.wt}`, `slot --clean ${f.wt}`]);
+    assert.ok(!fs.existsSync(f.wt));
+    assert.ok(fs.existsSync(path.join(other, 'scripts', 'agent-env.sh')), 'the other worker is untouched');
+    assert.notEqual(git(f.root, 'branch', '--list', 'feat/w2-other'), '');
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});
+
+test('a dry run and a refused reap run neither cleanup script', () => {
+  const f = fixture();
+  try {
+    const { run, lines } = withCleanupStubs(f, ['w1-thing']);
+    assert.equal(run('--dry-run', 'w1-thing').status, 0);
+    fs.writeFileSync(path.join(f.wt, 'b.txt'), 'uncommitted\n');
+    assert.equal(run('w1-thing').status, 2);
+    assert.deepEqual(lines(), []);
+    assert.ok(fs.existsSync(f.wt));
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});

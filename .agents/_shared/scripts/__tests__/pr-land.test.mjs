@@ -799,25 +799,29 @@ test('pickBranchPr: PRs into another base are ignored', () => {
 // fetch it before it can tell whether HEAD moved past it.
 const { headCarriesWorkBeyond } = require('../pr-land.js');
 
+// The fixture's base is whatever base the loaded config names: pr-land.js reads the config of
+// the directory the tests run from, and a consumer's copy runs them from a repo whose base is `main`.
+const BASE = require('../pr-land.js').CONFIG.baseBranch;
+
 function repoWithOldPrHead() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'land-reuse-'));
   const run = (cwd, cmd) => execSync(`git -c user.name=t -c user.email=t@t ${cmd}`, { cwd, stdio: 'pipe' }).toString().trim();
   const origin = path.join(tmp, 'origin.git');
   const seed = path.join(tmp, 'seed');
   const clone = path.join(tmp, 'clone');
-  run(tmp, `init -q --bare -b develop ${origin}`);
+  run(tmp, `init -q --bare -b ${BASE} ${origin}`);
   run(tmp, `clone -q ${origin} ${seed}`);
-  run(seed, 'checkout -qb develop');
+  run(seed, `checkout -qb ${BASE}`);
   fs.writeFileSync(path.join(seed, 'a.txt'), 'base\n');
   run(seed, 'add . && git -c user.name=t -c user.email=t@t commit -qm base');
-  run(seed, 'push -q origin develop');
+  run(seed, `push -q origin ${BASE}`);
   run(seed, 'checkout -qb old');
   fs.writeFileSync(path.join(seed, 'old.txt'), 'old\n');
   run(seed, 'add . && git -c user.name=t -c user.email=t@t commit -qm old');
   const oldHead = run(seed, 'rev-parse HEAD');
   run(seed, 'push -q origin HEAD:refs/pull/7/head');
   // file:// rather than a path: a local clone hardlinks every object, the PR ref's included.
-  run(tmp, `clone -q -b develop file://${origin} ${clone}`);
+  run(tmp, `clone -q -b ${BASE} file://${origin} ${clone}`);
   return { clone, oldHead, run };
 }
 

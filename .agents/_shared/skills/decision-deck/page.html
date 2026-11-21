@@ -107,6 +107,9 @@ textarea{font:inherit;width:100%;box-sizing:border-box;min-height:70px;border-ra
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
   let db = null, me = null, canAnswer = false;
+  // Nothing is answerable until both collections have arrived: a card drawn before its saved
+  // answer looks unanswered, and answering it would overwrite that answer.
+  let cardsLoaded = false, answersLoaded = false;
   let cards = [], answers = {}, current = null, shownAt = 0, openedCtx = false, toastTimer = null;
   // High-stakes cards ask for your answer before showing the pick: id -> the option chosen blind.
   const blindFirst = {};
@@ -280,7 +283,9 @@ textarea{font:inherit;width:100%;box-sizing:border-box;min-height:70px;border-ra
       else if (dx < -Math.min(120, w * .3)){ reset(); onLeft(); }
       else reset();
     };
-    card.addEventListener("pointerup", end); card.addEventListener("pointercancel", end);
+    // A gesture the browser cancels is never an answer, however far it had travelled.
+    const cancel = () => { if (x0 === null) return; card.classList.remove("dragging"); x0 = null; dx = 0; reset(); };
+    card.addEventListener("pointerup", end); card.addEventListener("pointercancel", cancel);
   }
 
   async function choose(c, opt, via, note, extra){
@@ -345,8 +350,14 @@ textarea{font:inherit;width:100%;box-sizing:border-box;min-height:70px;border-ra
     if (e.key === "ArrowLeft"){ e.preventDefault(); const a = document.querySelector(".card .answer"); if (a) showOthers(a, current, (current.options||[]).filter(o => o.id !== current.pick), "key"); }
   });
 
+  // A failed subscription leaves nothing answerable on screen, at first load or later.
+  function stop(text){
+    cardsLoaded = answersLoaded = false; current = null;
+    $("stage").replaceChildren(el("p","empty",text));
+  }
+
   async function start(){
-    const timer = setTimeout(() => { if (!cards.length) $("loading").textContent = "The decisions didn't load. Reopen the page to try again."; }, 10000);
+    const timer = setTimeout(() => { if (!(cardsLoaded && answersLoaded) && $("loading")) $("loading").textContent = "The decisions didn't load. Reopen the page to try again."; }, 10000);
     db = await window.claude?.use?.("db").catch(() => null);
     const user = await window.claude?.use?.("user").catch(() => null);
     if (!db){ clearTimeout(timer); $("loading").textContent = "Sign in to claude.ai to see and answer this deck."; return; }
@@ -354,14 +365,15 @@ textarea{font:inherit;width:100%;box-sizing:border-box;min-height:70px;border-ra
     try{ canAnswer = user ? !!(await user.canEdit()) : false; }catch(_){ canAnswer = false; }
     db.doc("deck/meta").onSnapshot(s => { const d = s.exists && s.data(); if (d && d.title){ $("deck-title").textContent = d.title; } }, () => {});
     db.collection("cards").onSnapshot(snap => {
-      clearTimeout(timer);
       cards = snap.docs.map(d => Object.assign({id:d.id}, d.data())).sort((a,b) => (a.order||0) - (b.order||0));
-      render();
-    }, (e) => { clearTimeout(timer); $("loading").textContent = "The decisions didn't load (" + (e && e.code || "error") + "). Reopen the page to try again."; });
+      cardsLoaded = true;
+      if (answersLoaded){ clearTimeout(timer); render(); }
+    }, (e) => { clearTimeout(timer); stop("The decisions didn't load (" + (e && e.code || "error") + "). Reopen the page to try again."); });
     db.collection("answers").onSnapshot(snap => {
       const fresh = {}; snap.docs.forEach(d => fresh[d.id] = d.data()); answers = fresh;
-      if (cards.length) render();
-    }, () => {});
+      answersLoaded = true;
+      if (cardsLoaded){ clearTimeout(timer); render(); }
+    }, (e) => { clearTimeout(timer); stop("Your earlier answers didn't load (" + (e && e.code || "error") + "). Reopen the page to try again."); });
   }
   start();
 })();
