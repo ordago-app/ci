@@ -1,7 +1,7 @@
 # Vendored: do not edit
 
-A copy of [agent-skills](https://github.com/ghostaff-ai/agent-skills/tree/35af0bccf842df141555ec52277b05fb90a1f300),
-commit `35af0bccf842df141555ec52277b05fb90a1f300`.
+A copy of [agent-skills](https://github.com/ghostaff-ai/agent-skills/tree/807e8b12686e45b77f80d8b897d75d2055145972),
+commit `807e8b12686e45b77f80d8b897d75d2055145972`.
 
 Refresh it with the workspace's `vendor-agent-skills.py`, never by hand: a local edit is
 overwritten by the next refresh. A change belongs in agent-skills; a value only this repo

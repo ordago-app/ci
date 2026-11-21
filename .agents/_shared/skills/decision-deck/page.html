@@ -1,0 +1,368 @@
+<title>Decision Deck</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;600&display=swap">
+<style>
+/* Layout: one card centred on a calm desk; progress on top, the answer under the card. Ghostaff's palette. */
+:root{
+  --surface:#F3F3F7; --card:#FFFFFF; --sunk:#E9E8F0; --ink:#16151E; --muted:#6A687A; --line:#E1E0E9;
+  --on-accent:#FFFFFF; --ok:#2F7D4F; --no:#A23B2C; --waiting:#D9622B; --pick:#F1EEFB; --pick-line:#CFC7EE;
+  --display:"Rubik", ui-sans-serif, system-ui, sans-serif;
+  --body:ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --shadow:0 1px 2px rgb(22 21 30 / .06), 0 8px 28px rgb(22 21 30 / .08);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --surface:#0C0D13; --card:#171922; --sunk:#23252F; --ink:#ECEDF3; --muted:#8C8FA0; --line:#262833;
+  --on-accent:#0C0D13; --ok:#3A9A62; --no:#C4503F; --waiting:#FF8A4C; --pick:#211F33; --pick-line:#3D3863;
+  --shadow:0 1px 2px rgb(0 0 0 / .4), 0 10px 30px rgb(0 0 0 / .35); color-scheme:dark}}
+:root[data-theme="dark"]{
+  --surface:#0C0D13; --card:#171922; --sunk:#23252F; --ink:#ECEDF3; --muted:#8C8FA0; --line:#262833;
+  --on-accent:#0C0D13; --ok:#3A9A62; --no:#C4503F; --waiting:#FF8A4C; --pick:#211F33; --pick-line:#3D3863;
+  --shadow:0 1px 2px rgb(0 0 0 / .4), 0 10px 30px rgb(0 0 0 / .35); color-scheme:dark}
+html,body{min-height:100%}
+body{background:var(--surface);color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.45;
+  padding-left:max(16px, env(safe-area-inset-left, 0px));padding-right:max(16px, env(safe-area-inset-right, 0px));padding-block:20px 48px;overflow-x:hidden}
+.wrap{max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+h1{font-family:var(--display);font-weight:600;font-size:18px;margin:0;letter-spacing:-.01em}
+.waiting{font-size:13px;color:var(--waiting);font-weight:600;font-variant-numeric:tabular-nums}
+.dots{display:flex;gap:5px;flex-wrap:wrap}
+.dot{width:22px;height:4px;border-radius:2px;background:var(--line)}
+.dot.done{background:var(--ink)} .dot.now{background:var(--waiting)}
+.stage{position:relative;min-height:200px}
+.card{background:var(--card);border-radius:18px;box-shadow:var(--shadow);padding:20px;display:flex;flex-direction:column;gap:14px;
+  touch-action:pan-y;user-select:none;will-change:transform;position:relative}
+.card.dragging{transition:none}
+.card.settle{transition:transform .25s ease, opacity .25s ease}
+.meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--muted)}
+.chip{border:1px solid var(--line);border-radius:999px;padding:2px 9px;font-size:11.5px;letter-spacing:.02em;white-space:nowrap}
+.chip.undo{color:var(--ok);border-color:color-mix(in srgb, var(--ok) 40%, transparent)}
+.chip.final{color:var(--no);border-color:color-mix(in srgb, var(--no) 40%, transparent)}
+.src{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto}
+h2{font-family:var(--display);font-weight:600;font-size:22px;line-height:1.2;margin:0;text-wrap:balance;letter-spacing:-.01em}
+.visual{background:var(--sunk);border-radius:12px;padding:10px;overflow-x:auto}
+.visual svg{display:block;width:100%;height:auto;min-width:300px}
+.visual .f-card{fill:var(--card)} .visual .f-sunk{fill:var(--sunk)} .visual .f-ink{fill:var(--ink)}
+.visual .f-muted{fill:var(--muted)} .visual .f-wait{fill:var(--waiting)} .visual .f-ok{fill:var(--ok)} .visual .f-no{fill:var(--no)}
+.visual .f-pick{fill:var(--pick)} .visual .s-line{stroke:var(--line);fill:none} .visual .s-ink{stroke:var(--ink);fill:none}
+.visual .s-muted{stroke:var(--muted);fill:none} .visual .s-wait{stroke:var(--waiting);fill:none} .visual .s-pick{stroke:var(--pick-line);fill:none}
+.visual text{font-family:var(--body);font-size:11px;fill:var(--muted)} .visual text.t-ink{fill:var(--ink);font-weight:600} .visual text.t-on{fill:var(--card);font-weight:600}
+.opts{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}
+.opt{border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;gap:2px}
+.opt.pick{background:var(--pick);border-color:var(--pick-line)}
+.opt .lab{font-weight:600}
+.opt .why{color:var(--muted);font-size:13.5px}
+.mypick{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--ink)}
+.yesno{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px}
+.yesno div{background:var(--sunk);border-radius:10px;padding:8px 10px;min-width:0}
+.yesno b{display:block;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}
+details{border-top:1px solid var(--line);padding-top:10px}
+summary{cursor:pointer;color:var(--muted);font-size:13.5px}
+summary:focus-visible,button:focus-visible,a:focus-visible,textarea:focus-visible{outline:2px solid var(--waiting);outline-offset:2px}
+.ctx{display:flex;flex-direction:column;gap:8px;margin-top:8px;font-size:14px;user-select:text}
+.ctx blockquote{margin:0;padding-left:10px;border-left:2px solid var(--line);color:var(--muted)}
+.ctx a{color:var(--ink)}
+.answer{display:flex;flex-direction:column;gap:8px}
+button{font:inherit;cursor:pointer;border-radius:12px;padding:12px 14px;border:1px solid var(--line);background:var(--card);color:var(--ink);text-align:left}
+button.primary{background:var(--ink);color:var(--on-accent);border-color:var(--ink);font-weight:600;text-align:center}
+button.quiet{background:transparent;border-color:transparent;color:var(--muted);text-align:center;padding:8px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.row>*{flex:1 1 140px}
+.hint{display:flex;justify-content:space-between;gap:8px;font-size:13px;color:var(--muted)}
+.hint button{padding:8px 12px;font-size:13px}
+.stamp{position:absolute;top:18px;padding:4px 10px;border-radius:8px;font-family:var(--display);font-weight:600;font-size:14px;opacity:0;pointer-events:none;border:2px solid}
+.stamp.right{right:18px;color:var(--ok);border-color:var(--ok)} .stamp.left{left:18px;color:var(--muted);border-color:var(--muted)}
+textarea{font:inherit;width:100%;box-sizing:border-box;min-height:70px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:10px}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(18px + env(safe-area-inset-bottom, 0px));background:var(--ink);color:var(--on-accent);
+  border-radius:12px;padding:10px 12px 10px 16px;display:flex;gap:12px;align-items:center;box-shadow:var(--shadow);max-width:calc(100% - 32px);box-sizing:border-box}
+.toast button{background:transparent;color:var(--on-accent);border-color:color-mix(in srgb, var(--on-accent) 40%, transparent);padding:6px 10px;text-align:center}
+.panel{background:var(--card);border-radius:18px;box-shadow:var(--shadow);padding:20px;display:flex;flex-direction:column;gap:14px}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.stat{background:var(--sunk);border-radius:12px;padding:10px 12px}
+.stat .n{font-family:var(--display);font-weight:600;font-size:24px;font-variant-numeric:tabular-nums}
+.stat .l{font-size:12.5px;color:var(--muted)}
+.done-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
+.done-list li{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:10px 0;border-top:1px solid var(--line)}
+.done-list .q{min-width:0;display:flex;flex-direction:column}
+.done-list .a{color:var(--muted);font-size:13px}
+.done-list button{padding:6px 10px;font-size:13px;flex:0 0 auto}
+.muted{color:var(--muted)}
+.empty{color:var(--muted);text-align:center;padding:40px 10px}
+@media (prefers-reduced-motion: reduce){.card.settle{transition:none}}
+@media (max-width:420px){h2{font-size:20px}.yesno{grid-template-columns:1fr}}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1 id="deck-title">Decision deck</h1>
+    <span class="waiting" id="waiting"></span>
+    <div class="dots" id="dots" aria-hidden="true"></div>
+  </header>
+  <main class="stage" id="stage"><p class="empty" id="loading">Loading the decisions waiting for you…</p></main>
+</div>
+<div class="toast" id="toast" hidden><span id="toast-text"></span><button id="toast-undo" type="button">Undo</button></div>
+
+<script>
+(function(){
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  let db = null, me = null, canAnswer = false;
+  let cards = [], answers = {}, current = null, shownAt = 0, openedCtx = false, toastTimer = null;
+  // High-stakes cards ask for your answer before showing the pick: id -> the option chosen blind.
+  const blindFirst = {};
+
+  // SVG visuals come from the card data; keep shapes and text only.
+  function safeSvg(src){
+    try{
+      const doc = new DOMParser().parseFromString(src, "image/svg+xml");
+      const svg = doc.documentElement;
+      if (!svg || svg.nodeName.toLowerCase() !== "svg") return null;
+      svg.querySelectorAll("script,foreignObject,iframe,image,use,a,style").forEach(n => n.remove());
+      svg.querySelectorAll("*").forEach(n => { for (const a of [...n.attributes]) { if (/^on/i.test(a.name) || /href/i.test(a.name) || a.name === "style") n.removeAttribute(a.name); } });
+      for (const a of [...svg.attributes]) if (/^on/i.test(a.name)) svg.removeAttribute(a.name);
+      svg.setAttribute("role","img");
+      return document.importNode(svg, true);
+    }catch(e){ return null; }
+  }
+
+  const active = (id) => answers[id] && answers[id].active;
+  const pending = () => cards.filter(c => !active(c.id)).sort((a,b) => (((answers[a.id]||{}).deferred||0) - ((answers[b.id]||{}).deferred||0)) || ((a.order||0) - (b.order||0)));
+
+  async function defer(c){
+    if (!db) return;
+    const prev = answers[c.id] || {};
+    const next = Object.assign({card:c.id, active:false, taken_back:0}, prev, {active:false, deferred:(prev.deferred||0) + 1, deferred_at:new Date().toISOString()});
+    answers[c.id] = next; current = null; render();
+    try{ await db.collection("answers").doc(c.id).set(next); }catch(e){ answers[c.id] = prev.card ? prev : undefined; render(); }
+  }
+
+  function renderTop(){
+    const left = pending().length;
+    $("waiting").textContent = cards.length ? (left ? left + " waiting" : "All answered") : "";
+    const dots = $("dots"); dots.replaceChildren();
+    const next = pending()[0];
+    cards.forEach(c => { const d = el("span","dot"); if (active(c.id)) d.classList.add("done"); else if (next && c.id === next.id) d.classList.add("now"); dots.append(d); });
+  }
+
+  function render(){
+    renderTop();
+    const stage = $("stage"); stage.replaceChildren();
+    if (!cards.length){ stage.append(el("p","empty","No decisions in this deck yet. Claude adds them from the terminal.")); return; }
+    const next = pending()[0];
+    if (!next){ current = null; stage.append(summary()); return; }
+    if (!current || current.id !== next.id){ current = next; shownAt = performance.now(); openedCtx = false; }
+    stage.append(cardView(next));
+  }
+
+  function cardView(c){
+    const blind = c.stakes === "high" && !blindFirst[c.id];
+    const swipe = c.mode === "swipe" && c.reversible !== false && c.stakes !== "high";
+    const card = el("article","card"); card.setAttribute("aria-label", c.question || "Decision");
+    const meta = el("div","meta");
+    meta.append(el("span","src", c.source || ""));
+    meta.append(el("span", "chip " + (c.reversible === false ? "final" : "undo"), c.reversible === false ? "Can't be undone" : "Can be undone"));
+    meta.append(el("span","chip", swipe ? "Test: swipe" : "Test: buttons"));
+    card.append(meta);
+    card.append(el("h2", null, c.question || ""));
+    if (c.visual){ const svg = safeSvg(c.visual); if (svg){ const v = el("div","visual"); v.append(svg); card.append(v); } }
+    const opts = el("ul","opts");
+    (c.options || []).forEach(o => {
+      const li = el("li","opt" + (!blind && o.id === c.pick ? " pick" : ""));
+      if (!blind && o.id === c.pick) li.append(el("span","mypick","My pick"));
+      li.append(el("span","lab", o.label || ""));
+      if (o.why) li.append(el("span","why", o.why));
+      opts.append(li);
+    });
+    card.append(opts);
+    if (blind) card.append(el("p","muted","This one matters more, so choose first. I show my pick after."));
+    if (!blind && (c.with_yes || c.with_no)){
+      const yn = el("div","yesno");
+      if (c.with_yes){ const d = el("div"); d.append(el("b",null,"With my pick")); d.append(document.createTextNode(c.with_yes)); yn.append(d); }
+      if (c.with_no){ const d = el("div"); d.append(el("b",null,"Without it")); d.append(document.createTextNode(c.with_no)); yn.append(d); }
+      card.append(yn);
+    }
+    if (c.context || c.quote || (c.sources && c.sources.length)){
+      const det = el("details"); det.append(el("summary",null,"All the context"));
+      const ctx = el("div","ctx");
+      if (c.context) String(c.context).split(/\n\n+/).forEach(p => ctx.append(el("p",null,p)));
+      if (c.quote && c.quote.text){ const q = el("blockquote",null,"«" + c.quote.text + "»" + (c.quote.from ? " — " + c.quote.from : "")); ctx.append(q); }
+      if (c.sources && c.sources.length){
+        const s = el("p","muted"); s.append(document.createTextNode("Sources: "));
+        c.sources.forEach((src,i) => { if (i) s.append(document.createTextNode(" · ")); if (/^https:\/\//.test(src.url||"")){ const a = el("a",null,src.label||src.url); a.href = src.url; a.target = "_blank"; a.rel = "noopener"; s.append(a); } else s.append(document.createTextNode(src.label||"")); });
+        ctx.append(s);
+      }
+      [...ctx.querySelectorAll("p")].forEach(p => p.style.margin = "0");
+      det.append(ctx);
+      det.addEventListener("toggle", () => { if (det.open) openedCtx = true; });
+      card.append(det);
+    }
+    const pickOpt = (c.options||[]).find(o => o.id === c.pick);
+    const others = (c.options||[]).filter(o => o.id !== c.pick);
+    const answer = el("div","answer");
+    if (!canAnswer){
+      answer.append(el("p","muted","Only the person this deck is for can answer it."));
+    } else if (blind){
+      (c.options||[]).forEach(o => { const b = el("button",null,o.action || o.label); b.type = "button";
+        b.onclick = () => { if (o.id === c.pick){ choose(c, o, "button", "", {blind_choice:o.id, agreed_blind:true}); } else { blindFirst[c.id] = o; render(); } };
+        answer.append(b); });
+      const other = el("button","quiet","Something else…"); other.type = "button"; other.onclick = () => showNote(answer, c, "button");
+      answer.append(other);
+    } else if (blindFirst[c.id]){
+      const mine = blindFirst[c.id];
+      answer.append(el("p",null,"You chose «" + (mine.action || mine.label) + "». My pick is marked above."));
+      const keep = el("button","primary","Keep mine: " + (mine.action || mine.label)); keep.type = "button";
+      keep.onclick = () => choose(c, mine, "button", "", {blind_choice:mine.id, agreed_blind:false});
+      const sw = el("button",null,"Switch to yours: " + (pickOpt ? (pickOpt.action || pickOpt.label) : "")); sw.type = "button";
+      sw.onclick = () => choose(c, pickOpt, "button", "", {blind_choice:mine.id, agreed_blind:false});
+      answer.append(keep, sw);
+    } else if (swipe){
+      const hint = el("div","hint");
+      const l = el("button",null,"← Other options"); l.type = "button"; l.onclick = () => showOthers(answer, c, others, "button");
+      const r = el("button",null,"Take my pick →"); r.type = "button"; r.onclick = () => choose(c, pickOpt, "button");
+      hint.append(l, r); answer.append(hint);
+      answer.append(el("p","muted","Swipe right to take my pick, left to see the others. Arrow keys work too."));
+      const sr = el("span","stamp right", pickOpt ? (pickOpt.action || "Yes") : "Yes"), sl = el("span","stamp left","Other");
+      card.append(sr, sl);
+      attachSwipe(card, sr, sl, () => choose(c, pickOpt, "swipe"), () => showOthers(answer, c, others, "swipe"));
+    } else {
+      const p = el("button","primary", pickOpt ? (pickOpt.action || pickOpt.label) : "Yes"); p.type = "button"; p.onclick = () => choose(c, pickOpt, "button");
+      answer.append(p);
+      const row = el("div","row");
+      others.forEach(o => { const b = el("button",null,o.action || o.label); b.type = "button"; b.onclick = () => choose(c, o, "button"); row.append(b); });
+      if (others.length) answer.append(row);
+      const other = el("button","quiet","Something else…"); other.type = "button"; other.onclick = () => showNote(answer, c, "button");
+      answer.append(other);
+    }
+    if (canAnswer && pending().length > 1){ const later = el("button","quiet","Decide later"); later.type = "button"; later.onclick = () => defer(c); answer.append(later); }
+    card.append(answer);
+    return card;
+  }
+
+  function showOthers(answer, c, others, via){
+    answer.replaceChildren();
+    answer.append(el("p","muted","Which one, then?"));
+    others.forEach(o => { const b = el("button",null,o.action || o.label); b.type = "button"; b.onclick = () => choose(c, o, via); answer.append(b); });
+    const back = el("button","quiet","Back to my pick"); back.type = "button"; back.onclick = () => render();
+    const other = el("button","quiet","Something else…"); other.type = "button"; other.onclick = () => showNote(answer, c, via);
+    answer.append(other, back);
+    const first = answer.querySelector("button"); if (first) first.focus();
+  }
+
+  function showNote(answer, c, via){
+    answer.replaceChildren();
+    const t = el("textarea"); t.id = "note-" + c.id; t.placeholder = "What do you want instead? A few words is enough.";
+    const send = el("button","primary","Send this answer"); send.type = "button";
+    send.onclick = () => { const v = t.value.trim(); if (!v){ t.focus(); return; } choose(c, {id:"other", label:v}, via, v); };
+    const back = el("button","quiet","Back"); back.type = "button"; back.onclick = () => render();
+    answer.append(t, send, back); t.focus();
+  }
+
+  function attachSwipe(card, sr, sl, onRight, onLeft){
+    let x0 = null, y0 = 0, dx = 0, id = null;
+    const reset = () => { card.classList.add("settle"); card.style.transform = ""; sr.style.opacity = 0; sl.style.opacity = 0; };
+    card.addEventListener("pointerdown", (e) => {
+      if (e.target.closest("button,a,summary,textarea,details[open] .ctx")) return;
+      x0 = e.clientX; y0 = e.clientY; dx = 0; id = e.pointerId; card.classList.remove("settle"); card.classList.add("dragging");
+    });
+    card.addEventListener("pointermove", (e) => {
+      if (x0 === null || e.pointerId !== id) return;
+      dx = e.clientX - x0; const dy = e.clientY - y0;
+      if (Math.abs(dx) < 8 || Math.abs(dy) > Math.abs(dx) * 1.2 && Math.abs(dx) < 30) return;
+      try{ card.setPointerCapture(id); }catch(_){}
+      const rot = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : dx / 24;
+      card.style.transform = "translateX(" + dx + "px) rotate(" + rot + "deg)";
+      sr.style.opacity = Math.max(0, Math.min(1, dx / 110)); sl.style.opacity = Math.max(0, Math.min(1, -dx / 110));
+    });
+    const end = () => {
+      if (x0 === null) return; card.classList.remove("dragging"); x0 = null;
+      const w = card.getBoundingClientRect().width;
+      if (dx > Math.min(120, w * .3)){ card.classList.add("settle"); card.style.transform = "translateX(" + (w + 60) + "px) rotate(8deg)"; card.style.opacity = 0; setTimeout(onRight, 180); }
+      else if (dx < -Math.min(120, w * .3)){ reset(); onLeft(); }
+      else reset();
+    };
+    card.addEventListener("pointerup", end); card.addEventListener("pointercancel", end);
+  }
+
+  async function choose(c, opt, via, note, extra){
+    if (!opt || !db) return;
+    const prev = answers[c.id] || {};
+    const doc = {
+      card: c.id, choice: opt.id, label: opt.label || "", followed_pick: opt.id === c.pick,
+      ms: Math.round(performance.now() - shownAt), opened_context: openedCtx,
+      mode: c.mode || "buttons", via, note: note || "", at: new Date().toISOString(),
+      active: true, taken_back: prev.taken_back || 0, by: me || "", stakes: c.stakes || "normal"
+    };
+    if (extra) Object.assign(doc, extra);
+    answers[c.id] = doc; current = null; render();
+    showToast("Saved: " + (opt.action || opt.label), c.id);
+    try{ await db.collection("answers").doc(c.id).set(doc); }
+    catch(e){ answers[c.id] = prev.card ? prev : undefined; render(); showToast("Couldn't save that answer: " + (e && e.code || "error") + ". Try again.", null); }
+  }
+
+  async function takeBack(id){
+    const a = answers[id]; if (!a || !db) return;
+    const next = Object.assign({}, a, {active:false, taken_back:(a.taken_back||0) + 1, taken_back_at:new Date().toISOString()});
+    answers[id] = next; current = null; hideToast(); render();
+    try{ await db.collection("answers").doc(id).set(next); }catch(e){ answers[id] = a; render(); }
+  }
+
+  function showToast(text, id){
+    clearTimeout(toastTimer); $("toast-text").textContent = text;
+    const u = $("toast-undo"); u.hidden = !id; u.onclick = () => takeBack(id);
+    $("toast").hidden = false; toastTimer = setTimeout(hideToast, 6000);
+  }
+  function hideToast(){ $("toast").hidden = true; }
+
+  function summary(){
+    const p = el("section","panel");
+    p.append(el("h2",null,"Deck answered"));
+    const done = cards.map(c => answers[c.id]).filter(a => a && a.active);
+    const secs = done.map(a => a.ms/1000).sort((a,b) => a-b);
+    const median = secs.length ? secs[Math.floor((secs.length-1)/2)] : 0;
+    const stats = el("div","stats");
+    const stat = (n,l) => { const s = el("div","stat"); s.append(el("div","n",n), el("div","l",l)); stats.append(s); };
+    stat(Math.round(median) + " s", "median time per card");
+    stat(done.filter(a => a.followed_pick).length + " of " + done.length, "took my pick");
+    stat(String(done.filter(a => a.opened_context).length), "opened the full context");
+    stat(String(cards.reduce((n,c) => n + ((answers[c.id]||{}).taken_back||0), 0)), "answers taken back");
+    p.append(stats);
+    p.append(el("p","muted","Claude reads these answers from the terminal and writes each one into its plan. You can take one back until then."));
+    const ul = el("ul","done-list");
+    cards.forEach(c => { const a = answers[c.id]; if (!a) return;
+      const li = el("li"); const q = el("div","q"); q.append(el("span",null,c.question), el("span","a",(a.followed_pick ? "My pick: " : "You chose: ") + a.label));
+      const b = el("button",null,"Take back"); b.type = "button"; b.onclick = () => takeBack(c.id);
+      li.append(q, b); ul.append(li); });
+    p.append(ul);
+    return p;
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (!current || !canAnswer || e.target.closest("textarea")) return;
+    const swipe = current.mode === "swipe" && current.reversible !== false && current.stakes !== "high";
+    if (!swipe) return;
+    const pickOpt = (current.options||[]).find(o => o.id === current.pick);
+    if (e.key === "ArrowRight"){ e.preventDefault(); choose(current, pickOpt, "key"); }
+    if (e.key === "ArrowLeft"){ e.preventDefault(); const a = document.querySelector(".card .answer"); if (a) showOthers(a, current, (current.options||[]).filter(o => o.id !== current.pick), "key"); }
+  });
+
+  async function start(){
+    const timer = setTimeout(() => { if (!cards.length) $("loading").textContent = "The decisions didn't load. Reopen the page to try again."; }, 10000);
+    db = await window.claude?.use?.("db").catch(() => null);
+    const user = await window.claude?.use?.("user").catch(() => null);
+    if (!db){ clearTimeout(timer); $("loading").textContent = "Sign in to claude.ai to see and answer this deck."; return; }
+    try{ me = user ? await user.id() : ""; }catch(_){ me = ""; }
+    try{ canAnswer = user ? !!(await user.canEdit()) : false; }catch(_){ canAnswer = false; }
+    db.doc("deck/meta").onSnapshot(s => { const d = s.exists && s.data(); if (d && d.title){ $("deck-title").textContent = d.title; } }, () => {});
+    db.collection("cards").onSnapshot(snap => {
+      clearTimeout(timer);
+      cards = snap.docs.map(d => Object.assign({id:d.id}, d.data())).sort((a,b) => (a.order||0) - (b.order||0));
+      render();
+    }, (e) => { clearTimeout(timer); $("loading").textContent = "The decisions didn't load (" + (e && e.code || "error") + "). Reopen the page to try again."; });
+    db.collection("answers").onSnapshot(snap => {
+      const fresh = {}; snap.docs.forEach(d => fresh[d.id] = d.data()); answers = fresh;
+      if (cards.length) render();
+    }, () => {});
+  }
+  start();
+})();
+</script>

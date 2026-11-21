@@ -1,0 +1,99 @@
+# Template — copy to .github/workflows/plans-map.yml in a consuming repo and set
+# BASE (the land config's baseBranch) and the runner. A workflow cannot be a
+# symlink into a submodule, so this one is copied; the script it runs is not.
+#
+# The map is a PURE FUNCTION of the plan files, so CI computes it rather than
+# checking that a human remembered to. A PR-side staleness check cost more than it
+# caught: two PRs that each add a plan make each other's MERGE stale while both
+# branches are individually in sync, and neither author can fix that. So a PR only
+# VALIDATES (a malformed `**Gate:**` is an author error that must not reach the
+# base — the generator exits before writing, so it cannot repair one afterwards),
+# and the base branch regenerates.
+name: Plans map
+
+on:
+  push:
+    branches: [develop] # BASE
+    paths:
+      - 'docs/plans/**'
+      # A release cut changes the map without touching a plan: the cycle header,
+      # every `Advanced` value and the `Waiting on release` sections derive from the
+      # newest `## vX.Y.Z` heading in CHANGELOG.md.
+      - 'CHANGELOG.md'
+      - 'AGENTS.md'
+      - '.agents/_shared'
+      - '.github/workflows/plans-map.yml'
+  pull_request:
+    paths:
+      - 'docs/plans/**'
+      - 'AGENTS.md'
+      - '.agents/_shared'
+      - '.github/workflows/plans-map.yml'
+
+# Two pushes landing together would race to regenerate and one would reject the
+# other's push. Queue rather than cancel: the second run must actually happen.
+concurrency:
+  group: plans-map-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Shallow on purpose: `--validate` returns before anything git-dependent.
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          # setup-node v5 enables package-manager caching on its own when package.json
+          # declares `packageManager`, then fails with "Unable to locate executable
+          # file: pnpm". This job runs one dependency-free script; it needs no install.
+          package-manager-cache: false
+      - run: node scripts/plans-map.js --validate
+
+  regenerate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          # `Advanced` walks every plan's history and dates cycles by the commit that
+          # introduced each CHANGELOG heading; the script refuses a shallow clone.
+          # Not `filter: blob:none` either — the CHANGELOG pickaxe needs the blobs.
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          # setup-node v5 enables package-manager caching on its own when package.json
+          # declares `packageManager`, then fails with "Unable to locate executable
+          # file: pnpm". This job runs one dependency-free script; it needs no install.
+          package-manager-cache: false
+      # Still FAILS on an invalid block: that is an author error a human must fix.
+      - run: node scripts/plans-map.js
+      - name: Commit the regenerated map
+        run: |
+          set -euo pipefail
+          # `git status`, not `git diff --quiet`: diff ignores untracked files, so the
+          # FIRST map — a new file — read as "in sync" and was never committed.
+          if [ -z "$(git status --porcelain -- docs/plans/_plans-map.md)" ]; then
+            echo "map already in sync — nothing to commit"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add docs/plans/_plans-map.md
+          git commit -m 'docs(plans): regenerate the plans map [skip ci]'
+          # A push made with GITHUB_TOKEN triggers no workflows, so this cannot
+          # re-enter itself or fire the base branch's deploy. Rebase first: a plan
+          # edit landing while this ran would otherwise reject the push.
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

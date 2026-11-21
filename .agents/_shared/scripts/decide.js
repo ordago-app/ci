@@ -23,13 +23,24 @@
 
 const EXIT = { MERGED: 0, CI_RED: 10, CHANGES_REQUESTED: 20, NEEDS_HUMAN: 30, PREFLIGHT: 40 };
 
+/**
+ * How many times one head may leave the merge queue unmerged before it is the
+ * author's problem. Two, not one: the queue runs the full suite, emulators
+ * included, and a single flaky lane would otherwise hand a sound PR back. A
+ * second removal on the same head is no longer a coin flip.
+ */
+const MAX_QUEUE_ATTEMPTS = 2;
+
 const ACTION = {
   PUSH: 'push',
   OPEN_PR: 'open-pr',
   WAIT_CHECKS: 'wait-checks',
   WAIT_REVIEW: 'wait-review',
   REBASE: 'rebase',
+  INTEGRATION_CHECK: 'integration-check',
   MERGE: 'merge',
+  ENQUEUE: 'enqueue',
+  WAIT_QUEUE: 'wait-queue',
   DELETE_REMOTE: 'delete-remote-branch',
 };
 
@@ -152,18 +163,6 @@ function decide(s) {
         '  runner cache, a starved lane — is not a regression to "fix".',
     };
   }
-  if (s.ciWillRun && (s.checks.state === 'none' || s.checks.state === 'pending')) {
-    if (s.checksDeadlinePassed) {
-      return {
-        exit: EXIT.NEEDS_HUMAN,
-        why: 'CI never settled within the timeout',
-        detail:
-          'A conflicting PR is already ruled out above, so the run was dispatchable.\n' +
-          '  Investigate by hand — a lane may be starved of runners.',
-      };
-    }
-    return { action: ACTION.WAIT_CHECKS, why: `checks are ${s.checks.state}` };
-  }
 
   // --- review ---------------------------------------------------------------
   // The cap is a budget, and each repo declares what running out of it MEANS.
@@ -177,6 +176,11 @@ function decide(s) {
   //               however many rounds were spent.
   const reviewSpent = s.roundsExhausted === 'merge' && s.review.rounds >= s.maxReviewRounds;
 
+  // Findings are reported as soon as they land, WITHOUT waiting for CI. The
+  // reviewer is triggered by the fast lanes, so its findings usually arrive while
+  // the heavy lane is still queued: the fix push cancels that run for free, where
+  // waiting for it first would spend the scarcest lane on a head already known
+  // to be superseded.
   if (!reviewSpent && s.review.state === 'changes_requested') {
     if (s.review.rounds >= s.maxReviewRounds) {
       return {
@@ -191,6 +195,42 @@ function decide(s) {
       detail: `${s.review.body}\n\n  Fix the cause, not the symptom. Do not silence the finding.`,
     };
   }
+
+  // --- a base that moved into this diff --------------------------------------
+  // Asked BEFORE any wait, not after the PR is green and approved. File overlap
+  // with the base only grows until the branch is rebased, so a PR that needs a
+  // rebase now will still need it at the merge — and rebasing there throws away
+  // a finished CI run (often hours of queue on the heavy lane) and the review
+  // bound to the old head. Rebasing now cancels a run that is usually still
+  // queued. After the red-CI and changes-requested exits, so a PR with work
+  // outstanding goes back to its author first: rebasing it now would buy a
+  // review of a head that is about to change anyway.
+  if (s.base.needsRebase) {
+    return {
+      action: ACTION.REBASE,
+      why: `the base moved into this diff (${s.base.overlap.length} overlapping, ${(s.base.forced || []).length} only CI can judge, ${s.base.blast.length} shared)`,
+    };
+  }
+
+  // --- verification, continued ---------------------------------------------
+  if (s.ciWillRun && (s.checks.state === 'none' || s.checks.state === 'pending')) {
+    if (s.checksDeadlinePassed) {
+      return {
+        exit: EXIT.NEEDS_HUMAN,
+        why: 'CI never settled within the timeout',
+        detail: (s.checks.missing || []).length
+          ? `  Required lanes never reported: ${s.checks.missing.join(', ')}.\n` +
+            "  Either their workflow did not dispatch — check that its gate's paths still mirror\n" +
+            "  the workflow's filter — or the lane is not an unconditional job of it, or a lane\n" +
+            '  is starved of runners.'
+          : 'A conflicting PR is already ruled out above, so the run was dispatchable.\n' +
+            '  Investigate by hand — a lane may be starved of runners.',
+      };
+    }
+    return { action: ACTION.WAIT_CHECKS, why: `checks are ${s.checks.state}` };
+  }
+
+  // --- review, continued -----------------------------------------------------
   if (!reviewSpent && s.requireApprovingReview && s.review.state !== 'approved') {
     if (s.reviewDeadlinePassed) {
       return {
@@ -212,23 +252,100 @@ function decide(s) {
     return { action: ACTION.WAIT_REVIEW, why: 'waiting for an approving review on this commit' };
   }
 
-  // --- integration ----------------------------------------------------------
-  // Semantic, not chronological. A branch whose paths do not intersect what the
-  // base changed is still validly green; re-running CI for it buys nothing and
-  // costs the scarcest lane on the host.
-  if (s.base.needsRebase) {
-    return {
-      action: ACTION.REBASE,
-      why: `the base moved into this diff (${s.base.overlap.length} overlapping, ${s.base.blast.length} shared)`,
-    };
-  }
-
   // --- the gate that green cannot answer ------------------------------------
+  // Before the integration check: a gated PR is handed to a human whatever that
+  // check says, so running it first only spends up to its whole timeout for
+  // nothing — a PR touching the rules files would run the widest scope of all.
   if (s.gated.length) {
     return {
       exit: EXIT.NEEDS_HUMAN,
       why: `${bar(s, reviewSpent)}, but this PR is gated — a human merges it`,
       detail: s.gated.map((g) => `  · ${g}`).join('\n') + `\n\n  PR: ${s.pr.url}`,
+    };
+  }
+
+  // --- integration ----------------------------------------------------------
+  // Semantic, not chronological. A branch whose paths do not intersect what the
+  // base changed is still validly green; re-running CI for it buys nothing and
+  // costs the scarcest lane on the host. A move through the shared blast radius
+  // is answered locally, on the merge result, and only once everything else is
+  // settled — the base keeps moving, and the last look is the one that counts.
+  if (s.base.needsIntegrationCheck) {
+    if (s.integration.state === 'pending') {
+      return {
+        action: ACTION.INTEGRATION_CHECK,
+        why: `the base moved through the shared blast radius (${s.base.blast.length} files) — checking the merge result`,
+      };
+    }
+    if (s.integration.state === 'error') {
+      return {
+        exit: EXIT.NEEDS_HUMAN,
+        why: 'the integration check could not run — this says nothing about the PR',
+        detail: [
+          s.integration.output,
+          '',
+          '  A missing tool, a failed install or a timeout on this machine. Fix the machine,',
+          `  then delete the verdict and re-run: ${s.integration.verdictFile}`,
+        ].join('\n'),
+      };
+    }
+    if (s.integration.state === 'fail') {
+      return {
+        exit: EXIT.CI_RED,
+        why: `this PR does not integrate with ${s.baseBranch} as it is now`,
+        detail: [
+          s.integration.output,
+          '',
+          `  The base moved through shared code under this PR. Rebase, fix, and push:`,
+          `    git fetch origin ${s.baseBranch} && git rebase origin/${s.baseBranch}`,
+          '',
+          `  If the output above is an infrastructure failure rather than your code, delete the`,
+          `  verdict and re-run: ${s.integration.verdictFile}`,
+        ].join('\n'),
+      };
+    }
+  }
+
+  // --- the merge queue ------------------------------------------------------
+  // When the base requires a merge queue, GitHub owns integration: it tests this
+  // PR stacked on the base (and on every PR ahead of it) in CI and merges only a
+  // green result. That is why baseMovement() never asks for a rebase or a local
+  // check here — the queue answers both on the real merge result, and a rebase
+  // would only restart a CI run the queue is about to repeat anyway.
+  if (s.queue && s.queue.enabled) {
+    if (s.queue.inQueue) {
+      if (s.queueDeadlinePassed) {
+        return {
+          exit: EXIT.NEEDS_HUMAN,
+          why: `#${s.pr.number} has been in the merge queue past the timeout`,
+          detail: `  The queue's own CI run is stuck or starved. Look at the queue, not the PR.\n\n  PR: ${s.pr.url}`,
+        };
+      }
+      return { action: ACTION.WAIT_QUEUE, why: `in the merge queue${s.queue.position ? ` (position ${s.queue.position})` : ''}` };
+    }
+    if (s.queue.merged) {
+      return { action: ACTION.WAIT_QUEUE, why: 'the queue merged it — waiting for GitHub to mark the PR merged' };
+    }
+    if (s.queue.failures.length >= MAX_QUEUE_ATTEMPTS) {
+      return {
+        exit: EXIT.CI_RED,
+        why: `the merge queue removed this head ${s.queue.failures.length} times — it does not integrate with ${s.baseBranch}`,
+        detail: [
+          ...s.queue.failures.map((f) => `  · ${f.at} — ${f.reason || 'no reason given'}`),
+          '',
+          `  The queue tested this PR on top of ${s.baseBranch} and it failed there, so the`,
+          '  base moved into it. Rebase, run the failing suite, fix, and push:',
+          `    git fetch origin ${s.baseBranch} && git rebase origin/${s.baseBranch}`,
+          '',
+          `  PR: ${s.pr.url}`,
+        ].join('\n'),
+      };
+    }
+    return {
+      action: ACTION.ENQUEUE,
+      why: s.queue.failures.length
+        ? `the queue removed it once (${s.queue.failures[0].reason || 'no reason given'}) — one retry, in case that was a flake`
+        : `${bar(s, reviewSpent)}, and ungated — handing it to the merge queue`,
     };
   }
 
@@ -248,4 +365,4 @@ function bar(s, reviewSpent = false) {
   return s.requireApprovingReview ? 'green and approved' : 'green (no review required here)';
 }
 
-module.exports = { decide, EXIT, ACTION };
+module.exports = { decide, EXIT, ACTION, MAX_QUEUE_ATTEMPTS };
