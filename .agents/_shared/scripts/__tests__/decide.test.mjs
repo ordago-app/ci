@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { decide, EXIT, ACTION } = require('../decide.js');
+const { baseMovement } = require('../pr-land.js');
 
 // The point of extracting decide(): the ENTIRE decision table is now testable
 // with no network, no git, no gh. The pipeline version could only be tested by
@@ -27,7 +28,9 @@ const base = () => ({
   files: ['src/a.ts'],
   ciWillRun: true,
   gated: [],
-  base: { overlap: [], blast: [], needsRebase: false },
+  base: { overlap: [], blast: [], needsRebase: false, needsIntegrationCheck: false },
+  baseTip: 'tip',
+  integration: { state: 'not-needed', output: '', verdictFile: null },
   checksDeadlinePassed: false,
   reviewDeadlinePassed: false,
 });
@@ -191,6 +194,17 @@ test('CI that never settles hands off rather than waiting forever', () => {
   assert.match(d.detail, /starved of runners/);
 });
 
+test('a required lane that never reported is named at the deadline, not guessed at', () => {
+  // The likeliest cause is a gate whose paths drifted from its workflow's filter,
+  // so that is what the message points at first.
+  const missing = 'Lint + typecheck + unit (ordago-console)';
+  const s = withState({ checks: { state: 'pending', failures: [], missing: [missing] }, checksDeadlinePassed: true });
+  const d = decide(s);
+  assert.equal(d.exit, EXIT.NEEDS_HUMAN);
+  assert.ok(d.detail.includes(missing));
+  assert.match(d.detail, /mirror/);
+});
+
 // --- review -----------------------------------------------------------------
 
 test('changes requested → exit 20 with the findings', () => {
@@ -282,12 +296,104 @@ test('a gated PR reports the same bar it actually cleared', () => {
 // --- integration and the gate green cannot answer ---------------------------
 
 test('base moved into this diff → rebase', () => {
-  const s = withState({ base: { overlap: ['src/a.ts'], blast: [], needsRebase: true } });
+  const s = withState({ base: { overlap: ['src/a.ts'], blast: [], needsRebase: true, needsIntegrationCheck: false } });
   assert.equal(decide(s).action, ACTION.REBASE);
 });
 
 test('base moved elsewhere → no rebase, green still holds', () => {
   assert.equal(decide(base()).action, ACTION.MERGE);
+});
+
+// The contract between the two files. decide() read `base.needsRebase` while
+// pr-land's helper returned `rebase`, so REBASE was unreachable from 2026-08-21
+// until this test existed: each side's tests built their own idea of the shape.
+// This one feeds decide() the helper's REAL output.
+test('CONTRACT: decide() acts on what baseMovement() actually returns', () => {
+  const cfg = { sharedBlastRadius: ['packages/shared/'], integrationCheck: { command: 'true', timeoutMs: 1 } };
+  const overlap = withState({ base: baseMovement(['src/a.ts'], ['src/a.ts'], cfg) });
+  assert.equal(decide(overlap).action, ACTION.REBASE);
+  const blast = withState({
+    base: baseMovement(['packages/shared/x.ts'], ['src/a.ts'], cfg),
+    integration: { state: 'pending', output: '', verdictFile: '/v' },
+  });
+  assert.equal(decide(blast).action, ACTION.INTEGRATION_CHECK);
+});
+
+const overlapping = { overlap: ['src/a.ts'], blast: [], needsRebase: true, needsIntegrationCheck: false };
+
+test('a PR that must rebase does it BEFORE waiting on CI, not after it is green', () => {
+  const s = withState({ base: overlapping, checks: { state: 'pending', failures: [] } });
+  assert.equal(decide(s).action, ACTION.REBASE);
+});
+
+test('a PR that must rebase does it before waiting on review', () => {
+  const s = withState({ base: overlapping, review: { state: 'none', rounds: 1, body: '' } });
+  assert.equal(decide(s).action, ACTION.REBASE);
+});
+
+test('findings are reported while CI is still running — the fix push supersedes that run', () => {
+  const s = withState({
+    checks: { state: 'pending', failures: [] },
+    review: { state: 'changes_requested', rounds: 1, body: 'null deref in foo()' },
+  });
+  const d = decide(s);
+  assert.equal(d.exit, EXIT.CHANGES_REQUESTED);
+  assert.match(d.detail, /null deref/);
+});
+
+test('findings go back to the author before a rebase', () => {
+  const s = withState({ base: overlapping, review: { state: 'changes_requested', rounds: 1, body: 'x' } });
+  assert.equal(decide(s).exit, EXIT.CHANGES_REQUESTED);
+});
+
+test('an approval alone still waits for CI', () => {
+  const s = withState({ checks: { state: 'pending', failures: [] } });
+  assert.equal(decide(s).action, ACTION.WAIT_CHECKS);
+});
+
+test('red CI goes back to the author before any rebase', () => {
+  const s = withState({ base: overlapping, checks: { state: 'red', failures: [] } });
+  assert.equal(decide(s).exit, EXIT.CI_RED);
+});
+
+// --- the local integration check --------------------------------------------
+
+const blastOnly = { overlap: [], blast: ['packages/shared/x.ts'], needsRebase: false, needsIntegrationCheck: true };
+
+test('a blast-radius move is checked locally once the PR is green and approved', () => {
+  const s = withState({ base: blastOnly, integration: { state: 'pending', output: '', verdictFile: '/v' } });
+  assert.equal(decide(s).action, ACTION.INTEGRATION_CHECK);
+});
+
+test('the local check waits for CI and review — the base keeps moving until then', () => {
+  const s = withState({
+    base: blastOnly,
+    integration: { state: 'pending', output: '', verdictFile: '/v' },
+    checks: { state: 'pending', failures: [] },
+  });
+  assert.equal(decide(s).action, ACTION.WAIT_CHECKS);
+});
+
+test('a passing merge result merges without a rebase', () => {
+  const s = withState({ base: blastOnly, integration: { state: 'pass', output: '', verdictFile: '/v' } });
+  assert.equal(decide(s).action, ACTION.MERGE);
+});
+
+test('a check that could not run hands over — it says nothing about the PR', () => {
+  const s = withState({ base: blastOnly, integration: { state: 'error', output: 'jq missing', verdictFile: '/v.json' } });
+  const d = decide(s);
+  assert.equal(d.exit, EXIT.NEEDS_HUMAN);
+  assert.match(d.detail, /jq missing/);
+  assert.doesNotMatch(d.detail, /git rebase/, 'never tell the author to fix code over a machine problem');
+});
+
+test('a failing merge result is red, with the output and how to retry', () => {
+  const s = withState({ base: blastOnly, integration: { state: 'fail', output: 'TS2339 foo', verdictFile: '/v.json' } });
+  const d = decide(s);
+  assert.equal(d.exit, EXIT.CI_RED);
+  assert.match(d.detail, /TS2339 foo/);
+  assert.match(d.detail, /git rebase origin\/develop/);
+  assert.match(d.detail, /\/v\.json/);
 });
 
 test('gated paths hand off even when green, approved and current', () => {
@@ -298,11 +404,17 @@ test('gated paths hand off even when green, approved and current', () => {
 });
 
 test('the gate is checked AFTER rebase — a stale gated PR rebases first', () => {
+  const s = withState({ gated: ['firestore.rules — security rules'], base: overlapping });
+  assert.equal(decide(s).action, ACTION.REBASE);
+});
+
+test('a gated PR is handed over BEFORE the integration check — the check cannot change that outcome', () => {
   const s = withState({
     gated: ['firestore.rules — security rules'],
-    base: { overlap: ['x'], blast: [], needsRebase: true },
+    base: blastOnly,
+    integration: { state: 'pending', output: '', verdictFile: '/v' },
   });
-  assert.equal(decide(s).action, ACTION.REBASE);
+  assert.equal(decide(s).exit, EXIT.NEEDS_HUMAN);
 });
 
 // --- purity -----------------------------------------------------------------
@@ -340,4 +452,74 @@ test('SAFETY: protected wins over every other terminal and precondition', () => 
     const s = withState({ ...patch, branch: { ...base().branch, ...(patch.branch || {}), isProtected: true } });
     assert.equal(decide(s).exit, EXIT.PREFLIGHT);
   }
+});
+
+// --- the merge queue ---------------------------------------------------------
+//
+// A base that requires a queue is observed, not configured, and changes what a
+// green PR's last step is: never a direct merge, never a rebase to stay current.
+
+const queued = (q = {}) => ({ id: 'PR_x', enabled: true, inQueue: false, position: null, merged: false, failures: [], ...q });
+
+test('queue: a green, ungated PR is enqueued instead of merged', () => {
+  const d = decide(withState({ queue: queued() }));
+  assert.equal(d.action, ACTION.ENQUEUE);
+});
+
+test('queue: no queue on the base keeps the direct merge', () => {
+  const d = decide(withState({ queue: { ...queued(), enabled: false } }));
+  assert.equal(d.action, ACTION.MERGE);
+});
+
+test('queue: a PR already in the queue waits there', () => {
+  const d = decide(withState({ queue: queued({ inQueue: true, position: 2 }) }));
+  assert.equal(d.action, ACTION.WAIT_QUEUE);
+  assert.match(d.why, /position 2/);
+});
+
+test('queue: stuck in the queue past the timeout goes to a human', () => {
+  const d = decide(withState({ queue: queued({ inQueue: true }), queueDeadlinePassed: true }));
+  assert.equal(d.exit, EXIT.NEEDS_HUMAN);
+});
+
+test('queue: one removal is retried — a single flaky lane must not hand back a sound PR', () => {
+  const d = decide(withState({ queue: queued({ failures: [{ at: 't1', reason: 'CI failed' }] }) }));
+  assert.equal(d.action, ACTION.ENQUEUE);
+  assert.match(d.why, /CI failed/);
+});
+
+test('queue: a PR the queue merged waits for GitHub to say so — never re-enqueued', () => {
+  const d = decide(withState({ queue: queued({ merged: true }) }));
+  assert.equal(d.action, ACTION.WAIT_QUEUE);
+  assert.equal(d.exit, undefined);
+});
+
+test('queue: a second removal of the same head is CI red, with the reasons', () => {
+  const failures = [{ at: 't1', reason: 'CI failed' }, { at: 't2', reason: 'CI failed again' }];
+  const d = decide(withState({ queue: queued({ failures }) }));
+  assert.equal(d.exit, EXIT.CI_RED);
+  assert.match(d.detail, /CI failed again/);
+});
+
+test('queue: a hard-stopped PR is never enqueued', () => {
+  const d = decide(withState({ queue: queued(), gated: ['x — why'] }));
+  assert.equal(d.exit, EXIT.NEEDS_HUMAN);
+});
+
+test('queue: red CI on the PR head is still red — the queue is not a second chance', () => {
+  const d = decide(withState({ queue: queued(), checks: { state: 'red', failures: [] } }));
+  assert.equal(d.exit, EXIT.CI_RED);
+});
+
+test('queue: a conflicting PR still needs its rebase — the queue cannot build it either', () => {
+  const d = decide(withState({ queue: queued(), pr: { ...base().pr, mergeable: 'CONFLICTING' } }));
+  assert.equal(d.exit, EXIT.PREFLIGHT);
+});
+
+test('queue: base movement never rebases or checks locally when a queue is active', () => {
+  const cfg = { rebaseRadius: ['package.json'], sharedBlastRadius: ['packages/shared/'], integrationCheck: null };
+  const m = baseMovement(['package.json', 'src/a.ts', 'packages/shared/x.ts'], ['src/a.ts'], cfg, { queue: true });
+  assert.equal(m.needsRebase, false);
+  assert.equal(m.needsIntegrationCheck, false);
+  assert.equal(baseMovement(['src/a.ts'], ['src/a.ts'], cfg).needsRebase, true, 'without a queue, overlap still rebases');
 });
