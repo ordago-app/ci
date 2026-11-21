@@ -109,12 +109,11 @@ over another org's placement, it is wrong regardless of how much simpler it look
 
 ## Working here — the autonomy contract
 
-**The user is a decider, not a merge gate.** A change should cost them two
-messages: their request, and one decision. The shared `ship-a-feature` skill owns
-the procedure — read the code first, front-load every business and technical
-question into ONE message with your recommended pick on each, take `go` as "all
-your picks", then implement and land without further check-ins. For defects,
-`fix-bug`; for new behaviour, `tdd`; for a vague proposal, `grill-me`.
+<!-- base:autonomy -->
+**The user is a decider, not a merge gate.** A change should cost them two messages: their request, and one decision. The `ship-a-feature` skill owns the full procedure — front-load every business and technical question into ONE message with your recommended pick on each, take `go` as "all your picks", then implement and land without further check-ins.
+<!-- /base:autonomy -->
+
+Read the code first. For defects, `fix-bug`; for new behaviour, `tdd`; for a vague proposal, `grill-me`.
 
 **Two work modes — classify from the diff, never ask which:**
 
@@ -157,12 +156,12 @@ pass*, not *is the blast radius acceptable*.
   to a role interface that a consumer's pin bump would have to react to. None of
   these is a file path; they are the design.
 
-**This repo overrides two `superpowers` skills.** `superpowers:brainstorming`'s
-one-question-per-message rule and `superpowers:finishing-a-development-branch`'s
-stop-and-ask merge menu are superseded by `ship-a-feature`. Every other
-superpowers skill (`systematic-debugging`, `verification-before-completion`, …)
-still applies. Brainstorm output lands in `docs/plans/ideas/<topic>.md`, no date
-prefix — not under `docs/superpowers/`.
+<!-- base:superpowers -->
+**This repo overrides two `superpowers` skills.** `superpowers:brainstorming`'s one-question-per-message rule and `superpowers:finishing-a-development-branch`'s stop-and-ask merge menu are **superseded by `ship-a-feature`** — do not run those flows for work in this repo. Every other superpowers skill (`systematic-debugging`, `test-driven-development`, …) still applies.
+<!-- /base:superpowers -->
+
+Brainstorm output lands in `docs/plans/ideas/<topic>.md`, no date prefix — not under
+`docs/superpowers/`.
 
 **Be proactive.** End a response with a one-line suggestion when you notice a
 manual operation done twice (→ `scripts/`), a workflow worth encoding (→ a
@@ -190,6 +189,12 @@ with another operator, so nothing from the others comes here.
 
 ## Shared agent setup
 
+<!-- base:setup -->
 `AGENTS.md` is the shared instruction entry point. Project skills live in
 `.agents/skills/`; `.claude/skills` points to that directory. See
 [`.agents/README.md`](.agents/README.md) for discovery requirements and dependencies.
+
+Text between `<!-- base:… -->` markers in this file is a copy of a section of
+[agent-skills `base/`](https://github.com/alvaro-francisco-gil/agent-skills/tree/main/base).
+Change it there, never here: the next sync overwrites a local edit.
+<!-- /base:setup -->
