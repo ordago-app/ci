@@ -32,6 +32,13 @@ missed them the same way. Two hours later, `make ci-status` showed 1 of 15 lanes
 nothing deferred. Later runs on other refs were served normally. So the sweep must judge
 by the job's status, whatever status the run itself reports.
 
+The fix that worked before — cancel, then rerun — worked for the PR run but not for the
+`develop` run. Rerun that run once more (attempt 2) and it stayed `pending`
+with **zero jobs** for at least 4 minutes, and it was missing from the branch's run listing.
+With no jobs, the controller has nothing it could have served. So the cause is on GitHub's
+side, before any job is created. Treat this as a third case: the sweep can only report it,
+not fix it.
+
 ## Proposal
 
 A slow sweep, about every 10 minutes, that does not trust the listing:
