@@ -65,17 +65,16 @@ over another org's placement, it is wrong regardless of how much simpler it look
   reaping, admission or health-check behaviour; most of the non-obvious code here
   exists because of one of them.
 - [`scripts/`](scripts/) — pool operator tooling. `scripts/pr-land.js` is the
-  landing tool (a symlink into the shared submodule, see below).
+  landing tool (a symlink into the shared copy, see below).
 - [`docs/plans/`](docs/plans/) — `ideas/` → `ready/` → `ongoing/`, one file per
   topic, deleted when verified. Rules in [`docs/plans/README.md`](docs/plans/README.md).
 - [`.agents/`](.agents/) — skills (`.claude/skills` is a symlink to
-  `.agents/skills`), the `_shared` submodule, and `land.config.json`.
-  `ship-a-feature` comes from the `_shared` submodule and `managing-plans-lifecycle`
-  from the pinned `agent-plans` files in `.agents/skills/`; both are shared with other
-  repos and carry procedure only; every value specific to this repo lives here
-  and in `land.config.json`. **Run `git submodule update --init` after cloning
-  and in every new worktree** — a missing `_shared` is silent: the skills load
-  as nothing and `node scripts/pr-land.js` fails with `MODULE_NOT_FOUND`.
+  `.agents/skills`), `_shared`, and `land.config.json`. `_shared` is a committed
+  copy of [agent-skills](https://github.com/ghostaff-ai/agent-skills), pinned in
+  `.agents/_shared/VENDORED.md` and never edited here. `ship-a-feature` comes
+  from it and `managing-plans-lifecycle` from the pinned `agent-plans` files in
+  `.agents/skills/`; both are shared with other repos and carry procedure only;
+  every value specific to this repo lives here and in `land.config.json`.
 
 ## Conventions
 
@@ -103,9 +102,8 @@ over another org's placement, it is wrong regardless of how much simpler it look
   `add -A`/`add .`, `worktree remove`, and hook-bypass flags, *even in a
   throwaway worktree*. Allow read-only `status`/`diff`/`log`/`show` and have them
   report BLOCKED rather than attempt one. Reaping a worktree is the dispatcher's
-  job, and this repo has a submodule, so `git worktree remove` refuses outright —
-  verify the worktree is clean and merged, then `rm -rf` it and
-  `git worktree prune`; never `--force`.
+  job: verify the worktree is clean and merged, then `git worktree remove` it;
+  never `--force`.
 
 ## Working here — the autonomy contract
 
