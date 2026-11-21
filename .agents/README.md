@@ -21,8 +21,10 @@ instructions locally: repository-specific policy belongs in `AGENTS.md`. This co
 a plans-lifecycle plugin install; if you also installed that plugin globally, disable it for
 this project to avoid exposing two copies.
 
-Existing shared skills may link into `.agents/_shared`. Run
-`git submodule update --init --recursive` after cloning and in new worktrees.
+Shared skills and scripts link into `.agents/_shared`, a committed copy of
+[agent-skills](https://github.com/ghostaff-ai/agent-skills) pinned in
+`.agents/_shared/VENDORED.md`. Refresh it with the workspace's `vendor-agent-skills.py`,
+never by hand. It is not a submodule: a clone or a worktree needs no init step.
 
 References: [Claude instructions](https://code.claude.com/docs/en/memory#read-agentsmd),
 [Claude skills](https://code.claude.com/docs/en/skills),

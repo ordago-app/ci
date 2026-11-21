@@ -1,3 +1,0 @@
-[submodule ".agents/_shared"]
-	path = .agents/_shared
-	url = https://github.com/alvaro-francisco-gil/agent-skills.git

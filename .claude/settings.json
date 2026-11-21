@@ -34,8 +34,6 @@
       "Bash(git stash*)",
       "Bash(git check-ignore*)",
       "Bash(git worktree list*)",
-      "Bash(git submodule status*)",
-      "Bash(git submodule update --init*)",
       "Bash(gh pr view*)",
       "Bash(gh pr list*)",
       "Bash(gh pr diff*)",
