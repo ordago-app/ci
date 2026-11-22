@@ -83,12 +83,49 @@ def test_installation_token_is_cached() -> None:
     assert inst.call_count == 1  # second call served from cache
 
 
+def _mock_no_pending_runs() -> None:
+    respx.get(
+        "https://api.github.com/repos/o/r/actions/runs",
+        params={"status": "pending", "per_page": "50"},
+    ).mock(return_value=httpx.Response(200, json={"workflow_runs": []}))
+
+
+@respx.mock
+def test_list_queued_jobs_finds_a_queued_job_of_a_pending_run() -> None:
+    """GitHub may report a run `pending` while its job waits for a runner; such a run is
+    absent from the `status=queued` listing and was never admitted (2026-11-21/22)."""
+    _mock_installation()
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
+    )
+    respx.get(
+        "https://api.github.com/repos/o/r/actions/runs",
+        params={"status": "queued", "per_page": "50"},
+    ).mock(return_value=httpx.Response(200, json={"workflow_runs": []}))
+    respx.get(
+        "https://api.github.com/repos/o/r/actions/runs",
+        params={"status": "pending", "per_page": "50"},
+    ).mock(
+        return_value=httpx.Response(200, json={"workflow_runs": [{"id": 777, "head_sha": "abc"}]})
+    )
+    respx.get("https://api.github.com/repos/o/r/actions/runs/777/jobs").mock(
+        return_value=httpx.Response(
+            200, json={"jobs": [{"id": 9, "status": "queued", "labels": ["self-hosted"]}]}
+        )
+    )
+
+    (job,) = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).list_queued_jobs("o/r")
+
+    assert (job.job_id, job.run_id) == (9, 777)
+
+
 @respx.mock
 def test_list_queued_jobs() -> None:
     _mock_installation()
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
+    _mock_no_pending_runs()
     respx.get(
         "https://api.github.com/repos/o/r/actions/runs",
         params={"status": "queued", "per_page": "50"},
@@ -122,6 +159,7 @@ def test_queued_jobs_carry_workflow_and_job_name() -> None:
     respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
         return_value=httpx.Response(201, json={"token": "ghs_inst", "expires_at": _future_iso()})
     )
+    _mock_no_pending_runs()
     respx.get(
         "https://api.github.com/repos/o/r/actions/runs",
         params={"status": "queued", "per_page": "50"},
@@ -653,6 +691,18 @@ def test_queued_jobs_carry_their_run_and_head() -> None:
     (job,) = GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).list_queued_jobs("o/r")
 
     assert (job.run_id, job.head_sha, job.pinned) == (5, "cafe", True)
+
+
+@respx.mock
+def test_cancel_queued_run_cancels_a_pending_run_none_of_whose_jobs_started() -> None:
+    _mock_token()
+    _mock_run("pending", "queued")
+    cancel = respx.post("https://api.github.com/repos/o/r/actions/runs/5/cancel").mock(
+        return_value=httpx.Response(202, json={})
+    )
+
+    assert GitHubAdapter(app_id="9", private_key_pem=TEST_KEY).cancel_queued_run("o/r", 5)
+    assert cancel.called
 
 
 def _mock_run(status: str, *job_statuses: str) -> None:

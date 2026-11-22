@@ -33,6 +33,8 @@ class AppNotInstalled(RuntimeError):
 _API_VERSION = "2026-03-10"
 
 RUNNER_PAGE_SIZE = 100
+# The run statuses GitHub gives a run whose jobs are waiting for a runner.
+WAITING_RUN_STATUSES = ("queued", "pending")
 # A repo would need >1000 registered runners to hit this. The bound exists so a
 # pathological (or corrupted) listing cannot spend the installation token's hourly
 # budget on one tick; hitting it yields an explicitly incomplete listing, not a
@@ -206,15 +208,25 @@ class GitHubAdapter:
         return str(conclusion) if conclusion else None
 
     def list_queued_jobs(self, repo: str) -> list[QueuedJob]:
-        runs_resp = self._repo_request(
-            "GET",
-            repo,
-            f"{self._base_url}/repos/{repo}/actions/runs",
-            params={"status": "queued", "per_page": 50},
-        )
-        runs_resp.raise_for_status()
+        """Every queued job of the repo's waiting runs.
+
+        A run whose job waits for a runner is reported `queued` or `pending` by GitHub,
+        and which one it picks is not ours to know: on 2026-11-21 and 2026-11-22 runs
+        sat `pending` for a day with their jobs `queued`, invisible to a `status=queued`
+        listing. So both listings are read and the job's own status decides."""
+        runs: dict[int, dict[str, Any]] = {}
+        for status in WAITING_RUN_STATUSES:
+            runs_resp = self._repo_request(
+                "GET",
+                repo,
+                f"{self._base_url}/repos/{repo}/actions/runs",
+                params={"status": status, "per_page": 50},
+            )
+            runs_resp.raise_for_status()
+            for run in runs_resp.json().get("workflow_runs", []):
+                runs.setdefault(int(run["id"]), run)
         jobs: list[QueuedJob] = []
-        for run in runs_resp.json().get("workflow_runs", []):
+        for run in runs.values():
             jobs_resp = self._repo_request(
                 "GET", repo, f"{self._base_url}/repos/{repo}/actions/runs/{run['id']}/jobs"
             )
@@ -249,7 +261,7 @@ class GitHubAdapter:
             "GET", repo, f"{self._base_url}/repos/{repo}/actions/runs/{run_id}"
         )
         resp.raise_for_status()
-        if resp.json().get("status") != "queued":
+        if resp.json().get("status") not in WAITING_RUN_STATUSES:
             return False
         for page in range(1, MAX_JOBS_PAGES + 1):
             jobs_resp = self._repo_request(
