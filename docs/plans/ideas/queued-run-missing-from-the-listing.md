@@ -24,24 +24,23 @@ until GitHub's 24-hour expiry.
 **Workaround that worked:** `gh run cancel <id>`, then `gh run rerun <id>`.
 After that, attempt 2 appeared in the `status=queued` listing within 20 seconds.
 
-**Seen again on 2026-11-21, in a second form.** Three runs in an operator repo were created
-between 11:17 and 12:20 UTC, again while the machine was short of memory. They reported
-`status: pending`, not `queued`. Their jobs were `queued` with self-hosted labels and no
-runner. A `pending` run can never appear in a `status=queued` listing, so the controller
-missed them the same way. Two hours later, `make ci-status` showed 1 of 15 lanes busy and
-nothing deferred. Later runs on other refs were served normally. So the sweep must judge
-by the job's status, whatever status the run itself reports.
+**Seen again on 2026-11-21 and 2026-11-22, in a second form — now fixed.** Runs reported
+`status: pending`, not `queued`, while their jobs were `queued` with self-hosted labels and no
+runner. A `pending` run never appears in a `status=queued` listing, so the controller missed
+them: an Órdago `develop` "Plans map" run sat like that from 2026-11-21 13:54 UTC for a day.
+`list_queued_jobs` now reads both the `queued` and the `pending` listings and lets the job's
+own status decide, and `cancel_queued_run` treats a `pending` run like a `queued` one.
 
-The fix that worked before — cancel, then rerun — worked for the PR run but not for the
-`develop` run. Rerun that run once more (attempt 2) and it stayed `pending`
-with **zero jobs** for at least 4 minutes, and it was missing from the branch's run listing.
-With no jobs, the controller has nothing it could have served. So the cause is on GitHub's
-side, before any job is created. Treat this as a third case: the sweep can only report it,
-not fix it.
+What was recorded here as a third case, a rerun that "stayed `pending` with **zero jobs**",
+was not GitHub losing the run. That workflow uses a per-ref `concurrency` group with
+`cancel-in-progress: false`, and GitHub holds a newer run of the group at `pending` with no
+jobs while an older one is unfinished. The older one was the stuck `pending` run above, so the
+newer one waited behind it. Serving the stuck run releases the group; nothing more is needed.
 
 ## Proposal
 
-A slow sweep, about every 10 minutes, that does not trust the listing:
+What is left is the first form: a run that is `queued` but missing from every listing. A slow
+sweep, about every 10 minutes, that does not trust the listing:
 
 1. For each onboarded repo, list open PRs' head SHAs and their check-runs. Check-runs come
    from a different index, and this run's were correct throughout ("config + script suites:
