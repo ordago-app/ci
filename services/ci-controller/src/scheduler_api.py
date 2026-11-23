@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Response
+from typing import Annotated
+
+from fastapi import FastAPI, HTTPException, Path, Response
 
 from src.host_stats import HostStats
 from src.models import AdmitDecision, QueuedJob
@@ -8,15 +10,23 @@ from src.scheduler import LocalScheduler
 from src.scheduler_models import (
     AdoptRequest,
     CommitRequest,
+    HoldList,
+    HoldRequest,
+    HoldWire,
+    HostRamWire,
     LaneList,
     PlanRequest,
     PlanResponse,
     UpdateRequest,
     decision_from_wire,
     decision_to_wire,
+    hold_to_wire,
     reservation_from_wire,
     reservation_to_wire,
 )
+
+# Printed in a table and typed on a command line, so kept to one plain token.
+HoldName = Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")]
 
 
 def create_scheduler_app(scheduler: LocalScheduler) -> FastAPI:
@@ -74,5 +84,28 @@ def create_scheduler_app(scheduler: LocalScheduler) -> FastAPI:
     @app.get("/lanes", response_model=LaneList)
     async def lanes() -> LaneList:
         return LaneList(lanes=[reservation_to_wire(r) for r in scheduler.lanes()])
+
+    @app.put("/holds/{name}", response_model=HoldWire)
+    async def put_hold(name: HoldName, req: HoldRequest) -> HoldWire:
+        try:
+            hold = scheduler.put_hold(
+                name, host=req.host, ram_mb=req.ram_mb, ttl_seconds=req.ttl_seconds
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return hold_to_wire(hold, scheduler.now())
+
+    @app.delete("/holds/{name}", status_code=204)
+    async def release_hold(name: HoldName) -> Response:
+        scheduler.release_hold(name)
+        return Response(status_code=204)
+
+    @app.get("/holds", response_model=HoldList)
+    async def holds() -> HoldList:
+        now = scheduler.now()
+        return HoldList(
+            holds=[hold_to_wire(h, now) for h in scheduler.holds()],
+            hosts={name: HostRamWire(**ram) for name, ram in scheduler.host_ram().items()},
+        )
 
     return app

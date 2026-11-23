@@ -28,7 +28,7 @@ Two containers, split along the credential line (see
   host health bookkeeping and placement decisions.
 
 `ci-controller` talks to the scheduler over HTTP (`/plan`, `/lanes`, `/lanes/adopt`,
-`/lanes/{id}`). Which transport it uses is one env var: `CI_SCHEDULER_URL` set (as
+`/lanes/{id}`, `GET /holds`). Which transport it uses is one env var: `CI_SCHEDULER_URL` set (as
 `compose.yml` sets it here, to `http://ci-scheduler:8001`) selects `HttpScheduler`;
 **unset**, `src/main.py` falls back to an in-process `LocalScheduler` and no `ci-scheduler`
 container is needed at all — the single-operator, single-container deployment this
@@ -98,6 +98,52 @@ every tick and charged `session_ram_mb` each against that host's budget, so revi
 lanes share one capacity model. `/status` reports the count as `review_sessions`; it is
 not part of `ledger_ram_mb`, which sums lanes.
 
+## Host RAM holds
+
+See [ADR 0101](../../docs/decisions/0101-host-ram-holds.md). A **hold** sets RAM aside
+on one pool host for work the pool does not schedule, such as an app release or an
+emulator run on a machine that also runs lanes. Admission charges active holds against
+the host's budget like lanes, so new lanes stop landing there (they defer `budget_full`
+or go to another host). **A hold never evicts a running lane.** Lanes that are already
+running finish normally, and the CLI waits for them.
+
+Holds have a TTL of 60 s to 12 h, and the scheduler keeps them **in memory**: a
+scheduler restart drops every hold. To renew a hold, reserve again under the same name.
+
+```
+docker exec ci-scheduler python -m src.hold_cli reserve --name release --host <host> --gb 9 --ttl 2h [--wait 15m]
+docker exec ci-scheduler python -m src.hold_cli list
+docker exec ci-scheduler python -m src.hold_cli release --name release
+```
+
+`reserve` places the hold. It then checks `GET /holds` every 10 s until that host's
+`lanes_ram_mb + held_ram_mb <= budget_ram_mb`, printing a line each time the numbers
+change. Exit codes:
+
+- `0`: the hold fits (or `--wait 0` was given).
+- `75`: `--wait` ran out while lanes were still draining. The hold **is** in place.
+- `2`: bad arguments, or the scheduler refused the hold (unknown host, TTL out of
+  range, more than the host's whole budget).
+- `69`: the scheduler did not answer after 3 attempts.
+
+If the hold disappears while `reserve` is waiting, for example after a scheduler
+restart, `reserve` places it again. The CLI talks to `CI_SCHEDULER_URL`, which
+defaults to `http://localhost:8001`.
+
+API on the scheduler:
+
+- `PUT /holds/{name}` with body `{host, ram_mb, ttl_seconds}`: creates or renews the
+  hold. Answers 422 for an unknown host, a `ram_mb` of 0 or less or over the host's
+  ceiling, or a TTL outside 60..43200.
+- `DELETE /holds/{name}`: 204, and safe to repeat.
+- `GET /holds`: returns `{holds: [{name, host, ram_mb, expires_at, remaining_seconds}],
+  hosts: {<host>: {budget_ram_mb, lanes_ram_mb, held_ram_mb}}}`. The budget here is the
+  configured ceiling. Expired holds are pruned, so they are never listed or charged.
+
+`/status` reports `hosts[<host>].held_ram_mb` and a top-level `holds` list. `/metrics`
+exports `ci_held_ram_mb`. If the scheduler runs an older pin that has no holds API, both
+fields are `null` and the metric is left out. They never read as 0.
+
 ## Security model
 
 - The controller holds the runner App private key; **lanes never do** (they get only a
@@ -127,5 +173,15 @@ not part of `ledger_ram_mb`, which sums lanes.
   and querying those behind a page that polls every 5s is not a trade worth making.
   Both are null rather than zero when unknown. `deferred[].review` is the head's review
   state, null when github-review has no row for it.
+- `hosts[<host>].unhealthy_reason` in `/status` is null for a host that takes lanes.
+  Otherwise it says why the host takes none:
+  - `unreachable`: the host did not answer ping or list its lanes this tick. After
+    `host_unhealthy_ticks` misses in a row, its lanes are reaped.
+  - `runner_image_missing`: the host answers, but a spawn found its configured
+    `runner_image` absent, and the host's socket proxy cannot pull it (`IMAGES: 0`).
+    The host is left out of admission for `runner_image_missing_cooldown_seconds`
+    (default 600). After that, one spawn tests it again. Its running lanes are left
+    alone. A WARNING names the host and the image when it is benched and when it
+    rejoins. Fix: re-apply the `ci_lane_host` role at this pin on that host.
 - Onboard a repo: `make ci-onboard REPO=owner/name`.
 - Deploy: from the main checkout, `... services.yml --tags ci-controller --diff`.

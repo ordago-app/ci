@@ -7,9 +7,15 @@ from typing import Any
 
 import httpx
 
+from src.holds import Hold
 from src.host_stats import HostStats
 from src.models import AdmitDecision, Decision, QueuedJob, Reservation
-from src.scheduler_models import decision_from_wire, decision_to_wire, reservation_from_wire
+from src.scheduler_models import (
+    decision_from_wire,
+    decision_to_wire,
+    hold_from_wire,
+    reservation_from_wire,
+)
 
 log = logging.getLogger("ci-controller")
 
@@ -114,3 +120,7 @@ class HttpScheduler:
     def lanes(self) -> list[Reservation]:
         data = self._request("GET", "/lanes", retry=True).json()
         return [reservation_from_wire(r) for r in data["lanes"]]
+
+    def holds(self) -> list[Hold]:
+        data = self._request("GET", "/holds", retry=True).json()
+        return [hold_from_wire(h) for h in data["holds"]]

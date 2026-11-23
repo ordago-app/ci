@@ -118,6 +118,9 @@ def create_app(
             f'ci_controller_info{{config_version="{s["config_version"]}",'
             f'admission_mode="{s["admission_mode"]}"}} 1',
         ]
+        # Absent, not 0, while the scheduler predates holds (status() says None).
+        if s["holds"] is not None:
+            lines.append(f"ci_held_ram_mb {sum(h['ram_mb'] for h in s['holds'])}")
         for disk, d in s["disk_gb"].items():
             lines.append(f'ci_disk_used_gb{{disk="{disk}"}} {d["used"]}')
             lines.append(f'ci_disk_budget_gb{{disk="{disk}"}} {d["budget"]}')

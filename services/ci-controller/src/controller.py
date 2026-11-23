@@ -10,8 +10,9 @@ from pathlib import Path
 
 from src.admission import host_pressure_binds, ram_budget_mb
 from src.config import ControllerConfig, HostConfig
-from src.docker_adapter import DockerPool, LaneInfo
+from src.docker_adapter import DockerPool, LaneInfo, RunnerImageMissing
 from src.github_adapter import RUNS_SCAN_LIMIT, GitHubAdapter
+from src.holds import Hold
 from src.host_stats import HostStats
 from src.ledger import Ledger
 from src.metrics import MetricsStore
@@ -45,6 +46,11 @@ _REAP_BLOCK_EMIT_EVERY = 20
 # github-review unreachable: said at ERROR on the first failed tick and then every Nth
 # (5 min at the 5 s poll), so a long outage stays visible without one line per tick.
 _REVIEW_UNREACHABLE_LOG_EVERY = 60
+
+
+# /status hosts[...].unhealthy_reason. Null for a host taking lanes.
+UNREACHABLE = "unreachable"
+RUNNER_IMAGE_MISSING = "runner_image_missing"
 
 
 def _now() -> float:
@@ -161,6 +167,12 @@ class Controller:
         # Consecutive failed health checks per host. Declaring a host lost REAPS every
         # lane it holds, so that verdict is debounced; skipping it for admission is not.
         self._unhealthy_ticks: dict[str, int] = {}
+        # Host -> epoch second until which it is kept out of admission because its
+        # runner image is missing. Kept after the cooldown ends, until a spawn there
+        # succeeds, so a re-test that fails again is not reported as a new outage.
+        # Separate from _healthy on purpose: the host still answers and lists its
+        # lanes, so they are neither lost nor reaped -- only new admissions stop.
+        self._image_missing_until: dict[str, float] = {}
 
     @property
     def ledger(self) -> Ledger:
@@ -554,7 +566,7 @@ class Controller:
         decisions = self.scheduler.plan(
             jobs,
             host_stats,
-            self._healthy,
+            self._healthy - self._image_missing_hosts(),
             review_sessions=self._count_review_sessions(),
             ram_offers=self._ram_offers,
         )
@@ -906,6 +918,33 @@ class Controller:
         self._peaks.pop(res.lane_id, None)
         log.info("reaped idle lane %s (%s)", res.lane_id, res.class_name)
 
+    def _image_missing_hosts(self) -> set[str]:
+        """Hosts benched for a missing runner image whose cooldown has not run out."""
+        now = _now()
+        return {host for host, until in self._image_missing_until.items() if until > now}
+
+    def _bench_for_missing_image(self, exc: RunnerImageMissing) -> None:
+        cooldown = self.config.runner_image_missing_cooldown_seconds
+        retest = exc.host in self._image_missing_until
+        self._image_missing_until[exc.host] = _now() + cooldown
+        if retest:
+            log.info(
+                "host %s still lacks runner image %s; out of admission for another %.0fs",
+                exc.host,
+                exc.image,
+                cooldown,
+            )
+            return
+        log.warning(
+            "host %s does not have runner image %s and cannot pull it through its socket "
+            "proxy; it takes no lanes, re-tested every %.0fs. Fix: re-apply the "
+            "ci_lane_host role at this pin on that host. (%s)",
+            exc.host,
+            exc.image,
+            cooldown,
+            exc,
+        )
+
     def _admit(self, decision: AdmitDecision) -> bool:
         """True once the lane exists AND the scheduler holds a reservation for it; the
         caller emits no admit event unless this returns True.
@@ -915,6 +954,8 @@ class Controller:
         False, leaving the job queued and its budget unreserved. `_readopt` closes it on a
         later tick — the container is listed on its host and re-adopted into the ledger,
         with its class read back from `CLASS_LABEL`."""
+        if decision.host in self._image_missing_hosts():
+            return False  # benched earlier this tick; the plan predates that
         try:
             token = self.github.mint_registration_token(decision.job.repo)
             lane_id, container_id = self.docker.for_host(decision.host).spawn(
@@ -926,9 +967,17 @@ class Controller:
                 container_id=container_id,
                 idle_since=_now(),
             )
+        except RunnerImageMissing as exc:
+            self._bench_for_missing_image(exc)
+            return False
         except Exception as exc:  # spawn failure: leave job queued
             log.error("failed to spawn lane for job %s: %s", decision.job.job_id, exc)
             return False
+        if self._image_missing_until.pop(decision.host, None) is not None:
+            log.warning(
+                "host %s spawned a lane again: its runner image is in place, back in admission",
+                decision.host,
+            )
         log.info(
             "admitted job %s (%s) on lane %s (%s)",
             decision.job.job_id,
@@ -966,8 +1015,28 @@ class Controller:
             ),
         }
 
+    def _holds_or_none(self) -> list[Hold] | None:
+        """None when the scheduler predates holds (404). The scheduler may be another
+        operator's deployment at an older pin, and /status is this dispatcher's
+        healthcheck: failing it would restart-loop a dispatcher that dispatches fine.
+        None, not an empty list, so a reader cannot mistake it for "no holds"."""
+        try:
+            return self.scheduler.holds()
+        except KeyError:
+            return None
+
+    def _unhealthy_reason(self, host: str, image_missing: set[str]) -> str | None:
+        if host not in self._healthy:
+            return UNREACHABLE
+        if host in image_missing:
+            return RUNNER_IMAGE_MISSING
+        return None
+
     def status(self) -> dict:
         lanes = self.scheduler.lanes()
+        holds = self._holds_or_none()
+        image_missing = self._image_missing_hosts()
+        now = _now()
         deferred = [d for d in self._last_decisions if isinstance(d, DeferDecision)]
         hosts: dict[str, dict[str, object]] = {}
         for name, host_cfg in self.config.resolved_hosts().items():
@@ -986,7 +1055,14 @@ class Controller:
                 "max_lanes": max_lanes,
                 "ram_mb": _total_ram(on_host),
                 "budget_ram_mb": budget_ram_mb,
-                "healthy": name in self._healthy,
+                "healthy": self._unhealthy_reason(name, image_missing) is None,
+                # Why a host takes no lanes: it did not answer this tick, or it answers
+                # but has no runner image (benched for runner_image_missing_cooldown_seconds).
+                "unhealthy_reason": self._unhealthy_reason(name, image_missing),
+                # RAM operators' holds set aside here (src/holds.py); not in ram_mb.
+                "held_ram_mb": (
+                    None if holds is None else sum(h.ram_mb for h in holds if h.host == name)
+                ),
                 "pressure": self._pressure(name, host_cfg),
             }
         return {
@@ -1081,4 +1157,18 @@ class Controller:
                 for d in deferred
             ],
             "hosts": hosts,
+            "holds": (
+                None
+                if holds is None
+                else [
+                    {
+                        "name": h.name,
+                        "host": h.host,
+                        "ram_mb": h.ram_mb,
+                        "expires_at": h.expires_at,
+                        "remaining_seconds": h.remaining_seconds(now),
+                    }
+                    for h in holds
+                ]
+            ),
         }

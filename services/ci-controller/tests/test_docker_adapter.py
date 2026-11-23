@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import docker.errors
+import pytest
+import requests
 from src.config import ControllerConfig
 from src.docker_adapter import (
     CLASS_LABEL,
@@ -14,6 +16,7 @@ from src.docker_adapter import (
     REVIEW_INSTANCE_LABEL,
     DockerAdapter,
     DockerPool,
+    RunnerImageMissing,
 )
 from src.models import AdmitDecision, QueuedJob
 
@@ -812,3 +815,57 @@ def test_ram_offers_skip_unhealthy_hosts(write_config) -> None:
 
     assert pool.ram_offers({"powerserver"}) == {}
     desktop.info.assert_not_called()
+
+
+# --- a host without its runner image ----------------------------------------------------
+
+
+def _http_error(status: int, url: str, explanation: str) -> docker.errors.APIError:
+    response = requests.Response()
+    response.status_code = status
+    response.url = url
+    return docker.errors.APIError(explanation, response=response, explanation=explanation)
+
+
+def _light_decision() -> AdmitDecision:
+    job = QueuedJob(job_id=7, repo="ordago-app/ordago-apps", labels=["ordago-ci"])
+    return AdmitDecision(job=job, class_name="light", ram_mb=700, needs_kvm=False)
+
+
+def test_a_refused_pull_of_a_missing_image_reports_the_image_missing(write_config) -> None:
+    """What a lane host's proxy (IMAGES: 0) answers when docker-py falls back to pulling."""
+    adapter, client, cfg = _adapter(write_config)
+    client.containers.run.side_effect = _http_error(
+        403, "http://lane-host:2375/v1.47/images/create?tag=latest&fromImage=x", "Forbidden"
+    )
+
+    with pytest.raises(RunnerImageMissing) as exc:
+        adapter.spawn(_light_decision(), registration_token="ARRT")
+
+    assert exc.value.host == cfg.default_host
+    assert exc.value.image == cfg.runner_image
+
+
+def test_an_image_that_stays_absent_reports_the_image_missing(write_config) -> None:
+    adapter, client, _ = _adapter(write_config)
+    client.containers.run.side_effect = docker.errors.ImageNotFound("No such image: x")
+
+    with pytest.raises(RunnerImageMissing):
+        adapter.spawn(_light_decision(), registration_token="ARRT")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _http_error(403, "http://lane-host:2375/v1.47/containers/create", "Forbidden"),
+        _http_error(500, "http://lane-host:2375/v1.47/images/create", "registry down"),
+        _http_error(409, "http://lane-host:2375/v1.47/containers/create", "name in use"),
+    ],
+    ids=["create-forbidden", "pull-500", "name-conflict"],
+)
+def test_other_spawn_errors_are_not_read_as_a_missing_image(write_config, error) -> None:
+    adapter, client, _ = _adapter(write_config)
+    client.containers.run.side_effect = error
+
+    with pytest.raises(docker.errors.APIError):
+        adapter.spawn(_light_decision(), registration_token="ARRT")
