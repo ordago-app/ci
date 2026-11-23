@@ -91,11 +91,16 @@ def _policy(host: HostConfig, config: ControllerConfig) -> _HostPolicy:
     )
 
 
+def ram_ceiling_mb(host: HostConfig, config: ControllerConfig) -> int:
+    """A host's configured RAM budget, before any elastic offer lowers it."""
+    return config.ram_budget_mb if host.ram_budget_mb is None else host.ram_budget_mb
+
+
 def ram_budget_mb(host: HostConfig, config: ControllerConfig, ram_offers: dict[str, int]) -> int:
     """The RAM a host may reserve this tick: its configured ceiling, lowered to its own
     offer when it publishes one. An elastic host with no reading this tick gets 0 --
     never the ceiling, which would over-admit onto a guest the balloon has shrunk."""
-    ceiling = config.ram_budget_mb if host.ram_budget_mb is None else host.ram_budget_mb
+    ceiling = ram_ceiling_mb(host, config)
     if host.ram_offer_reserve_mb is None:
         return ceiling
     return min(ceiling, ram_offers.get(host.name, 0))
@@ -231,6 +236,7 @@ def evaluate(
     healthy: set[str] | None = None,
     review_sessions: int = 0,
     ram_offers: dict[str, int] | None = None,
+    held_ram_mb: dict[str, int] | None = None,
 ) -> list[Decision]:
     """Decide admit/defer per job, accumulating admissions within the batch.
 
@@ -255,6 +261,10 @@ def evaluate(
     `host_stats` is keyed by host name; a host with no entry has no live stats, so its
     host_pressure guard cannot fire. `healthy=None` means every configured host is healthy.
     `ram_offers` is keyed the same way; see `ram_budget_mb`.
+
+    `held_ram_mb` is the RAM active holds set aside per host (src/holds.py), charged
+    like the review sessions above: it binds budget_full and shrinks headroom, so new
+    lanes stop landing there. Lanes already running are untouched.
     """
     states: dict[str, _HostState] = {}
     for name, host in config.resolved_hosts().items():
@@ -275,6 +285,9 @@ def evaluate(
     session_host = states.get(config.review_admission.session_host)
     if session_host is not None:
         session_host.ram += review_sessions * config.review_admission.session_ram_mb
+    for name, held in (held_ram_mb or {}).items():
+        if name in states:
+            states[name].ram += held
 
     decisions: list[Decision] = []
     # Whether any job ranked above a rejected head has deferred waiting for a lane.

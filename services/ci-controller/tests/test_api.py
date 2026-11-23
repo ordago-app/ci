@@ -37,6 +37,7 @@ def test_metrics_prometheus_text() -> None:
         "config_version": "test-ver",
         "admission_mode": "reservation",
         "disk_gb": {},
+        "holds": [],
     }
     client = _client(payload)
     body = client.get("/metrics").text
@@ -63,6 +64,7 @@ def test_metrics_exposes_ci_lanes_booting_gauge() -> None:
         "config_version": "abc123",
         "admission_mode": "reservation",
         "disk_gb": {},
+        "holds": [],
     }
     client = _client(payload)
     body = client.get("/metrics").text
@@ -85,6 +87,7 @@ def test_metrics_exposes_info_and_disk_gauges() -> None:
             "ssd": {"used": 20, "budget": 500},
             "hdd": {"used": 5, "budget": 1000},
         },
+        "holds": [],
     }
     client = _client(payload)
     body = client.get("/metrics").text
@@ -93,6 +96,44 @@ def test_metrics_exposes_info_and_disk_gauges() -> None:
     assert 'admission_mode="reservation"' in body
     assert 'ci_disk_used_gb{disk="ssd"}' in body
     assert 'ci_disk_budget_gb{disk="hdd"}' in body
+
+
+def test_metrics_sums_the_ram_every_hold_sets_aside() -> None:
+    payload = {
+        "budget_ram_mb": 11000,
+        "ledger_ram_mb": 0,
+        "lanes_running": 0,
+        "max_lanes": 4,
+        "kvm_in_use": False,
+        "running": [],
+        "deferred": [],
+        "config_version": "abc123",
+        "admission_mode": "reservation",
+        "disk_gb": {},
+        "holds": [
+            {"name": "a", "host": "host-a", "ram_mb": 9216},
+            {"name": "b", "host": "host-b", "ram_mb": 1024},
+        ],
+    }
+    body = _client(payload).get("/metrics").text
+    assert "ci_held_ram_mb 10240" in body
+
+
+def test_metrics_omits_held_ram_while_the_scheduler_cannot_say() -> None:
+    payload = {
+        "budget_ram_mb": 11000,
+        "ledger_ram_mb": 0,
+        "lanes_running": 0,
+        "max_lanes": 4,
+        "kvm_in_use": False,
+        "running": [],
+        "deferred": [],
+        "config_version": "abc123",
+        "admission_mode": "reservation",
+        "disk_gb": {},
+        "holds": None,
+    }
+    assert "ci_held_ram_mb" not in _client(payload).get("/metrics").text
 
 
 def test_healthz_reports_consecutive_tick_failures() -> None:

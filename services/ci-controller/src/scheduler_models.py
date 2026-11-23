@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from src.holds import HOLD_TTL_MAX_SECONDS, HOLD_TTL_MIN_SECONDS, Hold
 from src.models import AdmitDecision, Decision, DeferDecision, QueuedJob, Reservation
 
 
@@ -78,3 +79,46 @@ class AdoptRequest(BaseModel):
 
 class LaneList(BaseModel):
     lanes: list[dict[str, Any]]
+
+
+class HoldRequest(BaseModel):
+    """No default host, ever (invariant 4): a hold names the machine it protects."""
+
+    host: str
+    ram_mb: int = Field(gt=0)
+    ttl_seconds: int = Field(ge=HOLD_TTL_MIN_SECONDS, le=HOLD_TTL_MAX_SECONDS)
+
+
+class HoldWire(BaseModel):
+    name: str
+    host: str
+    ram_mb: int
+    expires_at: float
+    remaining_seconds: int
+
+
+class HostRamWire(BaseModel):
+    budget_ram_mb: int
+    lanes_ram_mb: int
+    held_ram_mb: int
+
+
+class HoldList(BaseModel):
+    holds: list[HoldWire]
+    hosts: dict[str, HostRamWire]
+
+
+def hold_to_wire(hold: Hold, now: float) -> HoldWire:
+    return HoldWire(
+        name=hold.name,
+        host=hold.host,
+        ram_mb=hold.ram_mb,
+        expires_at=hold.expires_at,
+        remaining_seconds=hold.remaining_seconds(now),
+    )
+
+
+def hold_from_wire(data: dict[str, Any]) -> Hold:
+    return Hold(
+        name=data["name"], host=data["host"], ram_mb=data["ram_mb"], expires_at=data["expires_at"]
+    )

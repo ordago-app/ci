@@ -32,6 +32,33 @@ HOST_LABEL = "com.homelab.ci-controller.host"
 REVIEW_INSTANCE_LABEL = "ordago.ci.github-review.instance"
 
 
+class RunnerImageMissing(RuntimeError):
+    """The host lacks its configured runner image and cannot fetch it.
+
+    A lane host's socket proxy denies IMAGES (services/ci-lane-host/compose.yml), so the
+    pull docker-py falls back to on a missing image is refused there with a 403; only the
+    host's own provisioning (the ci_lane_host role) can put the image in place. Retrying
+    the spawn cannot fix that, so the controller benches the host instead."""
+
+    def __init__(self, host: str, image: str, cause: Exception) -> None:
+        super().__init__(f"runner image {image} is missing on {host}: {cause}")
+        self.host = host
+        self.image = image
+
+
+def _is_missing_image(exc: docker.errors.APIError) -> bool:
+    """`containers.run` creates, and on a 404 "No such image" pulls and creates again.
+    Either the pull's refusal or the image staying absent means the image is not there."""
+    if isinstance(exc, docker.errors.ImageNotFound):
+        return True
+    response = exc.response
+    return (
+        response is not None
+        and response.status_code == 403
+        and "/images/create" in str(getattr(response, "url", ""))
+    )
+
+
 def _random_suffix() -> str:
     """Six hex chars, drawn per spawn. Lane identity must not be derived from the job id:
     GitHub can hand a lane a different job than the one it was spawned for, which frees
@@ -215,9 +242,13 @@ class DockerAdapter:
         # jobs that need it. _resolve() has already filled this in from the top level
         # when the host omitted it; the `or` is a belt-and-braces default for a
         # HostConfig built directly in a test.
-        container = self._client.containers.run(
-            self._host_config.runner_image or self._config.runner_image, **run_kwargs
-        )
+        image = self._host_config.runner_image or self._config.runner_image
+        try:
+            container = self._client.containers.run(image, **run_kwargs)
+        except docker.errors.APIError as exc:
+            if _is_missing_image(exc):
+                raise RunnerImageMissing(self._host, image, exc) from exc
+            raise
         return lane_id, container.id
 
     def list_lanes(self) -> list[LaneInfo]:

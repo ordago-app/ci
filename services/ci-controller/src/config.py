@@ -208,6 +208,12 @@ class ControllerConfig(BaseModel):
     # an ordinary redeploy free every live lane's budget and permanently record green
     # jobs as infra failures. At the 5s poll interval, 3 tolerates ~15s of blindness.
     host_unhealthy_ticks: int = 3
+    # How long a reachable host whose runner image is missing (and cannot be pulled
+    # through its proxy) is kept out of admission before one spawn re-tests it. Retrying
+    # every tick cannot help -- only re-provisioning that host can -- and on 2026-11-22
+    # it cost 459 failed spawns in 90 min. Ten minutes bounds how long a fixed host
+    # waits to rejoin.
+    runner_image_missing_cooldown_seconds: float = Field(default=600.0, gt=0)
     max_concurrent_lanes: int
     default_class: str
     # Required: names the machine work lands on when `hosts:` is absent. A
