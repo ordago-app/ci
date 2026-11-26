@@ -155,6 +155,18 @@ def test_providers_must_not_repeat(tmp_path: Path) -> None:
         _load(tmp_path, doc)
 
 
+def test_review_bot_authors_names_bot_logins_only(tmp_path: Path) -> None:
+    assert write_config(tmp_path).repos["homelab"].review_bot_authors == []
+    loaded = write_config(
+        tmp_path, {"homelab": {"providers": ["codex"], "review_bot_authors": ["agent[bot]"]}}
+    )
+    assert loaded.repos["homelab"].review_bot_authors == ["agent[bot]"]
+    with pytest.raises(ConfigError, match="bot logins only"):
+        write_config(
+            tmp_path, {"homelab": {"providers": ["codex"], "review_bot_authors": ["alice"]}}
+        )
+
+
 def test_review_mode_is_all_or_labeled(tmp_path: Path) -> None:
     assert write_config(tmp_path).repos["homelab"].review_mode == "all"
     with pytest.raises(ConfigError):
