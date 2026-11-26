@@ -98,10 +98,11 @@ class ReviewPoller:
                     continue
                 if pr.author == self._reviewer_bot:
                     continue
-                # A bot PR is reviewed only when it is a dependency bump and the
-                # repo opts in; agent and other bot PRs never are.
+                # A bot PR is reviewed only when the repo opts in: a dependency
+                # bump by switch, any other bot by name.
                 if pr.author.endswith("[bot]") and not (
-                    repo_policy.review_dependency_bots and pr.author in DEPENDENCY_BOTS
+                    (repo_policy.review_dependency_bots and pr.author in DEPENDENCY_BOTS)
+                    or pr.author in repo_policy.review_bot_authors
                 ):
                     continue
                 if repo_policy.review_mode == "labeled" and REVIEW_LABEL not in pr.labels:

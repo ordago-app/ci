@@ -143,6 +143,10 @@ class RepoPolicy(_Strict):
     enabled: bool = True
     review_drafts: bool = False
     review_dependency_bots: bool = False
+    # Bot logins whose PRs get the ordinary code review, as a person's would: an
+    # agent that opens PRs under its own GitHub App. Named one by one, because a
+    # bot PR spends the same review budget and nobody is watching it.
+    review_bot_authors: list[str] = Field(default_factory=list)
     run_ci_first: bool = True
     review_mode: Literal["all", "labeled"] = "all"
     max_runtime_minutes: int = Field(default=30, ge=1)
@@ -152,6 +156,17 @@ class RepoPolicy(_Strict):
     def providers_are_unique(cls, value: list[str]) -> list[str]:
         if len(set(value)) != len(value):
             raise ValueError("providers must not repeat — a chain retries accounts, not itself")
+        return value
+
+    @field_validator("review_bot_authors")
+    @classmethod
+    def bot_authors_are_bot_logins(cls, value: list[str]) -> list[str]:
+        not_bots = [login for login in value if not login.endswith("[bot]")]
+        if not_bots:
+            raise ValueError(
+                f"review_bot_authors lists bot logins only (`name[bot]`), not {not_bots}:"
+                " a person's PRs are reviewed already"
+            )
         return value
 
 

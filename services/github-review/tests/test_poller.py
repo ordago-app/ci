@@ -23,6 +23,7 @@ def config(
     *,
     review_drafts: bool = False,
     review_dependency_bots: bool = False,
+    review_bot_authors: list[str] | None = None,
     review_mode: str = "all",
 ) -> ReviewConfig:
     return write_config(
@@ -32,6 +33,7 @@ def config(
                 "providers": ["codex"],
                 "review_drafts": review_drafts,
                 "review_dependency_bots": review_dependency_bots,
+                "review_bot_authors": review_bot_authors or [],
                 "review_mode": review_mode,
             }
         },
@@ -144,6 +146,25 @@ def test_opting_in_to_dependency_bots_still_skips_other_bots(tmp_path: Path) -> 
         reviewer_bot="reviewer[bot]",
     )
     assert poller.poll_once() == []
+
+
+def test_reviews_a_named_bot_author(tmp_path: Path) -> None:
+    store = ReviewJobStore(tmp_path / "jobs.db")
+    store.init()
+    poller = ReviewPoller(
+        config(tmp_path, review_bot_authors=["agent[bot]"]),
+        store,
+        FakeGitHub(
+            [
+                pr(number=1, sha="one", author="agent[bot]"),
+                pr(number=2, sha="two", author="other-agent[bot]"),
+                pr(number=3, sha="three", author="dependabot[bot]"),
+            ]
+        ),
+        reviewer_bot="reviewer[bot]",
+    )
+    # Naming one bot admits that bot only: not other agents, not dependency bumps.
+    assert [job.pr_number for job in poller.poll_once()] == [1]
 
 
 def test_labeled_mode_only_reviews_labelled_prs(tmp_path: Path) -> None:

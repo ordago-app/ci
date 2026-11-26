@@ -275,7 +275,8 @@ limits:                                 # all optional; defaults shown
 ```
 
 Per repo, also: `enabled` (true), `review_drafts` (false), `review_dependency_bots`
-(false), `run_ci_first` (true), `review_mode` (`all` | `labeled`, default `all`),
+(false), `review_bot_authors` (`[]`: bot logins, such as an agent's GitHub App, whose PRs
+get the ordinary code review; any other bot is never reviewed), `run_ci_first` (true), `review_mode` (`all` | `labeled`, default `all`),
 `max_runtime_minutes` (30). Unknown keys are refused, not ignored.
 
 **What each account spent.** Every paid run is logged (`job N owner/repo#PR:

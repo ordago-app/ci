@@ -118,6 +118,13 @@ def test_a_human_pr_does_not_get_the_dependency_review() -> None:
     assert "Test coverage is a required gate" in prompt
 
 
+def test_an_agent_bot_pr_gets_the_code_review_not_the_dependency_review() -> None:
+    # An agent's bot writes code, so a review_bot_authors entry gets what a person's PR gets.
+    prompt = _prompt(author="agent[bot]")
+    assert "dependency review" not in prompt
+    assert "Test coverage is a required gate" in prompt
+
+
 def file_diff(path: str, body: str = "+added\n") -> str:
     return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n{body}"
 
